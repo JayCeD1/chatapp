@@ -1,10 +1,12 @@
-use std::io::{Read, Write};
-use std::net::{TcpListener, TcpStream, SocketAddr};
-use std::sync::{Mutex, Arc};
+use crate::db_queries::save_message_internal;
+use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::collections::HashMap;
+use std::io::{Read, Write};
+use std::net::{SocketAddr, TcpListener, TcpStream};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use serde::{Serialize, Deserialize};
 use tauri::{Emitter, State};
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -20,9 +22,11 @@ pub struct AppState {
 pub struct Message {
     pub message_type: MessageType,
     pub username: String,
+    pub user_id: Option<u64>,
     pub message: String,
     pub room: String,
-    pub timestamp: u64,
+    pub room_id: Option<u64>,
+    pub created_at: u64,
     pub is_emoji: bool,
 }
 
@@ -58,7 +62,7 @@ pub struct ServerInfo {
     pub user_count: usize,
 }
 
-// Network discovery - scan for servers on local network
+// Network discovery - scan for servers on a local network
 #[tauri::command]
 pub fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
     let mut servers = Vec::new();
@@ -109,7 +113,7 @@ pub fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
 
 // Enhanced server that can handle multiple clients
 #[tauri::command]
-pub fn server_listen(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>>>, username: String, port: Option<u16>) {
+pub fn server_listen(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>>>, db: State<'_, SqlitePool>, username: String, port: Option<u16>) {
     let port = port.unwrap_or(3625);
     let bind_addr = format!("0.0.0.0:{}", port); // Bind to all interfaces for network access
     
@@ -128,6 +132,7 @@ pub fn server_listen(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>>
     // Spawn server listener thread
     let app_clone = app.clone();
     let state_clone = state.inner().clone();
+    let pool_clone = db.inner().clone();
     
     thread::spawn(move || {
         for stream in socket.incoming() {
@@ -135,9 +140,10 @@ pub fn server_listen(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>>
                 Ok(stream) => {
                     let app_handle = app_clone.clone();
                     let state_handle = state_clone.clone();
+                    let pool_handle = pool_clone.clone();
                     
                     thread::spawn(move || {
-                        handle_client_connection(app_handle, state_handle, stream);
+                        handle_client_connection(app_handle, state_handle, stream, pool_handle);
                     });
                 }
                 Err(e) => eprintln!("Failed to accept connection: {}", e),
@@ -146,7 +152,7 @@ pub fn server_listen(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>>
     });
 }
 
-fn handle_client_connection(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, mut stream: TcpStream) {
+fn handle_client_connection(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, mut stream: TcpStream, pool: SqlitePool) {
     let peer_addr = stream.peer_addr().unwrap();
     println!("New connection from: {}", peer_addr);
     
@@ -160,10 +166,13 @@ fn handle_client_connection(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, 
 
     let app_clone = app.clone();
     let state_clone = state.clone();
-    
+    // Clone for the reader thread
+    let pool_reader = pool.clone();
+
+
     thread::spawn(move || {
         let mut buffer = [0; 1024];
-        
+
         loop {
             match stream.read(&mut buffer) {
                 Ok(0) => {
@@ -174,9 +183,12 @@ fn handle_client_connection(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, 
                 }
                 Ok(n) => {
                     let message_data = &buffer[..n];
+                    // Clone pool for each use inside the loop to avoid moving it
+                    let pool_for_msg = pool_reader.clone();
+
                     if let Ok(message_str) = std::str::from_utf8(message_data) {
                         if let Ok(message) = serde_json::from_str::<Message>(message_str) {
-                            handle_message(app_clone.clone(), Arc::clone(&state_clone), message, peer_addr);
+                            handle_message(app_clone.clone(), Arc::clone(&state_clone), message, pool_for_msg,  peer_addr);
                         }
                     }
                 }
@@ -186,13 +198,24 @@ fn handle_client_connection(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, 
     });
 }
 
-fn handle_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, message: Message, sender_addr: SocketAddr) {
+fn handle_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, message: Message, pool: SqlitePool, sender_addr: SocketAddr) {
     match message.message_type {
         MessageType::Connect => {
             // Broadcast user joined to all clients in the room
             broadcast_to_room(&app, &state, &message.room, &message, &sender_addr.to_string());
         }
         MessageType::Chat => {
+            //first the save message to db only if IDs are present
+            if let (Some(room_id_u64), Some(user_id_u64)) = (message.room_id, message.user_id) {
+                let pool_clone = pool.clone();
+                let msg_text = message.message.clone();
+                let is_emoji = message.is_emoji;
+
+                tauri::async_runtime::spawn(async move {
+                    let _ = save_message_internal(&pool_clone, room_id_u64 as i64, user_id_u64 as i64, msg_text, "Chat".to_string(), is_emoji).await;
+                });
+            }
+
             // Broadcast chat message to all clients in the room
             broadcast_to_room(&app, &state, &message.room, &message, &sender_addr.to_string());
         }
@@ -229,7 +252,7 @@ fn broadcast_to_room(app: &tauri::AppHandle, state: &Arc<Mutex<AppState>>, _room
         }
     }
     
-    // Also emit to frontend
+    // Also emit to the frontend
     app.emit("message", &message_json).unwrap();
 }
 
@@ -239,10 +262,12 @@ pub fn client_connect(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>
     
     let message = Message {
         message_type: MessageType::Connect,
+        user_id: None,
         username: username.clone(),
         message: format!("{} joined the chat", username),
         room: room.clone(),
-        timestamp: std::time::SystemTime::now()
+        room_id: None,
+        created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
@@ -265,16 +290,18 @@ pub fn client_connect(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn send(state: State<'_, Arc<Mutex<AppState>>>, message: String, room: String, is_emoji: bool) {
+pub fn send(state: State<'_, Arc<Mutex<AppState>>>, message: String, user_id: Option<u64>, room: String, room_id: Option<u64>, is_emoji: bool) {
     let state_guard = state.lock().unwrap();
     let streams = state_guard.streams.lock().unwrap();
-    
+
     let chat_message = Message {
         message_type: MessageType::Chat,
         username: state_guard.username.clone(),
+        user_id,
         message,
+        room_id,
         room,
-        timestamp: std::time::SystemTime::now()
+        created_at: std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_secs(),
@@ -283,7 +310,7 @@ pub fn send(state: State<'_, Arc<Mutex<AppState>>>, message: String, room: Strin
     
     let payload = serde_json::to_string(&chat_message).unwrap();
     
-    // Send to all streams (in a real implementation, you'd filter by room)
+    // Send to all streams (in a real implementation, I'd filter by room)
     for stream in streams.values() {
         if let Err(e) = stream.try_clone().unwrap().write_all(payload.as_bytes()) {
             eprintln!("Failed to send message: {}", e);

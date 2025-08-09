@@ -352,6 +352,34 @@ pub async fn save_message(
     })
 }
 
+pub async fn save_message_internal(
+    pool: &SqlitePool,
+    room_id: i64,
+    user_id: i64,
+    message: String,
+    message_type: String,
+    is_emoji: bool,
+) -> Result<InsertResult, String> {
+    let result = sqlx::query(
+        "INSERT INTO messages (room_id, user_id, message, message_type, is_emoji)
+         VALUES ($1, $2, $3, $4, $5)"
+    )
+        .bind(&room_id)
+        .bind(&user_id)
+        .bind(&message)
+        .bind(&message_type)
+        .bind(&is_emoji)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to save message: {}", e))?;
+
+    Ok(InsertResult {
+        rows_affected: result.rows_affected(),
+        last_insert_id: result.last_insert_rowid(),
+    })
+}
+
+
 #[tauri::command]
 pub async fn get_room_messages(
     db: State<'_, SqlitePool>,

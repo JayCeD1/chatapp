@@ -109,7 +109,7 @@ pub fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
 
 // Enhanced server that can handle multiple clients
 #[tauri::command]
-pub fn server_listen(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, username: String, port: Option<u16>) {
+pub fn server_listen(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>>>, username: String, port: Option<u16>) {
     let port = port.unwrap_or(3625);
     let bind_addr = format!("0.0.0.0:{}", port); // Bind to all interfaces for network access
     
@@ -127,7 +127,7 @@ pub fn server_listen(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, usernam
     
     // Spawn server listener thread
     let app_clone = app.clone();
-    let state_clone = state.clone();
+    let state_clone = state.inner().clone();
     
     thread::spawn(move || {
         for stream in socket.incoming() {
@@ -234,7 +234,7 @@ fn broadcast_to_room(app: &tauri::AppHandle, state: &Arc<Mutex<AppState>>, _room
 }
 
 #[tauri::command]
-pub fn client_connect(app: tauri::AppHandle, state: State<Mutex<AppState>>, host: String, username: String, room: String) {
+pub fn client_connect(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>>>, host: String, username: String, room: String) {
     let mut stream: TcpStream = TcpStream::connect(&host).unwrap();
     
     let message = Message {
@@ -292,7 +292,7 @@ pub fn send(state: State<'_, Mutex<AppState>>, message: String, room: String, is
 }
 
 #[tauri::command]
-pub fn get_server_info(state: State<'_, Mutex<AppState>>) -> Option<String> {
+pub fn get_server_info(state: State<'_,Arc<Mutex<AppState>>>) -> Option<String> {
     let state_guard = state.lock().unwrap();
     state_guard.server_addr.map(|addr| addr.to_string())
 }

@@ -1,10 +1,13 @@
 use std::env;
+use std::sync::Mutex;
 use sqlx::SqlitePool;
 use tauri::Manager;
-use crate::db_queries::{create_user, get_users, get_user_by_id};
+use crate::db_queries::{create_user, get_users, get_user_by_id, update_user_online_status, get_departments, get_chat_rooms, get_rooms_by_department, join_room, leave_room, save_message, get_room_messages, upsert_user};
+use crate::sockets::{AppState, server_listen, client_connect, send, get_server_info, discover_servers};
 
 mod migration;
 mod db_queries;
+mod sockets;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
@@ -13,9 +16,15 @@ fn greet(name: &str) -> String {
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
-pub fn run() {// <- Must be async now
+pub fn run() {
 
     tauri::Builder::default()
+        .manage(Mutex::new(AppState {
+            streams: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            username: String::new(),
+            current_room: String::new(),
+            server_addr: None,
+        }))
         .plugin(tauri_plugin_sql::Builder::default()
             .add_migrations("sqlite:nutler.db", migration::get_migrations()).build())
         .plugin(tauri_plugin_opener::init())
@@ -42,7 +51,19 @@ pub fn run() {// <- Must be async now
 
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet,create_user, get_users, get_user_by_id])
+        .invoke_handler(tauri::generate_handler![
+            greet,
+            // User management
+            upsert_user, create_user, get_users, get_user_by_id, update_user_online_status,
+            // Department management
+            get_departments,
+            // Chat room management
+            get_chat_rooms, get_rooms_by_department, join_room, leave_room,
+            // Message management
+            save_message, get_room_messages,
+            // Socket management
+            server_listen, client_connect, send, get_server_info, discover_servers
+        ])
         .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .expect("error while running tauri application Jesse => ");
 }

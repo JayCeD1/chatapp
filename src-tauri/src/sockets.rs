@@ -265,7 +265,7 @@ pub fn client_connect(app: tauri::AppHandle, state: State<'_,Arc<Mutex<AppState>
 }
 
 #[tauri::command(rename_all = "snake_case")]
-pub fn send(state: State<'_, Mutex<AppState>>, message: String, room: String, is_emoji: bool) {
+pub fn send(state: State<'_, Arc<Mutex<AppState>>>, message: String, room: String, is_emoji: bool) {
     let state_guard = state.lock().unwrap();
     let streams = state_guard.streams.lock().unwrap();
     

@@ -58,7 +58,7 @@ pub async fn upsert_user(
     department_id: Option<i64>,
 ) -> Result<User, String> {
     //Try find existing
-    if let Some (row) = sqlx::query(
+    if let Some (_row) = sqlx::query(
         "SELECT u.id, u.name, u.email, u.department_id, u.is_online, u.last_seen,
                 d.name as department_name
          FROM users u LEFT JOIN departments d ON u.department_id = d.id

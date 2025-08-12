@@ -20,7 +20,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(AppState {
-            streams: std::sync::Arc::new(Mutex::new(std::collections::HashMap::new())),
+            streams: Arc::new(Mutex::new(std::collections::HashMap::new())),
             username: String::new(),
             current_room: String::new(),
             server_addr: None,

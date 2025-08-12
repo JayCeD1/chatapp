@@ -6,8 +6,9 @@ import {
   Building2,
   MessageCircle,
   LogOut,
-  Settings,
+  // Settings,
 } from "lucide-react";
+import { listen } from "@tauri-apps/api/event";
 
 const Chat = () => {
   const [currentView, setCurrentView] = useState("login"); // 'login', 'chat', 'rooms'
@@ -21,7 +22,7 @@ const Chat = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
-  const [users, setUsers] = useState<User[]>([]);
+  // const [users, setUsers] = useState<User[]>([]);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
 
@@ -53,6 +54,56 @@ const Chat = () => {
         .catch(() => localStorage.removeItem("nutler.userId"));
     }
   }, []);
+
+  //listen for messages events from the server
+  useEffect(() => {
+    if (!currentRoom) return;
+
+    let stop: (() => void) | undefined;
+
+    (async () => {
+      const unlisten = await listen<string>("message", (e) => {
+        const m = JSON.parse(e.payload) as Message;
+
+        if (m.message_type === "Chat" && m.room === currentRoom?.name) {
+          setMessages((prev) => {
+            // Check for duplicate messages to prevent duplicates
+            const isDuplicate = prev.some(
+              (msg) =>
+                msg.message === m.message &&
+                msg.username === m.username &&
+                msg.created_at ===
+                  new Date(Number(m.created_at) * 1000).toISOString()
+            );
+
+            if (isDuplicate) {
+              return prev; // Don't add if duplicate
+            }
+
+            return [
+              ...prev,
+              {
+                room_id: currentRoom!.id!,
+                room: currentRoom!.name!,
+                user_id: 0,
+                username: m.username,
+                message: m.message,
+                message_type: m.message_type,
+                is_emoji: m.is_emoji,
+                created_at: new Date(Number(m.created_at) * 1000).toISOString(),
+              },
+            ];
+          });
+        }
+      });
+      stop = () => {
+        unlisten();
+      };
+    })();
+    return () => {
+      stop?.();
+    };
+  }, [currentRoom]);
 
   const loadDepartments = async () => {
     try {
@@ -104,6 +155,9 @@ const Chat = () => {
           await invoke("server_listen", { username, port: 3625 });
           const addr = (await invoke("get_server_info")) as string;
           const host = addr.replace("0.0.0.0", "127.0.0.1");
+          console.log("Server listening on:", host);
+
+          //todo this has to be revisited esp room for join company chat button
           await invoke("client_connect", {
             host,
             username,
@@ -138,31 +192,38 @@ const Chat = () => {
     }
   };
 
+  //todo handle leave room as well both (front + back)
+
   const handleSendMessage = async () => {
     if (message.trim() && currentRoom?.id && currentUser?.id) {
       try {
-        // Save message to database
-        await invoke("save_message", {
-          roomId: currentRoom.id,
-          userId: currentUser.id,
+        // Send the message via socket
+        await invoke("send", {
           message: message,
-          messageType: "chat",
-          isEmoji: false,
+          user_id: currentUser.id,
+          room: currentRoom.name,
+          room_id: currentRoom.id,
+          is_emoji: false,
         });
 
-        // Add to local state
-        const newMessage: Message = {
-          room_id: currentRoom.id,
-          user_id: currentUser.id,
-          username: currentUser.name,
-          message: message,
-          message_type: "chat",
-          is_emoji: false,
-          created_at: new Date().toISOString(),
-        };
+        // REMOVE THIS PART - let the listener handle adding messages
+        // The message will be added via the listener when it comes back from server
+        // This prevents duplicate messages
 
-        setMessages((prev) => [...prev, newMessage]);
-        setMessage("");
+        // Add to local state
+        // const newMessage: Message = {
+        //   room_id: currentRoom.id,
+        //   room: currentRoom.name,
+        //   user_id: currentUser.id,
+        //   username: currentUser.name,
+        //   message: message,
+        //   message_type: "Chat",
+        //   is_emoji: false,
+        //   created_at: new Date().toISOString(),
+        // };
+
+        // setMessages((prev) => [...prev, newMessage]);
+        setMessage(""); // Only clear the input text
       } catch (error) {
         console.error("Error sending message:", error);
       }

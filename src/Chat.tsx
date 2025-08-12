@@ -47,7 +47,9 @@ const Chat = () => {
     if (savedId) {
       invoke("get_user_by_id", { id: Number(savedId) })
         .then((u) => {
-          setCurrentUser(u as User);
+          const user = u as User;
+          setCurrentUser(user);
+          setUsername(user.name);
           setCurrentView("rooms");
           loadChatRooms();
         })
@@ -73,7 +75,7 @@ const Chat = () => {
                 msg.message === m.message &&
                 msg.username === m.username &&
                 msg.created_at ===
-                  new Date(Number(m.created_at) * 1000).toISOString()
+                  new Date(Number(m.created_at) * 1000).toISOString(),
             );
 
             if (isDuplicate) {

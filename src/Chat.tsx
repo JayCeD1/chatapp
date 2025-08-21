@@ -235,7 +235,7 @@ const Chat = () => {
         if (mode === "server") {
           await invoke("server_listen", {
             username,
-            user_id: user.id,
+            userId: user.id,
             port: 3625,
           });
           const addr = (await invoke("get_server_info")) as string;

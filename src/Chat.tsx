@@ -246,17 +246,17 @@ const Chat = () => {
           await invoke("client_connect", {
             host,
             username,
-            user_id: user.id,
+            userId: user.id,
             room: user.department_name,
-            room_id: user.department_id,
+            roomId: user.department_id,
           });
         } else {
           await invoke("client_connect", {
             host: serverIp,
             username,
-            user_id: user.id,
+            userId: user.id,
             room: user.department_name,
-            room_id: user.department_id,
+            roomId: user.department_id,
           });
         }
 

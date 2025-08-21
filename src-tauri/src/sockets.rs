@@ -1,15 +1,15 @@
-use tokio::io::AsyncWriteExt;
 use crate::db_queries::save_message_internal;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpListener, TcpStream};
-use std::sync::{Arc, Mutex, TryLockResult};
+use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
-use tauri::{Emitter, Manager, State};
+use tauri::{Emitter, State};
 use tokio::io::AsyncReadExt;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 //Better indexing and room management
@@ -176,8 +176,8 @@ pub fn server_listen(
     let username_clone = username.clone();
 
     thread::spawn(move || {
-        // Connect as client to self first
-        if let Err(e) = client_connect(
+        // Connect as a client to self first
+        if let Err(e) = client_connect_internal(
             app_clone.clone(),
             state_clone.clone(),
             format!("127.0.0.1:{}", port),
@@ -453,13 +453,33 @@ fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, mes
 #[tauri::command]
 pub fn client_connect(
     app: tauri::AppHandle,
-    state: Arc<Mutex<AppState>>,
+    state: State<Arc<Mutex<AppState>>>,
     host: String,
     username: String,
     user_id: u64,
     room: String,
     room_id: u64
 ) -> Result<(), String> {
+   client_connect_internal(
+       app,
+       Arc::clone(&state.inner()),
+       host,
+       username,
+       user_id,
+       room,
+       room_id
+   )
+}
+
+fn client_connect_internal(
+    app: tauri::AppHandle,
+    state: Arc<Mutex<AppState>>,
+    host: String,
+    username: String,
+    user_id: u64,
+    room: String,
+    room_id: u64
+)-> Result<(), String> {
     let stream = TcpStream::connect(&host)
         .map_err(|e| format!("Failed to connect to {}: {}", host, e))?;
 
@@ -502,9 +522,9 @@ pub fn client_connect(
     Ok(())
 }
 
-async fn client_connect_internal(
+async fn client_connect_internal_async(
     app: tauri::AppHandle,
-    state: State<'_, Arc<Mutex<AppState>>>,
+    state: Arc<Mutex<AppState>>,
     host: String,
     username: String,
     user_id: u64,

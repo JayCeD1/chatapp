@@ -346,7 +346,7 @@ async fn clean_client(
 }
 
 //More efficient fir room broadcasting
-fn broadcast_to_room_efficient(app: &tauri::AppHandle, state: &Arc<Mutex<AppState>>, target_room: &str, message: &Message, exclude_user_id: Option<u64>) {
+fn broadcast_to_room_efficient(_app: &tauri::AppHandle, state: &Arc<Mutex<AppState>>, target_room: &str, message: &Message, exclude_user_id: Option<u64>) {
     let state_guard = state.lock().unwrap();
     let streams = state_guard.server_streams.lock().unwrap();
     let room_clients = state_guard.room_clients.lock().unwrap();

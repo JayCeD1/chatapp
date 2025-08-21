@@ -233,7 +233,11 @@ const Chat = () => {
         localStorage.setItem("nutler.userId", String(user.id));
 
         if (mode === "server") {
-          await invoke("server_listen", { username, port: 3625 });
+          await invoke("server_listen", {
+            username,
+            user_id: user.id,
+            port: 3625,
+          });
           const addr = (await invoke("get_server_info")) as string;
           const host = addr.replace("0.0.0.0", "127.0.0.1");
           console.log("Server listening on:", host);

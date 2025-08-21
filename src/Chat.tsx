@@ -42,6 +42,7 @@ const Chat = () => {
 
   //On app boot, try auto-login
   useEffect(() => {
+    //todo auto login should be able to start either server or client?
     const savedId = localStorage.getItem("nutler.userId");
 
     if (savedId) {
@@ -65,37 +66,64 @@ const Chat = () => {
 
     (async () => {
       const unlisten = await listen<string>("message", (e) => {
-        const m = JSON.parse(e.payload) as Message;
+        console.log("Raw payload:", e.payload);
+        console.log("Payload type:", typeof e.payload);
+        console.log("Payload length:", e.payload.length);
+        console.log("First 100 chars:", e.payload.substring(0, 100));
+        console.log(
+          "Last 100 chars:",
+          e.payload.substring(e.payload.length - 100),
+        );
 
-        if (m.message_type === "Chat" && m.room === currentRoom?.name) {
-          setMessages((prev) => {
-            // Check for duplicate messages to prevent duplicates
-            const isDuplicate = prev.some(
-              (msg) =>
-                msg.message === m.message &&
-                msg.username === m.username &&
-                msg.created_at ===
-                  new Date(Number(m.created_at) * 1000).toISOString(),
-            );
+        // Check if it ends properly
+        const lastChar = e.payload[e.payload.length - 1];
+        console.log(
+          "Last character:",
+          lastChar,
+          "Is closing brace:",
+          lastChar === "}",
+        );
 
-            if (isDuplicate) {
-              return prev; // Don't add if duplicate
-            }
+        try {
+          const m = JSON.parse(e.payload) as Message;
 
-            return [
-              ...prev,
-              {
-                room_id: currentRoom!.id!,
-                room: currentRoom!.name!,
-                user_id: 0,
-                username: m.username,
-                message: m.message,
-                message_type: m.message_type,
-                is_emoji: m.is_emoji,
-                created_at: new Date(Number(m.created_at) * 1000).toISOString(),
-              },
-            ];
-          });
+          //I think we can include all other message types as well as long us they belong to the same room
+          if (m.message_type === "Chat" && m.room === currentRoom?.name) {
+            setMessages((prev) => {
+              // Check for duplicate messages to prevent duplicates
+              const isDuplicate = prev.some(
+                (msg) =>
+                  msg.message === m.message &&
+                  msg.username === m.username &&
+                  msg.created_at ===
+                    new Date(Number(m.created_at) * 1000).toISOString(),
+              );
+
+              if (isDuplicate) {
+                return prev; // Don't add if duplicate
+              }
+
+              return [
+                ...prev,
+                {
+                  room_id: currentRoom!.id!,
+                  room: currentRoom!.name!,
+                  user_id: 0,
+                  username: m.username,
+                  message: m.message,
+                  message_type: m.message_type,
+                  is_emoji: m.is_emoji,
+                  created_at: new Date(
+                    Number(m.created_at) * 1000,
+                  ).toISOString(),
+                },
+              ];
+            });
+          }
+        } catch (error) {
+          console.error("JSON parse error:", error);
+          console.error("Failed payload:", e.payload);
+          return; // Skip this message
         }
       });
       stop = () => {
@@ -106,6 +134,57 @@ const Chat = () => {
       stop?.();
     };
   }, [currentRoom]);
+
+  // Frontend reconnection
+  useEffect(() => {
+    let stop: (() => void) | undefined;
+
+    (async () => {
+      const unlisten = await listen("connection_lost", () => {
+        console.log("Connection lost, attempting to reconnect...");
+        // Exponential backoff retry
+        let retryDelay = 1000;
+        const maxRetries = 5;
+        let retryCount = 0;
+
+        const attemptReconnect = () => {
+          if (retryCount >= maxRetries) {
+            console.error("Max reconnection attempts reached");
+            return;
+          }
+
+          setTimeout(() => {
+            invoke("client_connect", {
+              host: serverIp,
+              username: currentUser?.name || "",
+              user_id: currentUser?.id || 0,
+              room: currentRoom?.name || "Company Wide",
+              room_id: currentRoom?.id || 1,
+            })
+              .then(() => {
+                console.log("Reconnected successfully");
+                retryCount = 0;
+              })
+              .catch((e) => {
+                console.error("Reconnect failed:", e);
+                retryCount++;
+                retryDelay *= 2; // Exponential backoff
+                attemptReconnect();
+              });
+          }, retryDelay);
+        };
+
+        attemptReconnect();
+      });
+      stop = () => {
+        unlisten();
+      };
+    })();
+
+    return () => {
+      stop?.();
+    };
+  }, [serverIp, currentUser, currentRoom]);
 
   const loadDepartments = async () => {
     try {
@@ -159,17 +238,21 @@ const Chat = () => {
           const host = addr.replace("0.0.0.0", "127.0.0.1");
           console.log("Server listening on:", host);
 
-          //todo this has to be revisited esp room for join company chat button
+          //todo update to match renewed client_connect method this has to be revisited esp room for join company chat button
           await invoke("client_connect", {
             host,
             username,
-            room: "Company Wide",
+            user_id: user.id,
+            room: user.department_name,
+            room_id: user.department_id,
           });
         } else {
           await invoke("client_connect", {
             host: serverIp,
             username,
-            room: "Company Wide",
+            user_id: user.id,
+            room: user.department_name,
+            room_id: user.department_id,
           });
         }
 
@@ -195,7 +278,7 @@ const Chat = () => {
   };
 
   //todo handle leave room as well both (front + back)
-
+  //todo seems sockets send are not persisted in the db!! URGENT!!!
   const handleSendMessage = async () => {
     if (message.trim() && currentRoom?.id && currentUser?.id) {
       try {

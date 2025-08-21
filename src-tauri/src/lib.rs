@@ -20,10 +20,16 @@ pub fn run() {
 
     tauri::Builder::default()
         .manage(Arc::new(Mutex::new(AppState {
-            streams: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            server_streams: Arc::new(Mutex::new(Default::default())),
+            client_stream: Arc::new(Mutex::new(None)),
+            // streams: Arc::new(Mutex::new(std::collections::HashMap::new())),
             username: String::new(),
+            user_id: None,
+            is_server: false,
             current_room: String::new(),
+            current_room_id: None,
             server_addr: None,
+            room_clients: Arc::new(Mutex::new(Default::default()))
         })))
         .plugin(tauri_plugin_sql::Builder::default()
             .add_migrations("sqlite:nutler.db", migration::get_migrations()).build())

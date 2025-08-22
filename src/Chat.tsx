@@ -67,39 +67,28 @@ const Chat = () => {
     (async () => {
       const unlisten = await listen<string>("message", (e) => {
         console.log("Raw payload:", e.payload);
-        console.log("Payload type:", typeof e.payload);
-        console.log("Payload length:", e.payload.length);
-        console.log("First 100 chars:", e.payload.substring(0, 100));
-        console.log(
-          "Last 100 chars:",
-          e.payload.substring(e.payload.length - 100),
-        );
-
-        // Check if it ends properly
-        const lastChar = e.payload[e.payload.length - 1];
-        console.log(
-          "Last character:",
-          lastChar,
-          "Is closing brace:",
-          lastChar === "}",
-        );
 
         try {
           const m = JSON.parse(e.payload) as Message;
 
-          //I think we can include all other message types as well as long us they belong to the same room
-          if (m.message_type === "Chat" && m.room === currentRoom?.name) {
+          // Accept all message types for the current room, not just Chat
+          if (m.room === currentRoom?.department_name) {
+            console.log("Message belongs to current room, adding to state");
+
             setMessages((prev) => {
               // Check for duplicate messages to prevent duplicates
               const isDuplicate = prev.some(
                 (msg) =>
                   msg.message === m.message &&
                   msg.username === m.username &&
-                  msg.created_at ===
-                    new Date(Number(m.created_at) * 1000).toISOString(),
+                  Math.abs(
+                    new Date(msg.created_at).getTime() -
+                      new Date(Number(m.created_at) * 1000).getTime(),
+                  ) < 1000, // Within 1 second,
               );
 
               if (isDuplicate) {
+                console.log("Duplicate message detected, skipping");
                 return prev; // Don't add if duplicate
               }
 
@@ -107,18 +96,22 @@ const Chat = () => {
                 ...prev,
                 {
                   room_id: currentRoom!.id!,
-                  room: currentRoom!.name!,
-                  user_id: 0,
+                  room: currentRoom!.department_name!,
+                  user_id: m.user_id || 0,
                   username: m.username,
                   message: m.message,
                   message_type: m.message_type,
-                  is_emoji: m.is_emoji,
+                  is_emoji: m.is_emoji || false,
                   created_at: new Date(
                     Number(m.created_at) * 1000,
                   ).toISOString(),
                 },
               ];
             });
+          } else {
+            console.log(
+              `Message for different room: ${m.room} vs ${currentRoom?.name}`,
+            );
           }
         } catch (error) {
           console.error("JSON parse error:", error);
@@ -154,12 +147,12 @@ const Chat = () => {
           }
 
           setTimeout(() => {
-            invoke("client_connect", {
+            invoke("client_connect_to_server", {
               host: serverIp,
               username: currentUser?.name || "",
-              user_id: currentUser?.id || 0,
-              room: currentRoom?.name || "Company Wide",
-              room_id: currentRoom?.id || 1,
+              userId: currentUser?.id || 0,
+              room: currentRoom?.department_name || "Company Wide",
+              roomId: currentRoom?.id || 1,
             })
               .then(() => {
                 console.log("Reconnected successfully");
@@ -233,25 +226,27 @@ const Chat = () => {
         localStorage.setItem("nutler.userId", String(user.id));
 
         if (mode === "server") {
-          await invoke("server_listen", {
+          await invoke("server_listen_as_participant", {
             username,
             userId: user.id,
             port: 3625,
+            room: user.department_name,
+            roomId: user.department_id,
           });
           const addr = (await invoke("get_server_info")) as string;
           const host = addr.replace("0.0.0.0", "127.0.0.1");
           console.log("Server listening on:", host);
 
-          //todo update to match renewed client_connect method this has to be revisited esp room for join company chat button
-          await invoke("client_connect", {
-            host,
-            username,
-            userId: user.id,
-            room: user.department_name,
-            roomId: user.department_id,
-          });
+          //no need to connect to server, it will connect automatically
+          // await invoke("client_connect", {
+          //   host,
+          //   username,
+          //   userId: user.id,
+          //   room: user.department_name,
+          //   roomId: user.department_id,
+          // });
         } else {
-          await invoke("client_connect", {
+          await invoke("client_connect_to_server", {
             host: serverIp,
             username,
             userId: user.id,
@@ -270,48 +265,42 @@ const Chat = () => {
   };
 
   const handleJoinRoom = async (room: ChatRoom) => {
-    if (!currentUser?.id || !room.id) return;
+    if (!currentUser?.id || !room.id) {
+      console.log("Cannot join room - missing user or room ID");
+      return;
+    }
+    //TODO we need tauri methods that hanlde room joins as well.
+
+    console.log(`Joining room: ${room.name} (ID: ${room.id})`);
 
     try {
       await invoke("join_room", { userId: currentUser.id, roomId: room.id });
       setCurrentRoom(room);
       setCurrentView("chat");
+      console.log("Successfully joined room");
     } catch (error) {
       console.error("Error joining room:", error);
     }
   };
 
-  //todo handle leave room as well both (front + back)
-  //todo seems sockets send are not persisted in the db!! URGENT!!!
   const handleSendMessage = async () => {
     if (message.trim() && currentRoom?.id && currentUser?.id) {
       try {
-        // Send the message via socket
-        await invoke("send", {
-          message: message,
-          user_id: currentUser.id,
-          room: currentRoom.name,
-          room_id: currentRoom.id,
-          is_emoji: false,
-        });
+        // Send the message via socket (this snake case works bcuz in tauri we use snake case)
 
-        // REMOVE THIS PART - let the listener handle adding messages
-        // The message will be added via the listener when it comes back from server
-        // This prevents duplicate messages
+        await invoke(
+          `${
+            mode === "server" ? "send_as_server_participant" : "send_as_client"
+          }`,
+          {
+            message: message,
+            user_id: currentUser.id,
+            room: currentRoom.department_name,
+            room_id: currentRoom.id,
+            is_emoji: false,
+          },
+        );
 
-        // Add to local state
-        // const newMessage: Message = {
-        //   room_id: currentRoom.id,
-        //   room: currentRoom.name,
-        //   user_id: currentUser.id,
-        //   username: currentUser.name,
-        //   message: message,
-        //   message_type: "Chat",
-        //   is_emoji: false,
-        //   created_at: new Date().toISOString(),
-        // };
-
-        // setMessages((prev) => [...prev, newMessage]);
         setMessage(""); // Only clear the input text
       } catch (error) {
         console.error("Error sending message:", error);

@@ -56,7 +56,7 @@ pub struct Message {
     pub is_emoji: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq)]
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
 pub enum MessageType {
     Connect,
     Disconnect,
@@ -139,15 +139,17 @@ pub fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
     servers
 }
 
-// Enhanced server that can handle multiple clients
+// MAIN SERVER START FUNCTION - Server as Participant
 #[tauri::command]
-pub fn server_listen(
+pub fn server_listen_as_participant(
     app: tauri::AppHandle,
     state: State<'_, Arc<Mutex<AppState>>>,
     db: State<'_, SqlitePool>,
     username: String,
     user_id: u64,
     port: Option<u16>,
+    room: String,
+    room_id: u64
 ) -> Result<(), String> {
     let port = port.unwrap_or(3625);
     let bind_addr = format!("0.0.0.0:{}", port); // Bind to all interfaces for network access
@@ -157,47 +159,76 @@ pub fn server_listen(
     let server_addr = socket.local_addr()
         .map_err(|e| format!("Failed to get server address: {}", e))?;
 
-    println!("Server listening on: {}", server_addr);
+    println!("🟢 Server (as participant) listening on: {}", server_addr);
 
-    // Update state
+    // Update state - Server is BOTH server AND participant
     {
         let mut state_guard = state.lock().unwrap();
         state_guard.server_addr = Some(server_addr);
         state_guard.username = username.clone();
         state_guard.user_id = Some(user_id);
         state_guard.is_server = true;
+        state_guard.current_room = room.clone();
+        state_guard.current_room_id = Some(room_id);
+
+        // Register server as a participant in the room
+        state_guard.room_clients
+            .lock()
+            .unwrap()
+            .entry(room.clone())
+            .or_insert_with(Vec::new)
+            .push(user_id);
+    }
+    // Send server join message to its own UI immediately
+    let join_message = Message {
+        message_type: MessageType::Connect,
+        username: username.clone(),
+        user_id,
+        message: format!("🟢 {} started the server and joined the chat", username),
+        message_id: Uuid::new_v4().to_string(),
+        room: room.clone(),
+        room_id,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        is_emoji: false,
+    };
+
+    // Save server join to database
+    let pool_clone = db.inner().clone();
+    let msg_clone = join_message.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = save_message_internal(
+            &pool_clone,
+            1, // room_id
+            msg_clone.user_id as i64,
+            msg_clone.message,
+            "Connect".to_string(),
+            false
+        ).await {
+            eprintln!("Failed to save server join message: {}", e);
+        }
+    });
+
+    // Emit join message to server's own UI
+    if let Err(e) = app.emit("message", serde_json::to_string(&join_message).unwrap()) {
+        eprintln!("Failed to emit server join message: {}", e);
     }
 
-    //  Server connects to itself as client
+    // Start accepting client connections
     let app_clone = app.clone();
-    // Clone the Arc<Mutex<AppState>> directly
     let state_clone = Arc::clone(&state.inner());
     let pool_clone = db.inner().clone();
-    let username_clone = username.clone();
 
     thread::spawn(move || {
-        // Connect as a client to self first
-        if let Err(e) = client_connect_internal(
-            app_clone.clone(),
-            state_clone.clone(),
-            format!("127.0.0.1:{}", port),
-            username_clone.clone(),
-            user_id,
-            "Company Wide".to_string(),
-            1
-        ) {
-            eprintln!("Server self-connect failed: {}", e);
-            return;
-        }
-
-        // Then start accepting other clients
         for stream in socket.incoming() {
             match stream {
                 Ok(stream) => {
+                    println!("🔵 New client connecting...");
                     let app_handle = app_clone.clone();
                     let state_handle = state_clone.clone();
                     let pool_handle = pool_clone.clone();
-
 
                     thread::spawn(move || {
                         if let Err(e) = handle_client_connection(app_handle, state_handle, stream, pool_handle) {
@@ -339,53 +370,64 @@ async fn clean_client(
     //Save the disconnect message to the database
     save_message_internal(pool, client.room_id as i64, client.user_id as i64, disconnect_msg.message.clone(), "Disconnect".to_string(), false).await?;
 
-    //Broadcast disconnect (without app.emit to avoid duplicates)
-    broadcast_to_room_efficient(app, state, &client.current_room, &disconnect_msg, Some(client.user_id));
+    //Broadcast disconnect
+    distribute_message_to_all(app, state, &client.current_room, &disconnect_msg, Some(client.user_id));
 
     Ok(())
 }
 
-//More efficient fir room broadcasting
-fn broadcast_to_room_efficient(_app: &tauri::AppHandle, state: &Arc<Mutex<AppState>>, target_room: &str, message: &Message, exclude_user_id: Option<u64>) {
+// ENHANCED MESSAGE DISTRIBUTION - Handles both network + local UI
+fn distribute_message_to_all(app: &tauri::AppHandle, state: &Arc<Mutex<AppState>>, target_room: &str, message: &Message, exclude_user_id: Option<u64>) {
     let state_guard = state.lock().unwrap();
     let streams = state_guard.server_streams.lock().unwrap();
     let room_clients = state_guard.room_clients.lock().unwrap();
+    let is_server = state_guard.is_server;
+    let server_user_id = state_guard.user_id;
 
-    //Only iterate over users in the target room
+    println!("🔍 Room '{}' contains users: {:?}", target_room, room_clients.get(target_room));
+
+    //Only iterate over users in the target room i.e., Send to network clients (other machines)
     if let Some (user_ids) = room_clients.get(target_room){
+        println!("📡 Broadcasting to {} network clients", user_ids.len());
+
         for &user_id in user_ids {
-            //Skip the excluded user
+            //Skip the excluded user (usually the sender)
             if let Some(exclude_user_id) = exclude_user_id {
                 if user_id == exclude_user_id {
                     continue;
                 }
             }
 
+            // Skip server's own user_id for network broadcast
+            // (server talks to its UI directly, not via network)
+            if is_server && Some(user_id) == server_user_id {
+                continue;
+            }
+
             if let Some (client_conn) = streams.get(&user_id){
-               let mut stream_clone = match client_conn.stream.try_lock() {
-                   Ok(guard) => match guard.try_clone() {
-                       Ok(stream) => stream,
-                       Err(e) => {
-                           eprintln!("Failed to clone stream for user {}: {}",user_id, e);
-                           continue;
-                       },
-                   }
-                   Err(e) => {
-                       eprintln!("Failed tp acquire lock for user {}: {}",user_id, e);
-                       continue;
-                   }
-               };
-                if let Err (e) = send_message_with_length(&mut stream_clone, message){
-                    eprintln!("Failed to send message to {} ({}): {}", client_conn.username, client_conn.addr, e);
+                // Lock the stream and send directly on the &mut TcpStream (no clone needed)
+                if let Ok (mut guard) = client_conn.stream.try_lock() {
+                    match send_message_with_length(&mut guard, message) {
+                        Ok(_) => println!("   ✅ Sent to {} ({})", client_conn.username, user_id),
+                        Err(e) => println!("   ❌ Failed to send to {}: {}", client_conn.username, e),
+                    }
+                }else {
+                    eprintln!("Failed to acquire lock for user {}: lock contended", user_id);
                 }
+
             }
         }
     }
-    // REMOVED: app.emit to prevent duplicates in server mode
-    // The server-hosting client will receive the message through its client_stream
+    // 2. ALWAYS send it to local UI (this machine's interface)
+    match app.emit("message", serde_json::to_string(message).unwrap()) {
+        Ok(_) => println!("📱 Emitted to local UI successfully"),
+        Err(e) => eprintln!("📱 Failed to emit to local UI: {}", e),
+    }
 }
 
 fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, message: Message, pool: SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
+    println!("🟢 Server handling message: {:?} from {}", message.message_type, message.username);
+
     match message.message_type {
         MessageType::Connect => {
             //Save connect the message to the db
@@ -396,7 +438,8 @@ fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, mes
                     eprintln!("Failed to save connect message to db: {}", e);
                 }
             });
-            broadcast_to_room_efficient(&app, &state, &message.room, &message, None);
+            // Distribute to all participants
+            distribute_message_to_all(&app, &state, &message.room, &message, None);
         }
         MessageType::Chat => {
             //save to db
@@ -407,18 +450,20 @@ fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, mes
                     eprintln!("Failed to save chat message to db: {}", e);
                 }
             });
-            broadcast_to_room_efficient(&app, &state, &message.room, &message, None);
+            // Distribute to all participants (exclude sender to avoid duplicate)
+            distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id));
         }
         MessageType::RoomJoin => {
             //Update client's room and room tracking
             {
                 let state_guard = state.try_lock().unwrap();
+                let mut server_streams_guard = state_guard.server_streams.try_lock().unwrap();
+                let mut room_clients_guard = state_guard.room_clients.try_lock().unwrap();
 
                 {
-                    let mut server_streams_guard = state_guard.server_streams.try_lock().unwrap();
                     if let Some(client) = server_streams_guard.get_mut(&message.user_id) {
                         //Remove from the old room
-                        if let Some(users) = state_guard.room_clients.try_lock().unwrap().get_mut(&client.current_room) {
+                        if let Some(users) = room_clients_guard.get_mut(&client.current_room) {
                             users.retain(|&id| id != message.user_id);
                         }
 
@@ -443,12 +488,214 @@ fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, mes
                     eprintln!("Failed to save room join message to db: {}", e);
                 }
             });
-            broadcast_to_room_efficient(&app, &state, &message.room, &message, None);
+            distribute_message_to_all(&app, &state, &message.room, &message, None);
         }
         _ => {}
     }
     Ok(())
 }
+
+// ENHANCED SEND FUNCTION - Server as Participant
+#[tauri::command(rename_all = "snake_case")]
+pub fn send_as_server_participant(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+    db: State<'_, SqlitePool>,
+    message: String,
+    user_id: u64,
+    room: String,
+    room_id: u64,
+    is_emoji: bool,
+) -> Result<(), String> {
+    let username = {
+        let state_guard = state.inner().lock().unwrap();
+        state_guard.username.clone()
+    };
+
+    let chat_message = Message {
+        message_type: MessageType::Chat,
+        username: username.clone(),
+        user_id,
+        message: message.clone(),
+        room_id,
+        room,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        is_emoji,
+        message_id: Uuid::new_v4().to_string(),
+    };
+
+    // Save to database
+    let pool_clone = db.inner().clone();
+    let msg_clone = chat_message.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = save_message_internal(
+            &pool_clone,
+            msg_clone.room_id as i64,
+            msg_clone.user_id as i64,
+            msg_clone.message,
+            "Chat".to_string(),
+            false
+        ).await {
+            eprintln!("Failed to save server message to DB: {}", e);
+        }
+    });
+
+    // Distribute to everyone Send to everyone, no exclusions for server messages
+    distribute_message_to_all(&app, state.inner(), &chat_message.room, &chat_message, None);
+
+    Ok(())
+}
+
+// CLIENT CONNECT FUNCTION - For external clients joining server
+#[tauri::command]
+pub fn client_connect_to_server(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+    host: String,
+    username: String,
+    user_id: u64,
+    room: String,
+    room_id: u64
+) -> Result<(), String> {
+    println!("🔵 Client connecting to server at {}", host);
+
+    let stream = TcpStream::connect(&host)
+        .map_err(|e| format!("Failed to connect to {}: {}", host, e))?;
+
+    // Update client state
+    {
+        let mut state_guard = state.lock().unwrap();
+        state_guard.username = username.clone();
+        state_guard.user_id = Some(user_id);
+        state_guard.current_room = room.clone();
+        state_guard.current_room_id = Some(room_id);
+        state_guard.is_server = false;
+        *state_guard.client_stream.lock().unwrap() = Some(stream.try_clone()
+            .map_err(|e| format!("Failed to clone stream: {}", e))?);
+    }
+
+    // Send connect message
+    let connect_message = Message {
+        message_type: MessageType::Connect,
+        username: username.clone(),
+        user_id,
+        message: format!("🔵 {} joined the chat", username),
+        room: room.clone(),
+        room_id,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        is_emoji: false,
+        message_id: Uuid::new_v4().to_string(),
+    };
+
+    let mut stream_clone = stream.try_clone()
+        .map_err(|e| format!("Failed to clone stream: {}", e))?;
+    send_message_with_length(&mut stream_clone, &connect_message)
+        .map_err(|e| format!("Failed to send connect message: {}", e))?;
+
+    // Start listening for messages from server
+    start_client_listener(app, stream);
+
+    println!("✅ Client connected successfully");
+    Ok(())
+}
+
+// CLIENT SEND FUNCTION - For external clients
+#[tauri::command(rename_all = "snake_case")]
+pub fn send_as_client(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<Mutex<AppState>>>,
+    message: String,
+    user_id: u64,
+    room: String,
+    room_id: u64,
+    is_emoji: bool,
+) -> Result<(), String> {
+
+    let (username, client_stream) = {
+        let state_guard = state.lock().unwrap();
+        let stream = state_guard.client_stream.lock().unwrap().as_ref().map(|s| s.try_clone());
+        (state_guard.username.clone(), stream)
+    };
+
+    println!("🔵 Client sending: '{}'", message);
+
+    let chat_message = Message {
+        message_type: MessageType::Chat,
+        username: username.clone(),
+        user_id,
+        message: message.clone(),
+        room_id,
+        room,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        is_emoji,
+        message_id: Uuid::new_v4().to_string(),
+    };
+
+    // Send to server
+    if let Some(Ok(mut stream)) = client_stream {
+        send_message_with_length(&mut stream, &chat_message)
+            .map_err(|e| format!("Failed to send message to server: {}", e))?;
+    } else {
+        return Err("Not connected to server".to_string());
+    }
+
+    // Show in own UI immediately (don't wait for server echo)
+    if let Err(e) = app.emit("message", serde_json::to_string(&chat_message).unwrap()) {
+        eprintln!("Failed to emit own message to UI: {}", e);
+    }
+
+    Ok(())
+}
+
+fn start_client_listener(app: tauri::AppHandle, mut stream: TcpStream) {
+    thread::spawn(move || {
+        println!("🎧 Client listener started");
+
+        loop {
+            let mut len_bytes = [0u8;4];
+            match stream.read_exact(&mut len_bytes) {
+                Ok(()) => {
+                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+                    let mut message_buffer = vec![0u8; msg_len];
+
+                    match stream.read_exact(&mut message_buffer) {
+                        Ok(()) => {
+                            if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
+                                println!("🎧 Client received: {}", message_str);
+                                if let Err(e) = app.emit("message", message_str) {
+                                    eprintln!("Failed to emit received message: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            println!("🔴 Client read error: {}", e);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    println!("🔴 Client connection lost: {}", e);
+                    if let Err(emit_err) = app.emit("connection_lost", ()) {
+                        eprintln!("Failed to emit connection lost: {}", emit_err);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+#[tauri::command]
+pub fn server_participant_join_room(){}
 
 #[tauri::command]
 pub fn client_connect(
@@ -516,10 +763,229 @@ fn client_connect_internal(
     send_message_with_length(&mut stream_clone, &message)
         .map_err(|e| format!("Failed to send connect message: {}", e))?;
 
-    // IMPROVED: Start listener with reconnection capability
+    // Start listener with reconnection capability
     start_client_listener_with_reconnection(app, stream);
 
     Ok(())
+}
+
+//Always use client_stream for consistency even in server mode
+#[tauri::command(rename_all = "snake_case")]
+pub fn send(
+    state: State<'_, Arc<Mutex<AppState>>>,
+    message: String,
+    user_id: u64,
+    room: String,
+    room_id: u64,
+    is_emoji: bool,
+) -> Result<(), String> {
+    let state_guard = state.try_lock().unwrap();
+
+    /*TODO confirmed seems messages reach here however the 2 parties dont get them in real time
+       Plus after send even the sender cannot the message he sent persisting seems to work just fine
+       just that no real time interaction happening*/
+    println!("Sending message: {}", message);
+
+    let chat_message = Message {
+        message_type: MessageType::Chat,
+        username: state_guard.username.clone(),
+        user_id,
+        message,
+        room_id,
+        room,
+        created_at: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+        is_emoji,
+        message_id: Uuid::new_v4().to_string(),
+    };
+
+    // Always use client_stream for consistency
+    // Lock the client_stream and send directly on the &mut TcpStream (no clone needed)
+    let mut client_stream_guard = state_guard.client_stream.try_lock().unwrap();
+    if let Some(stream) = client_stream_guard.as_mut() {
+
+        send_message_with_length(stream, &chat_message)
+            .map_err(|e| format!("Failed to send message: {}", e))?;
+    }else {
+        return Err("Not connected to server".to_string())
+    }
+    Ok(())
+}
+
+#[tauri::command]
+pub fn get_server_info(state: State<'_, Arc<Mutex<AppState>>>) -> Option<String> {
+    let state_guard = state.lock().unwrap();
+    state_guard.server_addr.map(|addr| addr.to_string())
+}
+
+fn send_message_with_length(
+    stream: &mut TcpStream,
+    message: &Message,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // Serialize message to JSON
+    let payload = serde_json::to_string(message)?;
+    let len = payload.len() as u32;
+
+    // Send length (4 bytes) then payload
+    stream.write_all(&len.to_be_bytes())?;
+    stream.write_all(payload.as_bytes())?;
+    stream.flush()?;
+
+    Ok(())
+}
+
+// New async version for tokio operations
+async fn send_message_with_length_async(
+    stream: &mut tokio::net::tcp::OwnedWriteHalf,
+    message: &Message,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let serialized = serde_json::to_string(message)?;
+    let length = serialized.len() as u32;
+
+    stream.write_all(&length.to_be_bytes()).await?;
+    stream.write_all(serialized.as_bytes()).await?;
+    stream.flush().await?;
+
+    Ok(())
+}
+
+fn get_data(app: tauri::AppHandle, mut stream: TcpStream) {
+    thread::spawn(move || {
+        let mut buffer = [0; 1024];
+
+        loop {
+            match stream.read(&mut buffer) {
+                Ok(0) => break, // Connection closed
+                Ok(n) => {
+                    let message_data = &buffer[..n];
+                    if let Ok(message_str) = std::str::from_utf8(message_data) {
+                        app.emit("message", &message_str).unwrap();
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    });
+}
+
+fn get_data_with_length_prefix(app: tauri::AppHandle, mut stream: TcpStream) {
+    thread::spawn(move || {
+        loop {
+            //Read length header
+            let mut len_bytes = [0u8; 4];
+            match stream.read_exact(&mut len_bytes) {
+                Ok(()) => {
+                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+
+                    //Read message payload
+                    let mut message_buffer = vec![0u8; msg_len];
+                    match stream.read_exact(&mut message_buffer) {
+                        Ok(()) => {
+                            if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
+                                //Emit the message to the frontend
+                                app.emit("message", &message_str).unwrap();
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                Err(_) => break, //Connection closed
+            }
+        }
+    });
+}
+
+// Client listener with reconnection logic
+fn start_client_listener_with_reconnection(app: tauri::AppHandle, mut stream: TcpStream) {
+    let peer_addr = stream.peer_addr();
+    thread::spawn(move || {
+        loop {
+            let mut len_bytes = [0u8; 4];
+            match stream.read_exact(&mut len_bytes) {
+                Ok(()) => {
+                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+                    //TODO (Is check msg_len > 10_000_000 necessary here as well)
+
+                    let mut message_buffer = vec![0u8; msg_len];
+                    match stream.read_exact(&mut message_buffer) {
+                        Ok(()) => {
+                            if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
+                                if let Err(e) = app.emit("message", &message_str) {
+                                    eprintln!("Failed to emit message: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Client read error: {}, peer: {:?}", e, peer_addr);
+                            break;
+                        }
+                    }
+                }
+                Err(e) => {
+                    eprintln!("Client stream closed: {}, peer: {:?}", e, peer_addr);
+                    //Notify the frontend of connection loss
+                    if let Err (emit_err) = app.emit("connection_lost", ()){
+                        eprintln!("Failed to emit connection lost: {}", emit_err);
+                    }
+                    break;
+                }
+            }
+        }
+    });
+}
+
+// Updated listener function
+fn start_client_listener_with_reconnection_async(
+    app: tauri::AppHandle,
+    read_half: tokio::net::tcp::OwnedReadHalf
+) {
+    tauri::async_runtime::spawn(async move {
+        let mut read_stream = read_half;
+        let peer_addr = read_stream.peer_addr();
+        loop {
+            let mut len_bytes = [0u8; 4];
+            match read_stream.read_exact(&mut len_bytes).await {
+                Ok(0) => {
+                    println!("Connection closed by server");
+                    break;
+                }
+                Ok(n) => {
+                    // Process received data
+                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+                    let mut message_buffer = vec![0u8; msg_len];
+                    match read_stream.read_exact(&mut message_buffer).await {
+                        Ok(0) => {
+                            println!("Failed to read message:");
+                            break;
+                        }
+                        Ok(_n) => {
+                            if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
+                                if let Err(e) = app.emit("message", &message_str) {
+                                    eprintln!("Failed to emit message: {}", e);
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            eprintln!("Client read error: {}", e);
+                            break;
+                        }
+                    }
+
+                }
+                Err(e) => {
+                    // Handle reconnection logic
+                    eprintln!("Client stream closed: {}, peer: {:?}", e, peer_addr);
+                    //Notify the frontend of connection loss
+                    if let Err (emit_err) = app.emit("connection_lost", ()){
+                        eprintln!("Failed to emit connection lost: {}", emit_err);
+                    }
+                    break;
+                }
+            }
+        }
+    });
 }
 
 async fn client_connect_internal_async(
@@ -586,219 +1052,6 @@ async fn client_connect_internal_async(
 
     // Start listener with async read half
     start_client_listener_with_reconnection_async(app, read_half);
-
-    Ok(())
-}
-
-
-// Client listener with reconnection logic
-fn start_client_listener_with_reconnection(app: tauri::AppHandle, mut stream: TcpStream) {
-   let peer_addr = stream.peer_addr();
-    thread::spawn(move || {
-        loop {
-            let mut len_bytes = [0u8; 4];
-            match stream.read_exact(&mut len_bytes) {
-                Ok(()) => {
-                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
-                    //TODO (Is check msg_len > 10_000_000 necessary here as well)
-
-                    let mut message_buffer = vec![0u8; msg_len];
-                    match stream.read_exact(&mut message_buffer) {
-                        Ok(()) => {
-                            if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
-                                if let Err(e) = app.emit("message", &message_str) {
-                                    eprintln!("Failed to emit message: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Client read error: {}, peer: {:?}", e, peer_addr);
-                            break;
-                        }
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Client stream closed: {}, peer: {:?}", e, peer_addr);
-                    //Notify the frontend of connection loss
-                    if let Err (emit_err) = app.emit("connection_lost", ()){
-                        eprintln!("Failed to emit connection lost: {}", emit_err);
-                    }
-                    break;
-                }
-            }
-        }
-    });
-}
-
-// Updated listener function
-fn start_client_listener_with_reconnection_async(
-    app: tauri::AppHandle,
-    read_half: tokio::net::tcp::OwnedReadHalf
-) {
-    tauri::async_runtime::spawn(async move {
-        let mut read_stream = read_half;
-        let peer_addr = read_stream.peer_addr();
-        loop {
-        let mut len_bytes = [0u8; 4];
-            match read_stream.read_exact(&mut len_bytes).await {
-                Ok(0) => {
-                    println!("Connection closed by server");
-                    break;
-                }
-                Ok(n) => {
-                    // Process received data
-                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
-                    let mut message_buffer = vec![0u8; msg_len];
-                    match read_stream.read_exact(&mut message_buffer).await {
-                        Ok(0) => {
-                            println!("Failed to read message:");
-                            break;
-                        }
-                        Ok(_n) => {
-                            if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
-                                if let Err(e) = app.emit("message", &message_str) {
-                                    eprintln!("Failed to emit message: {}", e);
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            eprintln!("Client read error: {}", e);
-                            break;
-                        }
-                    }
-
-                }
-                Err(e) => {
-                    // Handle reconnection logic
-                    eprintln!("Client stream closed: {}, peer: {:?}", e, peer_addr);
-                    //Notify the frontend of connection loss
-                    if let Err (emit_err) = app.emit("connection_lost", ()){
-                        eprintln!("Failed to emit connection lost: {}", emit_err);
-                    }
-                    break;
-                }
-            }
-        }
-    });
-}
-//Always use client_stream for consistency even in server mode
-#[tauri::command(rename_all = "snake_case")]
-pub fn send(
-    state: State<'_, Arc<Mutex<AppState>>>,
-    message: String,
-    user_id: u64,
-    room: String,
-    room_id: u64,
-    is_emoji: bool,
-) -> Result<(), String> {
-    let state_guard = state.try_lock().unwrap();
-
-    let chat_message = Message {
-        message_type: MessageType::Chat,
-        username: state_guard.username.clone(),
-        user_id,
-        message,
-        room_id,
-        room,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
-        is_emoji,
-        message_id: Uuid::new_v4().to_string(),
-    };
-
-    // Always use client_stream for consistency
-    if let Some(ref mut stream) = *state_guard.client_stream.try_lock().unwrap() {
-        let mut stream_clone = stream.try_clone()
-            .map_err(|e| format!("Failed to clone stream: {}", e))?;
-        send_message_with_length(&mut stream_clone, &chat_message)
-            .map_err(|e| format!("Failed to send message: {}", e))?;
-    }else {
-        return Err("Not connected to server".to_string())
-    }
-    Ok(())
-}
-
-#[tauri::command]
-pub fn get_server_info(state: State<'_, Arc<Mutex<AppState>>>) -> Option<String> {
-    let state_guard = state.lock().unwrap();
-    state_guard.server_addr.map(|addr| addr.to_string())
-}
-
-fn get_data(app: tauri::AppHandle, mut stream: TcpStream) {
-    thread::spawn(move || {
-        let mut buffer = [0; 1024];
-
-        loop {
-            match stream.read(&mut buffer) {
-                Ok(0) => break, // Connection closed
-                Ok(n) => {
-                    let message_data = &buffer[..n];
-                    if let Ok(message_str) = std::str::from_utf8(message_data) {
-                        app.emit("message", &message_str).unwrap();
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    });
-}
-
-fn get_data_with_length_prefix(app: tauri::AppHandle, mut stream: TcpStream) {
-    thread::spawn(move || {
-        loop {
-            //Read length header
-            let mut len_bytes = [0u8; 4];
-            match stream.read_exact(&mut len_bytes) {
-                Ok(()) => {
-                    let msg_len = u32::from_be_bytes(len_bytes) as usize;
-
-                    //Read message payload
-                    let mut message_buffer = vec![0u8; msg_len];
-                    match stream.read_exact(&mut message_buffer) {
-                        Ok(()) => {
-                            if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
-                                //Emit the message to the frontend
-                                app.emit("message", &message_str).unwrap();
-                            }
-                        }
-                        Err(_) => break,
-                    }
-                }
-                Err(_) => break, //Connection closed
-            }
-        }
-    });
-}
-
-fn send_message_with_length(
-    stream: &mut TcpStream,
-    message: &Message,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Serialize message to JSON
-    let payload = serde_json::to_string(message)?;
-    let len = payload.len() as u32;
-
-    // Send length (4 bytes) then payload
-    stream.write_all(&len.to_be_bytes())?;
-    stream.write_all(payload.as_bytes())?;
-    stream.flush()?;
-
-    Ok(())
-}
-
-// New async version for tokio operations
-async fn send_message_with_length_async(
-    stream: &mut tokio::net::tcp::OwnedWriteHalf,
-    message: &Message,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let serialized = serde_json::to_string(message)?;
-    let length = serialized.len() as u32;
-
-    stream.write_all(&length.to_be_bytes()).await?;
-    stream.write_all(serialized.as_bytes()).await?;
-    stream.flush().await?;
 
     Ok(())
 }

@@ -41,22 +41,22 @@ const Chat = () => {
   }, [currentRoom]);
 
   //On app boot, try auto-login
-  useEffect(() => {
-    //todo auto login should be able to start either server or client?
-    const savedId = localStorage.getItem("nutler.userId");
-
-    if (savedId) {
-      invoke("get_user_by_id", { id: Number(savedId) })
-        .then((u) => {
-          const user = u as User;
-          setCurrentUser(user);
-          setUsername(user.name);
-          setCurrentView("rooms");
-          loadChatRooms();
-        })
-        .catch(() => localStorage.removeItem("nutler.userId"));
-    }
-  }, []);
+  // useEffect(() => {
+  //   //todo auto login should be able to start either server or client?
+  //   const savedId = localStorage.getItem("nutler.userId");
+  //
+  //   if (savedId) {
+  //     invoke("get_user_by_id", { id: Number(savedId) })
+  //       .then((u) => {
+  //         const user = u as User;
+  //         setCurrentUser(user);
+  //         setUsername(user.name);
+  //         setCurrentView("rooms");
+  //         loadChatRooms();
+  //       })
+  //       .catch(() => localStorage.removeItem("nutler.userId"));
+  //   }
+  // }, []);
 
   //listen for messages events from the server
   useEffect(() => {
@@ -83,8 +83,8 @@ const Chat = () => {
                   msg.username === m.username &&
                   Math.abs(
                     new Date(msg.created_at).getTime() -
-                      new Date(Number(m.created_at) * 1000).getTime(),
-                  ) < 1000, // Within 1 second,
+                      new Date(Number(m.created_at) * 1000).getTime()
+                  ) < 1000 // Within 1 second,
               );
 
               if (isDuplicate) {
@@ -103,14 +103,14 @@ const Chat = () => {
                   message_type: m.message_type,
                   is_emoji: m.is_emoji || false,
                   created_at: new Date(
-                    Number(m.created_at) * 1000,
+                    Number(m.created_at) * 1000
                   ).toISOString(),
                 },
               ];
             });
           } else {
             console.log(
-              `Message for different room: ${m.room} vs ${currentRoom?.name}`,
+              `Message for different room: ${m.room} vs ${currentRoom?.name}`
             );
           }
         } catch (error) {
@@ -236,15 +236,6 @@ const Chat = () => {
           const addr = (await invoke("get_server_info")) as string;
           const host = addr.replace("0.0.0.0", "127.0.0.1");
           console.log("Server listening on:", host);
-
-          //no need to connect to server, it will connect automatically
-          // await invoke("client_connect", {
-          //   host,
-          //   username,
-          //   userId: user.id,
-          //   room: user.department_name,
-          //   roomId: user.department_id,
-          // });
         } else {
           await invoke("client_connect_to_server", {
             host: serverIp,
@@ -269,14 +260,34 @@ const Chat = () => {
       console.log("Cannot join room - missing user or room ID");
       return;
     }
-    //TODO we need tauri methods that hanlde room joins as well.
 
     console.log(`Joining room: ${room.name} (ID: ${room.id})`);
 
     try {
-      await invoke("join_room", { userId: currentUser.id, roomId: room.id });
+      //Update the UI
       setCurrentRoom(room);
       setCurrentView("chat");
+
+      //Tells server about room switch
+      // if (mode === "server") {
+      //   await invoke("server_participant_join_room", {
+      //     userId: currentUser.id,
+      //     newRoom: room.name,
+      //     newRoomId: room.id,
+      //     oldRoom: currentUser.department_name,
+      //   });
+      // } else {
+      //   await invoke("client_join_room", {
+      //     userId: currentUser.id,
+      //     newRoom: room.name,
+      //     newRoomId: room.id,
+      //   });
+      // }
+
+      console.log(`Switched to room: ${room.name} (ID: ${room.id})`);
+      //persists in the db the number of online users in a room
+      await invoke("join_room", { userId: currentUser.id, roomId: room.id });
+
       console.log("Successfully joined room");
     } catch (error) {
       console.error("Error joining room:", error);
@@ -295,10 +306,10 @@ const Chat = () => {
           {
             message: message,
             user_id: currentUser.id,
-            room: currentRoom.department_name,
-            room_id: currentRoom.id,
+            // room: currentRoom.department_name,
+            // room_id: currentRoom.id,
             is_emoji: false,
-          },
+          }
         );
 
         setMessage(""); // Only clear the input text

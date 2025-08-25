@@ -1,9 +1,9 @@
+use crate::db_queries::{create_user, get_chat_rooms, get_departments, get_room_messages, get_rooms_by_department, get_user_by_id, get_users, join_room, leave_room, save_message, update_user_online_status, upsert_user};
+use crate::sockets::{client_connect_to_server, client_join_room, discover_servers, get_server_info, send_as_client, send_as_server_participant, server_listen_as_participant, server_participant_join_room, AppState};
+use sqlx::SqlitePool;
 use std::env;
 use std::sync::{Arc, Mutex};
-use sqlx::SqlitePool;
 use tauri::Manager;
-use crate::db_queries::{create_user, get_users, get_user_by_id, update_user_online_status, get_departments, get_chat_rooms, get_rooms_by_department, join_room, leave_room, save_message, get_room_messages, upsert_user};
-use crate::sockets::{AppState, server_listen_as_participant, client_connect, send, get_server_info, discover_servers, send_as_server_participant, client_connect_to_server, send_as_client};
 
 mod migration;
 mod db_queries;
@@ -68,9 +68,9 @@ pub fn run() {
             // Message management
             save_message, get_room_messages,
             // Socket management
-            client_connect, send, get_server_info, discover_servers,
+            get_server_info, discover_servers,
             server_listen_as_participant, send_as_server_participant, client_connect_to_server,
-            send_as_client
+            send_as_client, server_participant_join_room, client_join_room
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application Jesse => ");

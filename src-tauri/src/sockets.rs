@@ -8,6 +8,7 @@ use std::time::Duration;
 use tauri::{Emitter, State};
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
@@ -116,13 +117,13 @@ pub async fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
 
     for (ip, port) in targets {
         let permit = semaphore.clone().acquire_owned().await.unwrap();
-        tasks.spawn(async move{
+        tasks.spawn(async move {
             // Hold the permit for the duration of the probe
             let _p = permit;
             let addr = format!("{}:{}", ip, port);
 
             // 100ms timeout for probe
-            let probe = timeout(Duration::from_millis(100), tokio::net::TcpStream::connect(&addr)).await;
+            let probe = timeout(Duration::from_millis(100), TcpStream::connect(&addr)).await;
             if let Ok(Ok(_)) = probe {
                 Some(ServerInfo {
                     address: ip.clone(),
@@ -255,7 +256,7 @@ pub async fn server_listen_as_participant(
 async fn handle_client_connection(
     app: tauri::AppHandle,
     state: Arc<Mutex<AppState>>,
-    stream: tokio::net::TcpStream,
+    stream: TcpStream,
     pool: SqlitePool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let peer_addr = stream.peer_addr()?;
@@ -584,7 +585,7 @@ pub async fn client_connect_to_server(
 ) -> Result<(), String> {
     println!("🔵 Client connecting to server at {}", host);
 
-    let stream = tokio::net::TcpStream::connect(&host).await
+    let stream = TcpStream::connect(&host).await
         .map_err(|e| format!("Failed to connect to {}: {}", host, e))?;
 
     let (mut reader, mut writer) = stream.into_split();

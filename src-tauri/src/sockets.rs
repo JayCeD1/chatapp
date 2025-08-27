@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, State};
 use tokio::io::AsyncReadExt;
@@ -27,23 +27,23 @@ pub struct ClientConnection {
     pub connected_at: std::time::SystemTime,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug)]
 pub struct AppState {
-    #[serde(skip)]
+    // Async collections behind Arcs so AppState can be shared easily
     // Use user_id as key for O(1) lookups
-    pub server_streams: Arc<Mutex<HashMap<u64, ClientConnection>>>,
-    #[serde(skip)]
+    pub server_streams: Arc<tokio::sync::Mutex<HashMap<u64, ClientConnection>>>,
     // Separate client stream management
     pub client_stream: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
-    #[serde(skip)]
     // Track which users are in which rooms for efficient broadcasting
-    pub room_clients: Arc<Mutex<HashMap<String, Vec<u64>>>>,
-    pub username: String,
-    pub user_id: Option<u64>,
-    pub is_server: bool,
-    pub current_room: String,
-    pub current_room_id: Option<u64>,
-    pub server_addr: Option<SocketAddr>,
+    pub room_clients: Arc<tokio::sync::Mutex<HashMap<String, Vec<u64>>>>,
+
+    // Use RwLock for frequently-read scalar fields
+    pub username: tokio::sync::RwLock<String>,
+    pub user_id: tokio::sync::RwLock<Option<u64>>,
+    pub is_server: tokio::sync::RwLock<bool>,
+    pub current_room: tokio::sync::RwLock<String>,
+    pub current_room_id: tokio::sync::RwLock<Option<u64>>,
+    pub server_addr: tokio::sync::RwLock<Option<SocketAddr>>,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -147,7 +147,7 @@ pub async fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
 #[tauri::command]
 pub async fn server_listen_as_participant(
     app: tauri::AppHandle,
-    state: State<'_, Arc<Mutex<AppState>>>,
+    state: State<'_, Arc<AppState>>,
     db: State<'_, SqlitePool>,
     username: String,
     user_id: u64,
@@ -167,21 +167,18 @@ pub async fn server_listen_as_participant(
 
     // Update state - Server is BOTH server AND participant
     {
-        let mut state_guard = state.lock().unwrap();
-        state_guard.server_addr = Some(server_addr);
-        state_guard.username = username.clone();
-        state_guard.user_id = Some(user_id);
-        state_guard.is_server = true;
-        state_guard.current_room = room.clone();
-        state_guard.current_room_id = Some(room_id);
+        *state.server_addr.write().await = Some(server_addr);
+        *state.username.write().await = username.clone();
+        *state.user_id.write().await = Some(user_id);
+        *state.is_server.write().await = true;
+        *state.current_room.write().await = room.clone();
+        *state.current_room_id.write().await = Some(room_id);
+
 
         // Register server as a participant in the room
-        state_guard.room_clients
-            .lock()
-            .unwrap()
-            .entry(room.clone())
-            .or_insert_with(Vec::new)
-            .push(user_id);
+        let mut rooms = state.room_clients.lock().await;
+        rooms.entry(room.clone()).or_default().push(user_id);
+
     }
     // Send server join message to its own UI immediately
     let join_message = Message {
@@ -255,7 +252,7 @@ pub async fn server_listen_as_participant(
 // Client handler - uses tokio::spawn internally but can use tauri for DB/events
 async fn handle_client_connection(
     app: tauri::AppHandle,
-    state: Arc<Mutex<AppState>>,
+    state: Arc<AppState>,
     stream: TcpStream,
     pool: SqlitePool,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -304,19 +301,12 @@ async fn handle_client_connection(
 
                     //Add to the server's stream list using user_id as a key
                     {
-                        let state_guard = state.lock().unwrap();
-                        state_guard
-                            .server_streams
-                            .lock()
-                            .unwrap()
-                            .insert(message.user_id, client_info.as_ref().unwrap().clone());
+                        let mut streams = state.server_streams.lock().await;
+                        streams.insert(message.user_id, client_info.as_ref().unwrap().clone());
 
                         //Add to room tracking
-                        state_guard
-                            .room_clients
-                            .lock()
-                            .unwrap()
-                            .entry(message.room.clone())
+                        let mut rooms = state.room_clients.lock().await;
+                        rooms.entry(message.room.clone())
                             .or_insert_with(Vec::new)
                             .push(message.user_id);
                     }
@@ -349,26 +339,21 @@ async fn handle_client_connection(
 }
 //Separate cleanup function
 async fn clean_client(
-    state: &Arc<Mutex<AppState>>,
+    state: &Arc<AppState>,
     app: &tauri::AppHandle,
     client: ClientConnection,
     pool: &SqlitePool,
 ) -> Result<(), Box<dyn std::error::Error>> {
     {
-        let state_guard = state.lock().unwrap();
 
         //Remove from server's stream list
-        {
-            let mut streams = state_guard.server_streams.lock().unwrap();
-            streams.remove(&client.user_id);
-        }
+        let mut streams = state.server_streams.lock().await;
+        streams.remove(&client.user_id);
 
         //Remove from room tracking
-        {
-            let mut rooms = state_guard.room_clients.lock().unwrap();
-            if let Some(users) = rooms.get_mut(&client.current_room) {
-                users.retain(|&id| id != client.user_id);
-            }
+        let mut rooms = state.room_clients.lock().await;
+        if let Some(users) = rooms.get_mut(&client.current_room) {
+            users.retain(|&id| id != client.user_id);
         }
     }
     println!("Client disconnected: {} (ID: {})", client.username, client.user_id);
@@ -390,18 +375,17 @@ async fn clean_client(
     save_message_internal(pool, client.room_id as i64, client.user_id as i64, disconnect_msg.message.clone(), "Disconnect".to_string(), false).await?;
 
     //Broadcast disconnect
-    distribute_message_to_all(app, state, &client.current_room, &disconnect_msg, Some(client.user_id));
+    distribute_message_to_all(app, state, &client.current_room, &disconnect_msg, Some(client.user_id)).await;
 
     Ok(())
 }
 
-// ENHANCED MESSAGE DISTRIBUTION - Handles both network + local UI
-fn distribute_message_to_all(app: &tauri::AppHandle, state: &Arc<Mutex<AppState>>, target_room: &str, message: &Message, exclude_user_id: Option<u64>) {
-    let state_guard = state.lock().unwrap();
-    let streams = state_guard.server_streams.lock().unwrap();
-    let room_clients = state_guard.room_clients.lock().unwrap();
-    let is_server = state_guard.is_server;
-    let server_user_id = state_guard.user_id;
+// ENHANCED MESSAGE DISTRIBUTION - Handles both network + local UI now async to await tokio locks
+async fn distribute_message_to_all(app: &tauri::AppHandle, state: &Arc<AppState>, target_room: &str, message: &Message, exclude_user_id: Option<u64>) {
+    let streams = state.server_streams.lock().await;
+    let room_clients = state.room_clients.lock().await;
+    let is_server = *state.is_server.read().await;
+    let server_user_id = *state.user_id.read().await;
 
     println!("🔍 Room '{}' contains users: {:?}", target_room, room_clients.get(target_room));
 
@@ -446,7 +430,7 @@ fn distribute_message_to_all(app: &tauri::AppHandle, state: &Arc<Mutex<AppState>
     }
 }
 
-async fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>>, message: Message, pool: SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
+async fn handle_server_message(app: tauri::AppHandle, state: Arc<AppState>, message: Message, pool: SqlitePool) -> Result<(), Box<dyn std::error::Error>> {
     println!("🟢 Server handling message: {:?} from {}", message.message_type, message.username);
 
     match message.message_type {
@@ -460,7 +444,7 @@ async fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>
                 }
             });
             // Distribute to all participants
-            distribute_message_to_all(&app, &state, &message.room, &message, None);
+            distribute_message_to_all(&app, &state, &message.room, &message, None).await;
         }
         MessageType::Chat => {
             //save to db
@@ -472,14 +456,13 @@ async fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>
                 }
             });
             // Distribute to all participants (exclude sender to avoid duplicate)
-            distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id));
+            distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id)).await;
         }
         MessageType::RoomJoin => {
             //Update client's room and room tracking
             {
-                let state_guard = state.lock().unwrap();
-                let mut server_streams_guard = state_guard.server_streams.try_lock().unwrap();
-                let mut room_clients_guard = state_guard.room_clients.try_lock().unwrap();
+                let mut server_streams_guard = state.server_streams.lock().await;
+                let mut room_clients_guard = state.room_clients.lock().await;
 
                 {
                     if let Some(client) = server_streams_guard.get_mut(&message.user_id) {
@@ -509,7 +492,7 @@ async fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>
                     eprintln!("Failed to save room join message to db: {}", e);
                 }
             });
-            distribute_message_to_all(&app, &state, &message.room, &message, None);
+            distribute_message_to_all(&app, &state, &message.room, &message, None).await;
         }
         _ => {}
     }
@@ -518,22 +501,18 @@ async fn handle_server_message(app: tauri::AppHandle, state: Arc<Mutex<AppState>
 
 // ENHANCED SEND FUNCTION - Server as Participant
 #[tauri::command(rename_all = "snake_case")]
-pub fn send_as_server_participant(
+pub async  fn send_as_server_participant(
     app: tauri::AppHandle,
-    state: State<'_, Arc<Mutex<AppState>>>,
+    state: State<'_, Arc<AppState>>,
     db: State<'_, SqlitePool>,
     message: String,
     user_id: u64,
     is_emoji: bool,
 ) -> Result<(), String> {
 
-    let (username,room,room_id) = {
-        let state_guard = state.inner().lock().unwrap();
-        (state_guard.username.clone(),
-        state_guard.current_room.clone(),
-        state_guard.current_room_id.unwrap_or(1)
-        )
-    };
+    let username = state.username.read().await.clone();
+    let room = state.current_room.read().await.clone();
+    let room_id = state.current_room_id.read().await.unwrap_or(1);
 
     let chat_message = Message {
         message_type: MessageType::Chat,
@@ -567,7 +546,7 @@ pub fn send_as_server_participant(
     });
 
     // Distribute to everyone Send to everyone, no exclusions for server messages
-    distribute_message_to_all(&app, state.inner(), &chat_message.room, &chat_message, None);
+    distribute_message_to_all(&app, state.inner(), &chat_message.room, &chat_message, None).await;
 
     Ok(())
 }
@@ -576,7 +555,7 @@ pub fn send_as_server_participant(
 #[tauri::command]
 pub async fn client_connect_to_server(
     app: tauri::AppHandle,
-    state: State<'_, Arc<Mutex<AppState>>>,
+    state: State<'_, Arc<AppState>>,
     host: String,
     username: String,
     user_id: u64,
@@ -588,18 +567,15 @@ pub async fn client_connect_to_server(
     let stream = TcpStream::connect(&host).await
         .map_err(|e| format!("Failed to connect to {}: {}", host, e))?;
 
-    let (mut reader, mut writer) = stream.into_split();
+    let (reader, mut writer) = stream.into_split();
 
     // Update client state
-    let client_stream_arc ={
-        let mut state_guard = state.lock().unwrap();
-        state_guard.username = username.clone();
-        state_guard.user_id = Some(user_id);
-        state_guard.current_room = room.clone();
-        state_guard.current_room_id = Some(room_id);
-        state_guard.is_server = false;
-        // Store the write half for later sends
-        state_guard.client_stream.clone()
+    {
+        *state.username.write().await = username.clone();
+        *state.user_id.write().await = Some(user_id);
+        *state.current_room.write().await = room.clone();
+        *state.current_room_id.write().await = Some(room_id);
+        *state.is_server.write().await = false;
     };
 
     // Send connect message BEFORE storing the writer (fully async, no blocking)
@@ -623,7 +599,7 @@ pub async fn client_connect_to_server(
 
     // Now store the writer for later sends (await AFTER the std::Mutex is dropped)
     {
-        let mut guard = client_stream_arc.lock().await;
+        let mut guard = state.client_stream.lock().await;
         *guard = Some(writer);
     }
 
@@ -637,21 +613,15 @@ pub async fn client_connect_to_server(
 #[tauri::command(rename_all = "snake_case")]
 pub async fn send_as_client(
     app: tauri::AppHandle,
-    state: State<'_, Arc<Mutex<AppState>>>,
+    state: State<'_, Arc<AppState>>,
     message: String,
     user_id: u64,
     is_emoji: bool,
 ) -> Result<(), String> {
 
-    let (username, room, room_id, client_stream_arc) = {
-        let state_guard = state.lock().unwrap();
-        (
-            state_guard.username.clone(),
-            state_guard.current_room.clone(),
-            state_guard.current_room_id.unwrap_or(1),
-            state_guard.client_stream.clone(),
-        )
-    };
+    let username = state.username.read().await.clone();
+    let room = state.current_room.read().await.clone();
+    let room_id = state.current_room_id.read().await.unwrap_or(1);
 
     println!("🔵 Client sending: '{}'", message);
 
@@ -672,7 +642,7 @@ pub async fn send_as_client(
 
     // Send to server via async write half (no blocking, no std::Mutex held)
     {
-        let mut guard = client_stream_arc.lock().await;
+        let mut guard = state.client_stream.lock().await;
         if let Some(writer) = guard.as_mut() {
             send_message_with_length(writer, &chat_message)
                 .await
@@ -724,22 +694,20 @@ fn start_client_listener(app: tauri::AppHandle, mut reader: tokio::net::tcp::Own
 }
 
 #[tauri::command]
-pub fn server_participant_join_room(
+pub async fn server_participant_join_room(
     app: tauri::AppHandle,
-    state: State<'_, Arc<Mutex<AppState>>>,
+    state: State<'_, Arc<AppState>>,
     db: State<'_, SqlitePool>,
     user_id: u64,
     new_room: String,
     new_room_id: u64,
     old_room: String,
 ) -> Result<(), String> {
-    let username = {
-        let mut state_guard = state.lock().unwrap();
-        //Update server's current room
-        state_guard.current_room = new_room.clone();
-        state_guard.current_room_id = Some(new_room_id);
-        state_guard.username.clone()
-    };
+    {
+        *state.current_room.write().await = new_room.clone();
+        *state.current_room_id.write().await = Some(new_room_id);
+    }
+    let username = state.username.read().await.clone();
 
     //create room join message
     let room_join_msg = Message {
@@ -756,13 +724,11 @@ pub fn server_participant_join_room(
         message_id: Uuid::new_v4().to_string(),
     };
 
-    //update room tracking manually since server is special case
-    {
-        let state_guard = state.lock().unwrap();
-        let mut room_clients = state_guard.room_clients.lock().unwrap();
+    { //update room tracking manually since server is special case
+        let mut room_clients = state.room_clients.lock().await;
 
         //Remove from old room
-        if let Some(users) = room_clients.get_mut(&old_room){
+        if let Some(users) = room_clients.get_mut(&old_room) {
             users.retain(|&id| id != user_id);
             println!("🔄 Removed server from room '{}'", old_room);
         }
@@ -774,27 +740,26 @@ pub fn server_participant_join_room(
         println!("🔄 Added server to room '{}'", new_room);
 
         println!("🔍 Room tracking after switch: {:?}", *room_clients);
-
-        // Save to database
-        let pool_clone = db.inner().clone();
-        let msg_clone = room_join_msg.clone();
-        tauri::async_runtime::spawn(async move {
-            if let Err(e) = save_message_internal(
-                &pool_clone,
-                msg_clone.room_id as i64,
-                msg_clone.user_id as i64,
-                msg_clone.message,
-                "RoomJoin".to_string(),
-                false
-            ).await {
-                eprintln!("Failed to save room join: {}", e);
-            }
-        });
-
-        // Distribute room join message
-        distribute_message_to_all(&app, state.inner(), &new_room, &room_join_msg, None);
-
     }
+
+    // Save to database
+    let pool_clone = db.inner().clone();
+    let msg_clone = room_join_msg.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = save_message_internal(
+            &pool_clone,
+            msg_clone.room_id as i64,
+            msg_clone.user_id as i64,
+            msg_clone.message,
+            "RoomJoin".to_string(),
+            false
+        ).await {
+            eprintln!("Failed to save room join: {}", e);
+        }
+    });
+
+    // Distribute room join message
+    distribute_message_to_all(&app, state.inner(), &new_room, &room_join_msg, None).await;
 
     Ok(())
 }
@@ -802,29 +767,20 @@ pub fn server_participant_join_room(
 // For client room switching
 #[tauri::command]
 pub async fn client_join_room(
-    state: State<'_, Arc<Mutex<AppState>>>,
+    state: State<'_, Arc<AppState>>,
     user_id: u64,
     new_room: String,
     new_room_id: u64,
 
 ) -> Result<(), String> {
-    let (username, old_room, old_room_id, client_stream) = {
-        let mut state_guard = state.lock().unwrap();
-        //Update client's current room
-        state_guard.current_room = new_room.clone();
-        state_guard.current_room_id = Some(new_room_id);
-        let client_stream_arc = state_guard.client_stream.clone();
-
-        // Get old room info before updating
-        let old_room = state_guard.current_room.clone();
-        let old_room_id = state_guard.current_room_id.unwrap_or(1);
-
-        // Update client's current room
-        state_guard.current_room = new_room.clone();
-        state_guard.current_room_id = Some(new_room_id);
-
-        (state_guard.username.clone(), old_room, old_room_id, client_stream_arc)
-    };
+    // Capture old state first
+    let username = state.username.read().await.clone();
+    let old_room = state.current_room.read().await.clone();
+    let _old_room_id = state.current_room_id.read().await.unwrap_or(1);
+    {
+        *state.current_room.write().await = new_room.clone();
+        *state.current_room_id.write().await = Some(new_room_id);
+    }
 
     // Send room join to server (server will handle the room tracking update)
     let room_join_msg = Message {
@@ -844,7 +800,7 @@ pub async fn client_join_room(
 
     // Send room join to server via async write half
     {
-        let mut guard = client_stream.lock().await;
+        let mut guard = state.client_stream.lock().await;
         if let Some(writer) = guard.as_mut() {
             send_message_with_length(writer, &room_join_msg)
                 .await
@@ -864,9 +820,9 @@ pub async fn client_join_room(
 }
 
 #[tauri::command]
-pub fn get_server_info(state: State<'_, Arc<Mutex<AppState>>>) -> Option<String> {
-    let state_guard = state.lock().unwrap();
-    state_guard.server_addr.map(|addr| addr.to_string())
+pub async  fn get_server_info(state: State<'_, Arc<AppState>>) -> Result<Option<String>,String> {
+    let addr = state.server_addr.read().await.map(|addr| addr.to_string());
+    Ok(addr)
 }
 
 async fn send_message_with_length(

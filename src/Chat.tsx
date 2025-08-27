@@ -70,9 +70,11 @@ const Chat = () => {
 
         try {
           const m = JSON.parse(e.payload) as Message;
-
+          console.log(
+            `m.room =${m.room} VS currentRoom?.department_name =${currentRoom?.department_name}`,
+          );
           // Accept all message types for the current room, not just Chat
-          if (m.room === currentRoom?.department_name) {
+          if (m.room === currentRoom?.name) {
             console.log("Message belongs to current room, adding to state");
 
             setMessages((prev) => {
@@ -83,8 +85,8 @@ const Chat = () => {
                   msg.username === m.username &&
                   Math.abs(
                     new Date(msg.created_at).getTime() -
-                      new Date(Number(m.created_at) * 1000).getTime()
-                  ) < 1000 // Within 1 second,
+                      new Date(Number(m.created_at) * 1000).getTime(),
+                  ) < 1000, // Within 1 second,
               );
 
               if (isDuplicate) {
@@ -103,14 +105,14 @@ const Chat = () => {
                   message_type: m.message_type,
                   is_emoji: m.is_emoji || false,
                   created_at: new Date(
-                    Number(m.created_at) * 1000
+                    Number(m.created_at) * 1000,
                   ).toISOString(),
                 },
               ];
             });
           } else {
             console.log(
-              `Message for different room: ${m.room} vs ${currentRoom?.name}`
+              `Message for different room: ${m.room} vs ${currentRoom?.name}`,
             );
           }
         } catch (error) {
@@ -269,20 +271,20 @@ const Chat = () => {
       setCurrentView("chat");
 
       //Tells server about room switch
-      // if (mode === "server") {
-      //   await invoke("server_participant_join_room", {
-      //     userId: currentUser.id,
-      //     newRoom: room.name,
-      //     newRoomId: room.id,
-      //     oldRoom: currentUser.department_name,
-      //   });
-      // } else {
-      //   await invoke("client_join_room", {
-      //     userId: currentUser.id,
-      //     newRoom: room.name,
-      //     newRoomId: room.id,
-      //   });
-      // }
+      if (mode === "server") {
+        await invoke("server_participant_join_room", {
+          userId: currentUser.id,
+          newRoom: room.name,
+          newRoomId: room.id,
+          oldRoom: currentUser.department_name,
+        });
+      } else {
+        await invoke("client_join_room", {
+          userId: currentUser.id,
+          newRoom: room.name,
+          newRoomId: room.id,
+        });
+      }
 
       console.log(`Switched to room: ${room.name} (ID: ${room.id})`);
       //persists in the db the number of online users in a room
@@ -309,7 +311,7 @@ const Chat = () => {
             // room: currentRoom.department_name,
             // room_id: currentRoom.id,
             is_emoji: false,
-          }
+          },
         );
 
         setMessage(""); // Only clear the input text

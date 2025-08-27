@@ -19,18 +19,17 @@ fn greet(name: &str) -> String {
 pub fn run() {
 
     tauri::Builder::default()
-        .manage(Arc::new(Mutex::new(AppState {
-            server_streams: Arc::new(Mutex::new(Default::default())),
+        .manage(Arc::new(AppState {
+            server_streams: Arc::new(tokio::sync::Mutex::new(Default::default())),
             client_stream: Arc::new(tokio::sync::Mutex::new(None)),
-            // streams: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            username: String::new(),
-            user_id: None,
-            is_server: false,
-            current_room: String::new(),
-            current_room_id: None,
-            server_addr: None,
-            room_clients: Arc::new(Mutex::new(Default::default()))
-        })))
+            room_clients: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            username: tokio::sync::RwLock::new(String::new()),
+            user_id: tokio::sync::RwLock::new(None),
+            is_server: tokio::sync::RwLock::new(false),
+            current_room: tokio::sync::RwLock::new(String::new()),
+            current_room_id: tokio::sync::RwLock::new(None),
+            server_addr: tokio::sync::RwLock::new(None),
+        }))
         .plugin(tauri_plugin_sql::Builder::default()
             .add_migrations("sqlite:nutler.db", migration::get_migrations()).build())
         .plugin(tauri_plugin_opener::init())

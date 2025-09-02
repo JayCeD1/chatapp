@@ -202,7 +202,7 @@ pub async fn server_listen_as_participant(
     tauri::async_runtime::spawn(async move {
         if let Err(e) = save_message_internal(
             &pool_clone,
-            1, // room_id
+            room_id as i64, // room_id
             msg_clone.user_id as i64,
             msg_clone.message,
             "Connect".to_string(),

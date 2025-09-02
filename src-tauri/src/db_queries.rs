@@ -52,21 +52,22 @@ pub struct InsertResult {
 // User management
 #[tauri::command]
 pub async fn upsert_user(
-    db:State<'_,SqlitePool>,
+    db: State<'_, SqlitePool>,
     name: String,
     email: String,
     department_id: Option<i64>,
 ) -> Result<User, String> {
     //Try find existing
-    if let Some (_row) = sqlx::query(
+    if let Some(_row) = sqlx::query(
         "SELECT u.id, u.name, u.email, u.department_id, u.is_online, u.last_seen,
                 d.name as department_name
          FROM users u LEFT JOIN departments d ON u.department_id = d.id
-         WHERE u.email = $1"
-    ).bind(&email)
-        .fetch_optional(&*db)
-        .await
-        .map_err(|e| e.to_string())?
+         WHERE u.email = $1",
+    )
+    .bind(&email)
+    .fetch_optional(&*db)
+    .await
+    .map_err(|e| e.to_string())?
     {
         // Optionally update display name/department if changed
         sqlx::query("UPDATE users SET name=$1, department_id=$2 WHERE email=$3")
@@ -92,12 +93,12 @@ pub async fn upsert_user(
         "SELECT u.id, u.name, u.email, u.department_id, u.is_online, u.last_seen,
                 d.name as department_name
          FROM users u LEFT JOIN departments d ON u.department_id = d.id
-         WHERE u.email = $1"
+         WHERE u.email = $1",
     )
-        .bind(&email)
-        .fetch_one(&*db)
-        .await
-        .map_err(|e| e.to_string())?;
+    .bind(&email)
+    .fetch_one(&*db)
+    .await
+    .map_err(|e| e.to_string())?;
 
     Ok(User {
         id: row.get::<Option<i64>, _>("id"),
@@ -225,18 +226,30 @@ pub async fn get_departments(db: State<'_, SqlitePool>) -> Result<Vec<Department
 #[tauri::command]
 pub async fn get_chat_rooms(db: State<'_, SqlitePool>) -> Result<Vec<ChatRoom>, String> {
     let result = sqlx::query(
-        "SELECT cr.id, cr.name, cr.description, cr.department_id, cr.is_private, 
-                d.name as department_name,
-                COUNT(ur.user_id) as user_count
-         FROM chat_rooms cr
-         LEFT JOIN departments d ON cr.department_id = d.id
-         LEFT JOIN user_rooms ur ON cr.id = ur.room_id AND ur.is_active = 1
-         GROUP BY cr.id
-         ORDER BY cr.name"
+        "SELECT
+  cr.id,
+  cr.name,
+  cr.description,
+  cr.department_id,
+  cr.is_private,
+  d.name AS department_name,
+  COALESCE(urc.user_count, 0) AS user_count
+FROM chat_rooms cr
+LEFT JOIN departments d
+  ON cr.department_id = d.id
+LEFT JOIN (
+  SELECT room_id, COUNT(DISTINCT user_id) AS user_count
+  FROM user_rooms
+  WHERE is_active = 1
+  GROUP BY room_id
+) urc
+  ON urc.room_id = cr.id
+ORDER BY cr.name
+",
     )
-        .fetch_all(&*db)
-        .await
-        .map_err(|e| format!("Failed to get chat rooms: {}", e))?;
+    .fetch_all(&*db)
+    .await
+    .map_err(|e| format!("Failed to get chat rooms: {}", e))?;
 
     let mut rooms = Vec::new();
     for row in result {
@@ -259,20 +272,32 @@ pub async fn get_rooms_by_department(
     department_id: i64,
 ) -> Result<Vec<ChatRoom>, String> {
     let result = sqlx::query(
-        "SELECT cr.id, cr.name, cr.description, cr.department_id, cr.is_private, 
-                d.name as department_name,
-                COUNT(ur.user_id) as user_count
-         FROM chat_rooms cr
-         LEFT JOIN departments d ON cr.department_id = d.id
-         LEFT JOIN user_rooms ur ON cr.id = ur.room_id AND ur.is_active = 1
-         WHERE cr.department_id = $1
-         GROUP BY cr.id
-         ORDER BY cr.name"
+        "SELECT
+  cr.id,
+  cr.name,
+  cr.description,
+  cr.department_id,
+  cr.is_private,
+  d.name AS department_name,
+  COALESCE(urc.user_count, 0) AS user_count
+FROM chat_rooms cr
+LEFT JOIN departments d
+  ON cr.department_id = d.id
+LEFT JOIN (
+  SELECT room_id, COUNT(DISTINCT user_id) AS user_count
+  FROM user_rooms
+  WHERE is_active = 1
+  GROUP BY room_id
+) urc
+  ON urc.room_id = cr.id
+WHERE cr.department_id = $1
+ORDER BY cr.name
+",
     )
         .bind(&department_id)
         .fetch_all(&*db)
-        .await
-        .map_err(|e| format!("Failed to get rooms by department: {}", e))?;
+    .await
+    .map_err(|e| format!("Failed to get rooms by department: {}", e))?;
 
     let mut rooms = Vec::new();
     for row in result {
@@ -296,13 +321,13 @@ pub async fn join_room(
     room_id: i64,
 ) -> Result<(), String> {
     sqlx::query(
-        "INSERT OR REPLACE INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)"
+        "INSERT OR REPLACE INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)",
     )
-        .bind(&user_id)
-        .bind(&room_id)
-        .execute(&*db)
-        .await
-        .map_err(|e| format!("Failed to join room: {}", e))?;
+    .bind(&user_id)
+    .bind(&room_id)
+    .execute(&*db)
+    .await
+    .map_err(|e| format!("Failed to join room: {}", e))?;
 
     Ok(())
 }
@@ -335,16 +360,16 @@ pub async fn save_message(
 ) -> Result<InsertResult, String> {
     let result = sqlx::query(
         "INSERT INTO messages (room_id, user_id, message, message_type, is_emoji) 
-         VALUES ($1, $2, $3, $4, $5)"
+         VALUES ($1, $2, $3, $4, $5)",
     )
-        .bind(&room_id)
-        .bind(&user_id)
-        .bind(&message)
-        .bind(&message_type)
-        .bind(&is_emoji)
-        .execute(&*db)
-        .await
-        .map_err(|e| format!("Failed to save message: {}", e))?;
+    .bind(&room_id)
+    .bind(&user_id)
+    .bind(&message)
+    .bind(&message_type)
+    .bind(&is_emoji)
+    .execute(&*db)
+    .await
+    .map_err(|e| format!("Failed to save message: {}", e))?;
 
     Ok(InsertResult {
         rows_affected: result.rows_affected(),
@@ -362,23 +387,22 @@ pub async fn save_message_internal(
 ) -> Result<InsertResult, String> {
     let result = sqlx::query(
         "INSERT INTO messages (room_id, user_id, message, message_type, is_emoji)
-         VALUES ($1, $2, $3, $4, $5)"
+         VALUES ($1, $2, $3, $4, $5)",
     )
-        .bind(&room_id)
-        .bind(&user_id)
-        .bind(&message)
-        .bind(&message_type)
-        .bind(&is_emoji)
-        .execute(pool)
-        .await
-        .map_err(|e| format!("Failed to save message: {}", e))?;
+    .bind(&room_id)
+    .bind(&user_id)
+    .bind(&message)
+    .bind(&message_type)
+    .bind(&is_emoji)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to save message: {}", e))?;
 
     Ok(InsertResult {
         rows_affected: result.rows_affected(),
         last_insert_id: result.last_insert_rowid(),
     })
 }
-
 
 #[tauri::command]
 pub async fn get_room_messages(
@@ -387,7 +411,7 @@ pub async fn get_room_messages(
     limit: Option<i64>,
 ) -> Result<Vec<Message>, String> {
     let limit = limit.unwrap_or(50);
-    
+
     let result = sqlx::query(
         "SELECT m.id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
                 u.name as username
@@ -395,13 +419,13 @@ pub async fn get_room_messages(
          JOIN users u ON m.user_id = u.id
          WHERE m.room_id = $1
          ORDER BY m.created_at DESC
-         LIMIT $2"
+         LIMIT $2",
     )
-        .bind(&room_id)
-        .bind(&limit)
-        .fetch_all(&*db)
-        .await
-        .map_err(|e| format!("Failed to get room messages: {}", e))?;
+    .bind(&room_id)
+    .bind(&limit)
+    .fetch_all(&*db)
+    .await
+    .map_err(|e| format!("Failed to get room messages: {}", e))?;
 
     let mut messages = Vec::new();
     for row in result {
@@ -416,7 +440,7 @@ pub async fn get_room_messages(
             created_at: row.get::<String, _>("created_at"),
         });
     }
-    
+
     // Reverse to get chronological order
     messages.reverse();
     Ok(messages)

@@ -14,7 +14,6 @@ pub fn get_migrations() -> Vec<Migration> {
             );",
             kind: MigrationKind::Up,
         },
-
         // Migration 2: Create users table
         Migration {
             version: 2,
@@ -30,7 +29,6 @@ pub fn get_migrations() -> Vec<Migration> {
             );",
             kind: MigrationKind::Up,
         },
-
         // Migration 3: Create chat rooms table
         Migration {
             version: 3,
@@ -112,5 +110,62 @@ pub fn get_migrations() -> Vec<Migration> {
                           (SELECT id FROM departments WHERE name = 'General'), FALSE);",
             kind: MigrationKind::Up,
         },
+        // Down for v7: remove default chat rooms created in v7
+        Migration {
+            version: 7,
+            description: "drop_default_chat_rooms",
+            sql: "
+                DELETE FROM chat_rooms WHERE name = 'Company Wide';
+                DELETE FROM chat_rooms
+                  WHERE name LIKE '% General';
+            ",
+            kind: MigrationKind::Down,
+        },
+        // Down for v6: remove the seeded departments from v6
+        Migration {
+            version: 6,
+            description: "remove_default_departments",
+            sql: "
+                DELETE FROM departments
+                  WHERE name IN ('IT','HR','Finance','Marketing','Operations','General');
+            ",
+            kind: MigrationKind::Down,
+        },
+        // Down for v5: drop messages table
+        Migration {
+            version: 5,
+            description: "drop_messages_table",
+            sql: "DROP TABLE IF EXISTS messages;",
+            kind: MigrationKind::Down,
+        },
+        // Down for v4: drop user_rooms table
+        Migration {
+            version: 4,
+            description: "drop_user_rooms_table",
+            sql: "DROP TABLE IF EXISTS user_rooms;",
+            kind: MigrationKind::Down,
+        },
+        // Down for v3: drop chat_rooms table
+        Migration {
+            version: 3,
+            description: "drop_chat_rooms_table",
+            sql: "DROP TABLE IF EXISTS chat_rooms;",
+            kind: MigrationKind::Down,
+        },
+        // Down for v2: drop users table
+        Migration {
+            version: 2,
+            description: "drop_users_table",
+            sql: "DROP TABLE IF EXISTS users;",
+            kind: MigrationKind::Down,
+        },
+        // Down for v1: drop departments table
+        Migration {
+            version: 1,
+            description: "drop_departments_table",
+            sql: "DROP TABLE IF EXISTS departments;",
+            kind: MigrationKind::Down,
+        },
+
     ]
 }

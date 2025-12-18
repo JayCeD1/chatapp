@@ -9,7 +9,7 @@ import {
   // Settings,
 } from "lucide-react";
 import { listen } from "@tauri-apps/api/event";
-
+import { confirm } from "@tauri-apps/plugin-dialog";
 const Chat = () => {
   const [currentView, setCurrentView] = useState("login"); // 'login', 'chat', 'rooms'
   const [mode, setMode] = useState("client"); // 'server' or 'client'
@@ -25,6 +25,7 @@ const Chat = () => {
   // const [users, setUsers] = useState<User[]>([]);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
+  const [isLoggingOut, setIsLoggingOut] = useState(false);
 
   const emojis = ["😊", "🤔", "😂", "😈", "👍", "👎", "❤️", "🎉", "🔥", "💯"];
 
@@ -296,6 +297,111 @@ const Chat = () => {
     }
   };
 
+  const handleLeaveRoom = async (room: ChatRoom) => {
+    if (!currentUser?.id || !room.id) {
+      console.log("Cannot leave room - missing user or room ID");
+      return;
+    }
+    console.log(`Leaving chat room: ${room.name} (ID: ${room.id})`);
+
+    try {
+      //Update the UI
+      setCurrentRoom(null);
+      setCurrentView("rooms");
+
+      //update the online status of the user in the db
+      await invoke("leave_room", { userId: currentUser.id, roomId: room.id });
+    } catch (error) {
+      console.error("Error leaving chat room:", error);
+    }
+  };
+
+  // Utility: enforce timeout on an async operation
+  const withTimeout = async <T,>(p: Promise<T>, ms = 3000): Promise<T> => {
+    return await Promise.race([
+      p,
+      new Promise<T>((_, reject) =>
+        setTimeout(() => reject(new Error("Operation timed out")), ms),
+      ),
+    ]);
+  };
+
+  const handleLogout = async () => {
+    console.log("Logging out...");
+    if (isLoggingOut) return;
+    console.log("Logging out... success");
+
+    const confirmation = await confirm(
+      "This action cannot be reverted. Are you sure?",
+      { title: "Log Out", kind: "info" },
+    );
+
+    console.log(confirmation);
+    if (!confirmation) return;
+
+    setIsLoggingOut(true);
+    try {
+      // 1) leave current room if any
+      if (currentUser?.id && currentRoom?.id) {
+        try {
+          await withTimeout(
+            invoke("leave_room", {
+              userId: currentUser.id,
+              roomId: currentRoom.id,
+            }),
+            3000,
+          );
+          console.log("leave_room during logout success");
+        } catch (e) {
+          console.warn("leave_room during logout failed (continuing):", e);
+        }
+      }
+
+      // 2) Disconnect transport depending on mode
+      if (mode === "server") {
+        // Gracefully stop server-participant hosting and clear server-side state
+        try {
+          console.log("server_participant_disconnect");
+          // await invoke("server_participant_disconnect");
+        } catch (e) {
+          console.warn("server_participant_disconnect failed (continuing):", e);
+        }
+      } else {
+        // Close client socket and notify the remote server
+        try {
+          console.log("client_disconnect");
+          // await invoke("client_disconnect");
+        } catch (e) {
+          console.warn("client_disconnect failed (continuing):", e);
+        }
+      }
+    } finally {
+      // 3) Clear reconnection conditions and local state regardless of backend result
+      localStorage.removeItem("nutler.userId");
+
+      setMessages([]);
+      setMessage("");
+      setShowEmojiPicker(false);
+
+      setCurrentRoom(null);
+      setChatRooms([]);
+      // If you want to retain departments for quicker re-login, keep them; otherwise clear:
+      // setDepartments([]);
+
+      setCurrentUser(null);
+      setUsername("");
+      setEmail("");
+      setDepartmentId(null);
+
+      // Optionally reset mode or serverIp if you want a clean slate:
+      // setMode("client");
+      // setServerIp("127.0.0.1:3625");
+
+      // 4) Navigate to login
+      setCurrentView("login");
+    }
+  };
+
   const handleSendMessage = async () => {
     if (message.trim() && currentRoom?.id && currentUser?.id) {
       try {
@@ -521,10 +627,13 @@ const Chat = () => {
         <div className="flex items-center justify-between">
           <div className="flex items-center space-x-4">
             <button
-              onClick={() => setCurrentView("rooms")}
+              disabled={!currentRoom}
               className="text-gray-500 hover:text-gray-700 p-2 rounded-lg hover:bg-gray-100"
             >
-              <Building2 size={20} />
+              <Building2
+                size={20}
+                onClick={() => handleLeaveRoom(currentRoom!)}
+              />
             </button>
             <div>
               <h2 className="text-lg font-semibold text-gray-800">
@@ -540,8 +649,13 @@ const Chat = () => {
               {currentRoom?.user_count || 0} online
             </span>
             <button
-              onClick={() => setCurrentView("login")}
-              className="text-gray-500 hover:text-gray-700 p-2 rounded-lg hover:bg-gray-100"
+              disabled={isLoggingOut}
+              onClick={handleLogout}
+              className={`text-gray-500 hover:text-gray-100 p-2 rounded-lg hover:bg-gray-100 ${
+                isLoggingOut
+                  ? "cursor-not-allowed opacity-50"
+                  : "hover:text-gray-700"
+              }`}
             >
               <LogOut size={20} />
             </button>

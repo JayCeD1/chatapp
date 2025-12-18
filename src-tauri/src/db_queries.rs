@@ -294,8 +294,8 @@ WHERE cr.department_id = $1
 ORDER BY cr.name
 ",
     )
-        .bind(&department_id)
-        .fetch_all(&*db)
+    .bind(&department_id)
+    .fetch_all(&*db)
     .await
     .map_err(|e| format!("Failed to get rooms by department: {}", e))?;
 

@@ -22,10 +22,13 @@ const Chat = () => {
   const [messages, setMessages] = useState<Message[]>([]);
   const [departments, setDepartments] = useState<Department[]>([]);
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
+  const [roomSearch, setRoomSearch] = useState("");
+  const [messageSearch, setMessageSearch] = useState("");
   // const [users, setUsers] = useState<User[]>([]);
   const [showEmojiPicker, setShowEmojiPicker] = useState(false);
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [isLoggingOut, setIsLoggingOut] = useState(false);
+  const [isConnecting, setIsConnecting] = useState(false);
 
   const emojis = ["😊", "🤔", "😂", "😈", "👍", "👎", "❤️", "🎉", "🔥", "💯"];
 
@@ -216,6 +219,7 @@ const Chat = () => {
 
   const handleJoin = async () => {
     if (username.trim() && email.trim() && departmentId) {
+      setIsConnecting(true);
       try {
         // Create or Update user in the database
         const user = (await invoke("upsert_user", {
@@ -254,6 +258,8 @@ const Chat = () => {
         setCurrentView("rooms");
       } catch (error) {
         console.error("Joined failed:", error);
+      } finally {
+        setIsConnecting(false);
       }
     }
   };
@@ -446,16 +452,50 @@ const Chat = () => {
     });
   };
 
+  const filteredRooms = chatRooms.filter((room) => {
+    const query = roomSearch.trim().toLowerCase();
+    if (!query) return true;
+    return (
+      room.name.toLowerCase().includes(query) ||
+      room.description.toLowerCase().includes(query) ||
+      (room.department_name || "").toLowerCase().includes(query)
+    );
+  });
+
+  const filteredMessages = messages.filter((msg) => {
+    const query = messageSearch.trim().toLowerCase();
+    if (!query) return true;
+    return (
+      msg.message.toLowerCase().includes(query) ||
+      msg.username.toLowerCase().includes(query)
+    );
+  });
+
   if (currentView === "login") {
     return (
-      <div className="min-h-screen bg-gradient-to-br from-blue-400 to-purple-600 flex items-center justify-center p-4">
-        <div className="bg-white rounded-2xl shadow-xl w-full max-w-md p-8 space-y-6">
+      <div className="min-h-screen bg-gradient-to-br from-blue-500 via-purple-600 to-indigo-700 flex items-center justify-center p-6">
+        <div className="relative bg-white/95 backdrop-blur rounded-3xl shadow-2xl w-full max-w-lg p-8 space-y-6">
+          <div className="absolute -top-8 -right-8 w-24 h-24 bg-purple-200 rounded-full blur-2xl opacity-70" />
+          <div className="absolute -bottom-8 -left-8 w-24 h-24 bg-blue-200 rounded-full blur-2xl opacity-70" />
           {/* Header */}
-          <div className="text-center">
-            <h1 className="text-3xl font-bold text-gray-800 mb-2">
+          <div className="text-center relative">
+            <h1 className="text-3xl font-bold text-gray-800 mb-2 tracking-tight">
               Company Chat
             </h1>
-            <p className="text-gray-600">Connect with your team</p>
+            <p className="text-gray-600">
+              Secure, offline-first communication for every department.
+            </p>
+            <div className="mt-4 flex items-center justify-center gap-2 text-xs text-gray-500">
+              <span className="px-3 py-1 rounded-full bg-gray-100">
+                Local network ready
+              </span>
+              <span className="px-3 py-1 rounded-full bg-gray-100">
+                Department rooms
+              </span>
+              <span className="px-3 py-1 rounded-full bg-gray-100">
+                Modern UI
+              </span>
+            </div>
           </div>
 
           {/* Server/Client Toggle */}
@@ -540,10 +580,12 @@ const Chat = () => {
           {/* Join Button */}
           <button
             onClick={handleJoin}
-            disabled={!username.trim() || !email.trim() || !departmentId}
-            className="w-full bg-purple-500 hover:bg-purple-600 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-semibold py-4 px-6 rounded-xl transition-colors duration-200 shadow-md hover:shadow-lg"
+            disabled={
+              isConnecting || !username.trim() || !email.trim() || !departmentId
+            }
+            className="w-full bg-purple-500 hover:bg-purple-600 disabled:bg-gray-300 disabled:cursor-not-allowed text-white font-semibold py-4 px-6 rounded-xl transition-colors duration-200 shadow-md hover:shadow-lg flex items-center justify-center gap-2"
           >
-            Join Company Chat
+            {isConnecting ? "Connecting..." : "Join Company Chat"}
           </button>
 
           {/* Status indicator */}
@@ -569,38 +611,74 @@ const Chat = () => {
     return (
       <div className="min-h-screen bg-gray-100 flex">
         {/* Sidebar */}
-        <div className="w-80 bg-white shadow-lg">
-          <div className="p-6 border-b border-gray-200">
-            <h2 className="text-xl font-semibold text-gray-800">Chat Rooms</h2>
-            <p className="text-sm text-gray-600 mt-1">Welcome, {username}!</p>
+        <div className="w-96 bg-white shadow-lg flex flex-col">
+          <div className="p-6 border-b border-gray-200 space-y-4">
+            <div>
+              <h2 className="text-xl font-semibold text-gray-800">Chat Rooms</h2>
+              <p className="text-sm text-gray-600 mt-1">
+                Welcome, {username}!
+              </p>
+            </div>
+            <div className="flex items-center gap-2 text-xs text-gray-500">
+              <span className="inline-flex items-center gap-1 rounded-full bg-green-100 text-green-700 px-3 py-1">
+                <span className="h-2 w-2 rounded-full bg-green-500" />
+                Connected
+              </span>
+              <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-3 py-1 capitalize">
+                {mode} mode
+              </span>
+            </div>
+            <div className="relative">
+              <input
+                type="text"
+                value={roomSearch}
+                onChange={(e) => setRoomSearch(e.target.value)}
+                placeholder="Search rooms, departments, topics"
+                className="w-full px-4 py-3 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent text-gray-700 placeholder-gray-400"
+              />
+            </div>
           </div>
 
-          <div className="p-4 space-y-2">
-            {chatRooms.map((room) => (
-              <button
-                key={room.id}
-                onClick={() => handleJoinRoom(room)}
-                className="w-full text-left p-4 rounded-lg hover:bg-gray-50 border border-gray-200 transition-colors"
-              >
-                <div className="flex items-center justify-between">
-                  <div>
-                    <h3 className="font-medium text-gray-800">{room.name}</h3>
-                    <p className="text-sm text-gray-600">{room.description}</p>
-                    {room.department_name && (
-                      <span className="inline-block bg-purple-100 text-purple-800 text-xs px-2 py-1 rounded-full mt-1">
-                        {room.department_name}
+          <div className="flex-1 overflow-y-auto p-4 space-y-3">
+            {filteredRooms.length === 0 ? (
+              <div className="text-center text-gray-500 text-sm py-12">
+                No rooms match your search.
+              </div>
+            ) : (
+              filteredRooms.map((room) => (
+                <button
+                  key={room.id}
+                  onClick={() => handleJoinRoom(room)}
+                  className="w-full text-left p-4 rounded-2xl border border-gray-200 bg-gradient-to-br from-white to-gray-50 hover:shadow-md transition-all"
+                >
+                  <div className="flex items-center justify-between gap-4">
+                    <div>
+                      <h3 className="font-semibold text-gray-800">
+                        {room.name}
+                      </h3>
+                      <p className="text-sm text-gray-600 line-clamp-2">
+                        {room.description}
+                      </p>
+                      {room.department_name && (
+                        <span className="inline-flex items-center gap-1 bg-purple-100 text-purple-800 text-xs px-2 py-1 rounded-full mt-2">
+                          <Building2 size={12} />
+                          {room.department_name}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-right">
+                      <div className="flex items-center text-sm text-gray-500">
+                        <Users size={16} className="mr-1" />
+                        {room.user_count || 0}
+                      </div>
+                      <span className="text-xs text-gray-400">
+                        active now
                       </span>
-                    )}
-                  </div>
-                  <div className="text-right">
-                    <div className="flex items-center text-sm text-gray-500">
-                      <Users size={16} className="mr-1" />
-                      {room.user_count || 0}
                     </div>
                   </div>
-                </div>
-              </button>
-            ))}
+                </button>
+              ))
+            )}
           </div>
         </div>
 
@@ -624,7 +702,7 @@ const Chat = () => {
     <div className="min-h-screen bg-gray-100 flex flex-col">
       {/* Chat Header */}
       <div className="bg-white shadow-sm border-b border-gray-200 px-6 py-4">
-        <div className="flex items-center justify-between">
+        <div className="flex flex-col gap-4 lg:flex-row lg:items-center lg:justify-between">
           <div className="flex items-center space-x-4">
             <button
               disabled={!currentRoom}
@@ -642,58 +720,86 @@ const Chat = () => {
               <p className="text-sm text-gray-600">
                 {currentRoom?.description}
               </p>
+              <div className="flex items-center gap-2 mt-2 text-xs text-gray-500">
+                <span className="inline-flex items-center gap-1 rounded-full bg-green-100 text-green-700 px-2 py-1">
+                  <span className="h-2 w-2 rounded-full bg-green-500" />
+                  Live
+                </span>
+                <span className="inline-flex items-center gap-1 rounded-full bg-gray-100 px-2 py-1 capitalize">
+                  {mode} mode
+                </span>
+              </div>
             </div>
           </div>
-          <div className="flex items-center space-x-2">
-            <span className="text-sm text-gray-500">
-              {currentRoom?.user_count || 0} online
-            </span>
-            <button
-              disabled={isLoggingOut}
-              onClick={handleLogout}
-              className={`text-gray-500 hover:text-gray-100 p-2 rounded-lg hover:bg-gray-100 ${
-                isLoggingOut
-                  ? "cursor-not-allowed opacity-50"
-                  : "hover:text-gray-700"
-              }`}
-            >
-              <LogOut size={20} />
-            </button>
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-end">
+            <div className="relative">
+              <input
+                type="text"
+                value={messageSearch}
+                onChange={(e) => setMessageSearch(e.target.value)}
+                placeholder="Search messages"
+                className="w-full sm:w-64 px-4 py-2 bg-gray-50 border border-gray-200 rounded-xl focus:outline-none focus:ring-2 focus:ring-purple-500 focus:border-transparent text-gray-700 placeholder-gray-400"
+              />
+            </div>
+            <div className="flex items-center space-x-2">
+              <span className="text-sm text-gray-500">
+                {currentRoom?.user_count || 0} online
+              </span>
+              <button
+                disabled={isLoggingOut}
+                onClick={handleLogout}
+                className={`text-gray-500 hover:text-gray-100 p-2 rounded-lg hover:bg-gray-100 ${
+                  isLoggingOut
+                    ? "cursor-not-allowed opacity-50"
+                    : "hover:text-gray-700"
+                }`}
+              >
+                <LogOut size={20} />
+              </button>
+            </div>
           </div>
         </div>
       </div>
 
       {/* Messages Area */}
       <div className="flex-1 overflow-y-auto p-6 space-y-4">
-        {messages.map((msg, index) => (
-          <div key={index} className="w-full">
-            <div
-              className={`flex ${msg.username === username ? "justify-end" : "justify-start"}`}
-            >
+        {filteredMessages.length === 0 ? (
+          <div className="text-center text-gray-500 text-sm py-12">
+            {messageSearch
+              ? "No messages match your search."
+              : "No messages yet. Start the conversation!"}
+          </div>
+        ) : (
+          filteredMessages.map((msg, index) => (
+            <div key={index} className="w-full">
               <div
-                className={`max-w-xs lg:max-w-md px-4 py-3 rounded-lg ${
-                  msg.username === username
-                    ? "bg-purple-500 text-white"
-                    : "bg-white border border-gray-200 text-gray-800"
-                }`}
+                className={`flex ${msg.username === username ? "justify-end" : "justify-start"}`}
               >
-                <div className="flex items-center space-x-2 mb-1">
-                  <span className="font-medium text-sm">{msg.username}</span>
-                  <span
-                    className={`text-xs ${
-                      msg.username === username
-                        ? "text-purple-200"
-                        : "text-gray-500"
-                    }`}
-                  >
-                    {formatTime(msg.created_at)}
-                  </span>
+                <div
+                  className={`max-w-xs lg:max-w-md px-4 py-3 rounded-2xl shadow-sm ${
+                    msg.username === username
+                      ? "bg-purple-500 text-white"
+                      : "bg-white border border-gray-200 text-gray-800"
+                  }`}
+                >
+                  <div className="flex items-center space-x-2 mb-1">
+                    <span className="font-medium text-sm">{msg.username}</span>
+                    <span
+                      className={`text-xs ${
+                        msg.username === username
+                          ? "text-purple-200"
+                          : "text-gray-500"
+                      }`}
+                    >
+                      {formatTime(msg.created_at)}
+                    </span>
+                  </div>
+                  <p className="text-sm leading-relaxed">{msg.message}</p>
                 </div>
-                <p className="text-sm">{msg.message}</p>
               </div>
             </div>
-          </div>
-        ))}
+          ))
+        )}
       </div>
 
       {/* Emoji Picker */}

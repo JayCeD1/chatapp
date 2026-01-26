@@ -1034,3 +1034,105 @@ pub async fn server_participant_disconnect(
     Ok(())
 
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::net::TcpListener;
+
+    async fn read_message_with_length(
+        reader: &mut tokio::net::tcp::OwnedReadHalf,
+    ) -> Message {
+        let mut len_bytes = [0u8; 4];
+        reader.read_exact(&mut len_bytes).await.unwrap();
+        let msg_len = u32::from_be_bytes(len_bytes) as usize;
+        let mut message_buffer = vec![0u8; msg_len];
+        reader.read_exact(&mut message_buffer).await.unwrap();
+        serde_json::from_slice(&message_buffer).unwrap()
+    }
+
+    #[tokio::test]
+    async fn send_message_with_length_transmits_message() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut reader, _) = stream.into_split();
+            read_message_with_length(&mut reader).await
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_reader, mut writer) = stream.into_split();
+
+        let message = Message {
+            message_type: MessageType::Chat,
+            username: "server".to_string(),
+            user_id: 42,
+            message: "hello client".to_string(),
+            message_id: Uuid::new_v4().to_string(),
+            room: "General".to_string(),
+            room_id: 1,
+            created_at: 1,
+            is_emoji: false,
+        };
+
+        send_message_with_length(&mut writer, &message)
+            .await
+            .unwrap();
+
+        let received = server.await.unwrap();
+        assert_eq!(received.message, message.message);
+        assert_eq!(received.user_id, message.user_id);
+        assert_eq!(received.room, message.room);
+    }
+
+    #[tokio::test]
+    async fn send_message_with_length_supports_multiple_messages() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let (mut reader, _) = stream.into_split();
+            let first = read_message_with_length(&mut reader).await;
+            let second = read_message_with_length(&mut reader).await;
+            (first, second)
+        });
+
+        let stream = TcpStream::connect(addr).await.unwrap();
+        let (_reader, mut writer) = stream.into_split();
+
+        let first = Message {
+            message_type: MessageType::Connect,
+            username: "client-a".to_string(),
+            user_id: 7,
+            message: "connected".to_string(),
+            message_id: Uuid::new_v4().to_string(),
+            room: "Ops".to_string(),
+            room_id: 2,
+            created_at: 2,
+            is_emoji: false,
+        };
+
+        let second = Message {
+            message_type: MessageType::Chat,
+            username: "client-a".to_string(),
+            user_id: 7,
+            message: "status update".to_string(),
+            message_id: Uuid::new_v4().to_string(),
+            room: "Ops".to_string(),
+            room_id: 2,
+            created_at: 3,
+            is_emoji: false,
+        };
+
+        send_message_with_length(&mut writer, &first).await.unwrap();
+        send_message_with_length(&mut writer, &second).await.unwrap();
+
+        let (received_first, received_second) = server.await.unwrap();
+        assert_eq!(received_first.message_type, MessageType::Connect);
+        assert_eq!(received_second.message_type, MessageType::Chat);
+        assert_eq!(received_second.message, second.message);
+    }
+}

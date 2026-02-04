@@ -962,7 +962,7 @@ pub async fn client_disconnect(app: tauri::AppHandle, state: State<'_, Arc<AppSt
 
     }
     
-    //todo confirm if true also check for room leave if necessary || i wonder why not using distribution_message_to_all here instead
+    // todo confirm if true also check for room leave if necessary || i wonder why not using distribution_message_to_all here instead
     let _ = app.emit("message", ());
 
     Ok(())

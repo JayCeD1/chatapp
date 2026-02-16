@@ -919,7 +919,7 @@ async fn send_message_with_length(
 }
 
 #[tauri::command]
-pub async fn client_disconnect(app: tauri::AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String>{
+pub async fn client_disconnect(_app: tauri::AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String>{
 
     //Read current identity from state
     let user_id_opt = {*state.user_id.read().await};
@@ -963,14 +963,14 @@ pub async fn client_disconnect(app: tauri::AppHandle, state: State<'_, Arc<AppSt
     }
     
     //todo confirm if true also check for room leave if necessary || i wonder why not using distribution_message_to_all here instead
-    let _ = app.emit("message", ());
+    // let _ = app.emit("message", ());
 
     Ok(())
 }
 
 #[tauri::command]
 pub async fn server_participant_disconnect(
-    app: tauri::AppHandle,
+    _app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
 ) -> Result<(), String> {
     // Capture host identity and room
@@ -1029,7 +1029,7 @@ pub async fn server_participant_disconnect(
     }
     // Optional: notify UI that server hosting stopped
     //todo confirm if true
-    let _ = app.emit("message", ());
+    // let _ = app.emit("message", ());
 
     Ok(())
 

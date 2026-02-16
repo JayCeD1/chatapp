@@ -368,7 +368,7 @@ const Chat = () => {
         // Gracefully stop server-participant hosting and clear server-side state
         try {
           console.log("server_participant_disconnect");
-          // await invoke("server_participant_disconnect");
+          await invoke("server_participant_disconnect");
         } catch (e) {
           console.warn("server_participant_disconnect failed (continuing):", e);
         }
@@ -376,7 +376,7 @@ const Chat = () => {
         // Close client socket and notify the remote server
         try {
           console.log("client_disconnect");
-          // await invoke("client_disconnect");
+          await invoke("client_disconnect");
         } catch (e) {
           console.warn("client_disconnect failed (continuing):", e);
         }
@@ -457,7 +457,7 @@ const Chat = () => {
     if (!query) return true;
     return (
       room.name.toLowerCase().includes(query) ||
-      room.description.toLowerCase().includes(query) ||
+      (room.description || "").toLowerCase().includes(query) ||
       (room.department_name || "").toLowerCase().includes(query)
     );
   });

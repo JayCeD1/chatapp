@@ -197,6 +197,12 @@ export const useChatConnection = () => {
       return;
     }
 
+    // Host-side failure of one of our requests (e.g. duplicate channel name) → surface it.
+    if (nm.message_type === "ErrorNotice") {
+      if (nm.message) setError(nm.message);
+      return;
+    }
+
     // Host tells us our canonical id (client mode) so we can recognise our own messages.
     if (nm.message_type === "Identity") {
       canonicalUserIdRef.current = nm.user_id;

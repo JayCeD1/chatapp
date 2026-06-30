@@ -250,6 +250,9 @@ pub enum MessageType {
     // local id differs from the host-assigned canonical id, so the client needs this to tell
     // which messages are its own (history carries the canonical author id).
     Identity,
+    // Host → a single client: a human-readable error (in `message`) for a request that failed
+    // host-side (e.g. a duplicate channel name), so the client can surface it.
+    ErrorNotice,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1061,6 +1064,33 @@ async fn broadcast_room_list(app: &tauri::AppHandle, state: &Arc<AppState>, pool
     }
 }
 
+/// Send one client a human-readable error (in `message`) for a request that failed host-side,
+/// so it can surface feedback instead of silently doing nothing.
+async fn send_error_notice(state: &Arc<AppState>, user_id: u64, text: &str) {
+    let conn = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .get(&user_id)
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+    };
+    if let Some((writer, transport)) = conn {
+        let msg = Message {
+            version: PROTOCOL_VERSION,
+            message_type: MessageType::ErrorNotice,
+            username: String::new(),
+            user_id: 0,
+            message: text.to_string(),
+            message_id: Uuid::new_v4().to_string(),
+            room: String::new(),
+            room_id: 0,
+            created_at: now_secs(),
+            is_emoji: false,
+            email: None,
+        };
+        let _ = send_secure(&writer, &transport, &msg).await;
+    }
+}
+
 /// Tell a freshly-connected client its canonical user id (carried in `user_id`), so it can
 /// recognise its own messages — its local id differs from the host-assigned canonical one, and
 /// persisted history is authored under the canonical id.
@@ -1519,7 +1549,10 @@ async fn handle_server_message(
                         // ...and hand the creator the room to switch straight to.
                         send_dm_ready(&state, actor, &room).await;
                     }
-                    Err(e) => tracing::warn!("DM request from {} failed: {}", actor, e),
+                    Err(e) => {
+                        tracing::warn!("DM request from {} failed: {}", actor, e);
+                        send_error_notice(&state, actor, &e).await;
+                    }
                 }
             }
         }
@@ -1563,7 +1596,10 @@ async fn handle_server_message(
                         }
                         send_dm_ready(&state, actor, &room).await;
                     }
-                    Err(e) => tracing::warn!("Room create from {} failed: {}", actor, e),
+                    Err(e) => {
+                        tracing::warn!("Room create from {} failed: {}", actor, e);
+                        send_error_notice(&state, actor, &e).await;
+                    }
                 }
             }
         }

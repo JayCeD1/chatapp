@@ -15,7 +15,21 @@ export interface SessionProfile {
 export const loadProfile = (): Partial<SessionProfile> => {
   try {
     const raw = localStorage.getItem(KEY);
-    return raw ? (JSON.parse(raw) as Partial<SessionProfile>) : {};
+    if (!raw) return {};
+    const p = JSON.parse(raw) as Record<string, unknown>;
+    // Validate each field by type — a corrupt or hand-edited profile must never
+    // push wrong-typed values into form state or down to the backend.
+    return {
+      username: typeof p.username === "string" ? p.username : undefined,
+      email: typeof p.email === "string" ? p.email : undefined,
+      departmentId:
+        typeof p.departmentId === "number" ? p.departmentId : undefined,
+      mode:
+        p.mode === "server" || p.mode === "client"
+          ? (p.mode as ConnectionMode)
+          : undefined,
+      serverIp: typeof p.serverIp === "string" ? p.serverIp : undefined,
+    };
   } catch {
     return {};
   }

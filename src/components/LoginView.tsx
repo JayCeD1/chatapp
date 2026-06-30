@@ -1,4 +1,4 @@
-import React, { useState } from "react";
+import React, { useState, useEffect } from "react";
 import { User, Server, Hash, Lock, Mail, AlertCircle } from "lucide-react";
 import { Department, ConnectionMode } from "../types";
 import { loadProfile } from "../session";
@@ -39,6 +39,19 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [error, setError] = useState<string | null>(null);
   // If the form is pre-filled, drop the user straight on the password field.
   const [returning] = useState(() => !!loadProfile().username);
+
+  // A restored department id may no longer exist (department list changed, or a
+  // corrupt profile). Once the live list loads, drop a stale id so the form can't
+  // submit a blank-but-truthy selection into a wrong/None room.
+  useEffect(() => {
+    if (
+      departmentId != null &&
+      departments.length > 0 &&
+      !departments.some((d) => d.id === departmentId)
+    ) {
+      setDepartmentId(null);
+    }
+  }, [departments, departmentId]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();

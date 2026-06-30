@@ -61,6 +61,18 @@ pub async fn upsert_user(
     email: String,
     department_id: Option<i64>,
 ) -> Result<User, String> {
+    upsert_user_internal(&db, name, email, department_id).await
+}
+
+/// Pool-based upsert so the socket layer can register a connecting client into the HOST's
+/// DB by email — making the host the single authority for user identity (globally-unique
+/// ids), instead of trusting the per-instance id the client asserts.
+pub async fn upsert_user_internal(
+    pool: &SqlitePool,
+    name: String,
+    email: String,
+    department_id: Option<i64>,
+) -> Result<User, String> {
     // Normalize + validate so identity (the broadcast/attribution key) stays clean:
     // trim/lowercase email, reject blank/oversized values.
     let name = name.trim().to_string();
@@ -80,7 +92,7 @@ pub async fn upsert_user(
          WHERE u.email = $1",
     )
     .bind(&email)
-    .fetch_optional(&*db)
+    .fetch_optional(pool)
     .await
     .map_err(|e| e.to_string())?
     {
@@ -89,7 +101,7 @@ pub async fn upsert_user(
             .bind(&name)
             .bind(department_id)
             .bind(&email)
-            .execute(&*db)
+            .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
     } else {
@@ -98,7 +110,7 @@ pub async fn upsert_user(
             .bind(&name)
             .bind(&email)
             .bind(department_id)
-            .execute(&*db)
+            .execute(pool)
             .await
             .map_err(|e| e.to_string())?;
     }
@@ -111,7 +123,7 @@ pub async fn upsert_user(
          WHERE u.email = $1",
     )
     .bind(&email)
-    .fetch_one(&*db)
+    .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
 

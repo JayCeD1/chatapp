@@ -438,10 +438,10 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 - [ ] DMs, settings persistence (7). _Avatars + theme persistence done in Phase 2._ — **S→L each**
 
 ### Phase 4 — Polish, tests, CI, release
-- [ ] Rust unit + `tokio::test` integration tests; Vitest + RTL frontend tests (8.1) — **L**
-- [ ] CI `check` job on PRs (tsc/eslint/clippy/fmt/test); fix `libwebkit2gtk-4.1`, Node 22, `npm ci`, rust-cache, release action v2 (8.2-8.5) — **M**
-- [ ] `tracing` logging (8.6); ESLint/Prettier wired + pre-commit (8.5) — **M**
-- [ ] Governance docs (CONTRIBUTING/CHANGELOG/SECURITY/templates/dependabot); harden or delete `deploy.sh`; codesign/notarize (9) — **M**
+- [x] Rust `tokio::test` integration tests over an in-memory SQLite pool with the real migrations applied: pagination/cursor ordering, author-scoped edit/delete (+ edit-after-delete no-op), reaction toggle/aggregate/`me` flag, and idempotent save (`db_queries.rs` test module). _Frontend Vitest + RTL still pending._ — **L**
+- [x] CI `check` workflow on PRs/push (`.github/workflows/ci.yml`): frontend tsc + `prettier --check` + build; backend `cargo fmt --check` + `cargo clippy -D warnings` + `cargo test`, with `npm ci`, `libwebkit2gtk-4.1`, Node 20, rust-cache, and run-cancellation. Clippy is clean at `-D warnings` (dead structs removed, `ClientLink` type alias, scoped `too_many_arguments` allows on Tauri commands). Also fixed the release workflow's `libwebkit2gtk-4.0 → 4.1`. _ESLint not added (Prettier-only); release-action bump still pending._ — **M**
+- [ ] `tracing` logging (8.6); ESLint wired + pre-commit (8.5) — **M**
+- [x] Governance docs: `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md`, `.github/dependabot.yml` (npm + cargo + actions). _Issue/PR templates + codesign/notarize still pending; `deploy.sh` review pending._ — **M**
 - [ ] PII at rest: SQLCipher/keychain, file perms (2.11) — **M**
 
 ---

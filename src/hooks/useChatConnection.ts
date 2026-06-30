@@ -184,8 +184,10 @@ export const useChatConnection = () => {
             } else {
               const liveAdvanced =
                 (m.deleted_at && !snap.deleted_at) ||
-                (m.edited_at && (!snap.edited_at || m.edited_at > snap.edited_at));
-              if (liveAdvanced) byId.set(m.message_id, { ...m, id: m.id ?? snap.id });
+                (m.edited_at &&
+                  (!snap.edited_at || m.edited_at > snap.edited_at));
+              if (liveAdvanced)
+                byId.set(m.message_id, { ...m, id: m.id ?? snap.id });
             }
           }
           const merged = [...byId.values()].sort((a, b) => {

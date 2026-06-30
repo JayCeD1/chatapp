@@ -87,7 +87,7 @@ pub async fn upsert_user(
         // Optionally update display name/department if changed
         sqlx::query("UPDATE users SET name=$1, department_id=$2 WHERE email=$3")
             .bind(&name)
-            .bind(&department_id)
+            .bind(department_id)
             .bind(&email)
             .execute(&*db)
             .await
@@ -97,7 +97,7 @@ pub async fn upsert_user(
         sqlx::query("INSERT INTO users (name, email, department_id) VALUES ($1, $2, $3)")
             .bind(&name)
             .bind(&email)
-            .bind(&department_id)
+            .bind(department_id)
             .execute(&*db)
             .await
             .map_err(|e| e.to_string())?;
@@ -136,7 +136,7 @@ pub async fn create_user(
     let result = sqlx::query("INSERT INTO users (name, email, department_id) VALUES ($1, $2, $3)")
         .bind(&name)
         .bind(&email)
-        .bind(&department_id)
+        .bind(department_id)
         .execute(&*db)
         .await
         .map_err(|e| format!("Failed to insert user: {}", e))?;
@@ -182,7 +182,7 @@ pub async fn get_user_by_id(db: State<'_, SqlitePool>, id: i64) -> Result<Option
          LEFT JOIN departments d ON u.department_id = d.id 
          WHERE u.id = $1"
     )
-        .bind(&id)
+        .bind(id)
         .fetch_optional(&*db)
         .await
         .map_err(|e| format!("Failed to get user by id: {}", e))?;
@@ -209,8 +209,8 @@ pub async fn update_user_online_status(
     is_online: bool,
 ) -> Result<(), String> {
     sqlx::query("UPDATE users SET is_online = $1, last_seen = CURRENT_TIMESTAMP WHERE id = $2")
-        .bind(&is_online)
-        .bind(&user_id)
+        .bind(is_online)
+        .bind(user_id)
         .execute(&*db)
         .await
         .map_err(|e| format!("Failed to update user status: {}", e))?;
@@ -309,7 +309,7 @@ WHERE cr.department_id = $1
 ORDER BY cr.name
 ",
     )
-    .bind(&department_id)
+    .bind(department_id)
     .fetch_all(&*db)
     .await
     .map_err(|e| format!("Failed to get rooms by department: {}", e))?;
@@ -350,9 +350,9 @@ pub async fn create_room(
     )
     .bind(&name)
     .bind(&description)
-    .bind(&department_id)
-    .bind(&is_private)
-    .bind(&created_by)
+    .bind(department_id)
+    .bind(is_private)
+    .bind(created_by)
     .execute(&*db)
     .await
     .map_err(|e| {
@@ -370,7 +370,7 @@ pub async fn create_room(
          FROM chat_rooms cr LEFT JOIN departments d ON cr.department_id = d.id
          WHERE cr.id = $1",
     )
-    .bind(&id)
+    .bind(id)
     .fetch_one(&*db)
     .await
     .map_err(|e| e.to_string())?;
@@ -397,8 +397,8 @@ pub async fn join_room(
         "INSERT INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)
          ON CONFLICT(user_id, room_id) DO UPDATE SET is_active = 1",
     )
-    .bind(&user_id)
-    .bind(&room_id)
+    .bind(user_id)
+    .bind(room_id)
     .execute(&*db)
     .await
     .map_err(|e| format!("Failed to join room: {}", e))?;
@@ -413,8 +413,8 @@ pub async fn leave_room(
     room_id: i64,
 ) -> Result<(), String> {
     sqlx::query("UPDATE user_rooms SET is_active = 0 WHERE user_id = $1 AND room_id = $2")
-        .bind(&user_id)
-        .bind(&room_id)
+        .bind(user_id)
+        .bind(room_id)
         .execute(&*db)
         .await
         .map_err(|e| format!("Failed to leave room: {}", e))?;
@@ -461,11 +461,11 @@ pub async fn save_message_internal(
          VALUES ($1, $2, $3, $4, $5, $6)
          ON CONFLICT(message_id) DO NOTHING",
     )
-    .bind(&room_id)
-    .bind(&user_id)
+    .bind(room_id)
+    .bind(user_id)
     .bind(&message)
     .bind(&message_type)
-    .bind(&is_emoji)
+    .bind(is_emoji)
     .bind(&message_id)
     .execute(pool)
     .await
@@ -506,9 +506,9 @@ pub async fn get_room_messages_internal(
          ORDER BY m.id DESC
          LIMIT $3",
     )
-    .bind(&room_id)
-    .bind(&before_id)
-    .bind(&limit)
+    .bind(room_id)
+    .bind(before_id)
+    .bind(limit)
     .fetch_all(pool)
     .await
     .map_err(|e| format!("Failed to get room messages: {}", e))?;
@@ -618,7 +618,7 @@ pub async fn search_messages(
          LIMIT $2",
     )
     .bind(&pattern)
-    .bind(&limit)
+    .bind(limit)
     .fetch_all(&*db)
     .await
     .map_err(|e| format!("Search failed: {}", e))?;
@@ -712,8 +712,8 @@ pub async fn get_room_reactions_internal(
          GROUP BY r.message_id, r.emoji
          ORDER BY r.message_id",
     )
-    .bind(&room_id)
-    .bind(&user_id)
+    .bind(room_id)
+    .bind(user_id)
     .fetch_all(pool)
     .await
     .map_err(|e| format!("Failed to load reactions: {}", e))?;
@@ -728,4 +728,157 @@ pub async fn get_room_reactions_internal(
         });
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use tauri_plugin_sql::MigrationKind;
+
+    // A single-connection in-memory DB with the REAL migrations applied. raw_sql is used
+    // so multi-statement migrations (e.g. the index/rebuild ones) run in full. Migrations
+    // 6/7 already seed departments and a room with id 1, so we only add the two users
+    // (Alice=1, Bob=2) the tests act as; messages go into the pre-seeded room 1.
+    async fn setup() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+
+        for m in crate::migration::get_migrations() {
+            if matches!(m.kind, MigrationKind::Up) {
+                sqlx::raw_sql(m.sql)
+                    .execute(&pool)
+                    .await
+                    .unwrap_or_else(|e| panic!("migration {} failed: {e}", m.version));
+            }
+        }
+
+        sqlx::raw_sql(
+            "INSERT INTO users (id, name, email, department_id)
+                 VALUES (1, 'Alice', 'a@x', 1), (2, 'Bob', 'b@x', 1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed users");
+
+        pool
+    }
+
+    async fn add(pool: &SqlitePool, user: i64, text: &str, mid: &str) {
+        save_message_internal(pool, 1, user, text.into(), "Chat".into(), false, mid.into())
+            .await
+            .expect("save message");
+    }
+
+    #[tokio::test]
+    async fn pagination_orders_chronologically_and_cursors_backwards() {
+        let pool = setup().await;
+        add(&pool, 1, "one", "m1").await;
+        add(&pool, 1, "two", "m2").await;
+        add(&pool, 2, "three", "m3").await;
+
+        let all = get_room_messages_internal(&pool, 1, 50, None)
+            .await
+            .unwrap();
+        let texts: Vec<_> = all.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(texts, ["one", "two", "three"]); // oldest → newest
+
+        // Newest page of 2.
+        let page = get_room_messages_internal(&pool, 1, 2, None).await.unwrap();
+        let texts: Vec<_> = page.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(texts, ["two", "three"]);
+
+        // Everything strictly older than id 2 — the cursor and sort key agree.
+        let older = get_room_messages_internal(&pool, 1, 50, Some(2))
+            .await
+            .unwrap();
+        let texts: Vec<_> = older.iter().map(|m| m.message.as_str()).collect();
+        assert_eq!(texts, ["one"]);
+    }
+
+    #[tokio::test]
+    async fn edit_is_author_scoped_and_sets_edited_at() {
+        let pool = setup().await;
+        add(&pool, 1, "hi", "m1").await;
+
+        // Bob cannot edit Alice's message; Alice can.
+        assert_eq!(edit_message_db(&pool, "m1", "hacked", 2).await.unwrap(), 0);
+        assert_eq!(edit_message_db(&pool, "m1", "fixed", 1).await.unwrap(), 1);
+
+        let msgs = get_room_messages_internal(&pool, 1, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(msgs[0].message, "fixed");
+        assert!(msgs[0].edited_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn delete_is_author_scoped_and_blocks_later_edit() {
+        let pool = setup().await;
+        add(&pool, 1, "secret", "m1").await;
+
+        assert_eq!(delete_message_db(&pool, "m1", 2).await.unwrap(), 0); // Bob can't
+        assert_eq!(delete_message_db(&pool, "m1", 1).await.unwrap(), 1); // Alice can
+                                                                         // Editing a deleted message is a no-op (the `deleted_at IS NULL` guard).
+        assert_eq!(edit_message_db(&pool, "m1", "back", 1).await.unwrap(), 0);
+
+        let msgs = get_room_messages_internal(&pool, 1, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(msgs[0].message, "");
+        assert!(msgs[0].deleted_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn reaction_toggle_updates_count_and_me_flag() {
+        let pool = setup().await;
+        add(&pool, 1, "react to me", "m1").await;
+
+        assert!(toggle_reaction_db(&pool, "m1", 1, "👍").await.unwrap()); // Alice adds
+        assert!(toggle_reaction_db(&pool, "m1", 2, "👍").await.unwrap()); // Bob adds
+
+        let agg = get_room_reactions_internal(&pool, 1, 1).await.unwrap();
+        assert_eq!(agg.len(), 1);
+        assert_eq!(agg[0].emoji, "👍");
+        assert_eq!(agg[0].count, 2);
+        assert!(agg[0].me); // Alice is among the reactors
+
+        // Alice removes hers → count drops, her `me` flips false.
+        assert!(!toggle_reaction_db(&pool, "m1", 1, "👍").await.unwrap());
+        let agg = get_room_reactions_internal(&pool, 1, 1).await.unwrap();
+        assert_eq!(agg[0].count, 1);
+        assert!(!agg[0].me);
+        // ...but Bob still sees it as his own.
+        let agg_bob = get_room_reactions_internal(&pool, 1, 2).await.unwrap();
+        assert!(agg_bob[0].me);
+    }
+
+    #[tokio::test]
+    async fn save_is_idempotent_on_message_id() {
+        let pool = setup().await;
+        add(&pool, 1, "once", "dup").await;
+
+        // Same message_id again — ON CONFLICT(message_id) DO NOTHING.
+        let r = save_message_internal(
+            &pool,
+            1,
+            1,
+            "twice".into(),
+            "Chat".into(),
+            false,
+            "dup".into(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(r.rows_affected, 0);
+
+        let all = get_room_messages_internal(&pool, 1, 50, None)
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].message, "once");
+    }
 }

@@ -121,6 +121,13 @@ fn now_secs() -> u64 {
 /// (a reconnect may have replaced it).
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// A peer's write half + its Noise transport — together, enough to send one
+/// encrypted frame. Snapshotted under the streams lock, then used after it drops.
+type ClientLink = (
+    Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    Arc<tokio::sync::Mutex<TransportState>>,
+);
+
 //Better indexing and room management
 #[derive(Clone)]
 pub struct ClientConnection {
@@ -193,20 +200,6 @@ pub enum MessageType {
 }
 
 #[derive(Serialize, Deserialize, Clone)]
-pub struct RoomInfo {
-    pub name: String,
-    pub description: String,
-    pub user_count: usize,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
-pub struct UserInfo {
-    pub username: String,
-    pub current_room: String,
-    pub is_online: bool,
-}
-
-#[derive(Serialize, Deserialize, Clone)]
 pub struct ServerInfo {
     pub address: String,
     pub port: u16,
@@ -272,6 +265,9 @@ pub async fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
 
 // MAIN SERVER START FUNCTION - Server as Participant
 #[tauri::command]
+// Tauri command: params map 1:1 to the JS invoke args, so a param struct would
+// only add indirection.
+#[allow(clippy::too_many_arguments)]
 pub async fn server_listen_as_participant(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
@@ -356,7 +352,7 @@ pub async fn server_listen_as_participant(
     // Start accepting client connections
     // Use tauri::async_runtime::spawn for the main server loop since it needs app context
     let app_clone = app.clone();
-    let state_clone = Arc::clone(&state.inner());
+    let state_clone = Arc::clone(state.inner());
     let pool_clone = db.inner().clone();
     // Bound concurrently-handled connections so a flood can't exhaust FDs/memory.
     let conn_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
@@ -794,8 +790,10 @@ async fn send_room_history(
     // whose target survives the trim (reactions are room-wide, so an untrimmed list
     // could overflow the frame on its own).
     let make = |msgs: &[crate::db_queries::Message]| -> Message {
-        let ids: std::collections::HashSet<&str> =
-            msgs.iter().filter_map(|m| m.message_id.as_deref()).collect();
+        let ids: std::collections::HashSet<&str> = msgs
+            .iter()
+            .filter_map(|m| m.message_id.as_deref())
+            .collect();
         let reactions: Vec<_> = all_reactions
             .iter()
             .filter(|r| ids.contains(r.message_id.as_str()))
@@ -819,7 +817,9 @@ async fn send_room_history(
     // fits one Noise frame with headroom for the AEAD tag.
     let resp = loop {
         let m = make(&messages);
-        let outer = serde_json::to_string(&m).map(|s| s.len()).unwrap_or(usize::MAX);
+        let outer = serde_json::to_string(&m)
+            .map(|s| s.len())
+            .unwrap_or(usize::MAX);
         if outer + 64 <= 60_000 || messages.len() <= 1 {
             break m;
         }
@@ -1102,6 +1102,7 @@ pub async fn send_as_server_participant(
 
 // CLIENT CONNECT FUNCTION - For external clients joining server
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: params map 1:1 to JS invoke args.
 pub async fn client_connect_to_server(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
@@ -1551,6 +1552,7 @@ pub async fn client_edit_message(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: params map 1:1 to JS invoke args.
 pub async fn server_edit_message(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
@@ -1662,6 +1664,7 @@ pub async fn client_toggle_reaction(
 }
 
 #[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: params map 1:1 to JS invoke args.
 pub async fn server_toggle_reaction(
     app: tauri::AppHandle,
     state: State<'_, Arc<AppState>>,
@@ -1875,10 +1878,7 @@ pub async fn server_participant_disconnect(
     // Best-effort: send an encrypted disconnect notice to each client, then drop them.
     // Snapshot the writers/transports under the lock, RELEASE it, then do the network
     // sends — never hold the global server_streams Mutex across .await I/O.
-    let targets: Vec<(
-        Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-        Arc<tokio::sync::Mutex<TransportState>>,
-    )> = {
+    let targets: Vec<ClientLink> = {
         let mut guard = state.server_streams.lock().await;
         let snapshot = guard
             .values()

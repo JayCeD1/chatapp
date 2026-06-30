@@ -24,6 +24,15 @@ mod sockets;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Structured logging. Default level is INFO (matching the prior println behavior);
+    // override with e.g. `RUST_LOG=nutler_lib=debug`. try_init so tests/re-entry don't panic.
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info")),
+        )
+        .try_init();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_notification::init())

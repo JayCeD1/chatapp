@@ -53,11 +53,14 @@ Run the same checks CI runs. All of these must be clean:
 
 ```bash
 npm run typecheck      # tsc --noEmit
+npm run lint           # eslint
 npm run format:check   # prettier --check
+npm test               # vitest run
 npm run build          # production build must succeed
 ```
 
-`npm run format` rewrites files with Prettier if `format:check` fails.
+`npm run format` rewrites files with Prettier if `format:check` fails;
+`npm run test:watch` runs Vitest in watch mode while developing.
 
 **Backend** (from `src-tauri/`)
 

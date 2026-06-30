@@ -295,7 +295,7 @@ pub async fn server_listen_as_participant(
         .local_addr()
         .map_err(|e| format!("Failed to get server address: {}", e))?;
 
-    println!("🟢 Server (as participant) listening on: {}", server_addr);
+    tracing::info!("🟢 Server (as participant) listening on: {}", server_addr);
 
     // Update state - Server is BOTH server AND participant
     {
@@ -338,14 +338,14 @@ pub async fn server_listen_as_participant(
         )
         .await
         {
-            eprintln!("Failed to save server join message: {}", e);
+            tracing::error!("Failed to save server join message: {}", e);
         }
     });
 
     // Emit join message to server's own UI
     if let Ok(payload) = serde_json::to_string(&join_message) {
         if let Err(e) = app.emit("message", payload) {
-            eprintln!("Failed to emit server join message: {}", e);
+            tracing::error!("Failed to emit server join message: {}", e);
         }
     }
 
@@ -366,7 +366,7 @@ pub async fn server_listen_as_participant(
                     let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
                         Ok(p) => p,
                         Err(_) => {
-                            eprintln!("⚠️  Connection limit reached; rejecting {}", addr);
+                            tracing::error!("⚠️  Connection limit reached; rejecting {}", addr);
                             drop(stream);
                             continue;
                         }
@@ -384,12 +384,12 @@ pub async fn server_listen_as_participant(
                         }
                     };
                     if over_ip_limit {
-                        eprintln!("⚠️  Per-IP connection limit for {}; rejecting", ip);
+                        tracing::error!("⚠️  Per-IP connection limit for {}; rejecting", ip);
                         drop(stream);
                         continue;
                     }
 
-                    println!("🔵 New client connecting from: {}", addr);
+                    tracing::info!("🔵 New client connecting from: {}", addr);
                     let app_handle = app_clone.clone();
                     let state_handle = state_clone.clone();
                     let state_dec = state_clone.clone();
@@ -407,7 +407,7 @@ pub async fn server_listen_as_participant(
                         )
                         .await
                         {
-                            eprintln!("Failed to handle client connection: {}", e);
+                            tracing::error!("Failed to handle client connection: {}", e);
                         }
                         // Release this IP's slot when the connection ends.
                         let mut counts = state_dec.ip_conn_counts.lock().await;
@@ -420,7 +420,7 @@ pub async fn server_listen_as_participant(
                     });
                 }
                 Err(e) => {
-                    eprintln!("Failed to accept client connection: {}", e);
+                    tracing::error!("Failed to accept client connection: {}", e);
                 }
             }
         }
@@ -438,7 +438,7 @@ async fn handle_client_connection(
     psk: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let peer_addr = stream.peer_addr()?;
-    println!("New client connection from: {}", peer_addr);
+    tracing::info!("New client connection from: {}", peer_addr);
 
     // Split once into owned halves: reader for this loop, writer for broadcasts.
     let (mut reader, mut writer) = stream.into_split();
@@ -448,11 +448,11 @@ async fn handle_client_connection(
     let transport = match secure::responder_handshake(&mut reader, &mut writer, &psk).await {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("🔒 Rejected {}: {}", peer_addr, e);
+            tracing::error!("🔒 Rejected {}: {}", peer_addr, e);
             return Ok(());
         }
     };
-    println!("🔒 Secure session established with {}", peer_addr);
+    tracing::info!("🔒 Secure session established with {}", peer_addr);
 
     let writer_arc = Arc::new(tokio::sync::Mutex::new(writer));
     let transport_arc = Arc::new(tokio::sync::Mutex::new(transport));
@@ -468,7 +468,7 @@ async fn handle_client_connection(
         let framed = tokio::time::timeout(READ_TIMEOUT, read_frame(&mut reader)).await;
         match framed {
             Err(_elapsed) => {
-                eprintln!(
+                tracing::error!(
                     "⏱️  Read timeout from {} (no heartbeat); closing",
                     peer_addr
                 );
@@ -484,7 +484,7 @@ async fn handle_client_connection(
                     match secure::decrypt(&mut ts, &ciphertext) {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!("🔒 Decrypt error from {}: {}", peer_addr, e);
+                            tracing::error!("🔒 Decrypt error from {}: {}", peer_addr, e);
                             break;
                         }
                     }
@@ -492,14 +492,14 @@ async fn handle_client_connection(
                 let message_str = match std::str::from_utf8(&plaintext) {
                     Ok(s) => s,
                     Err(e) => {
-                        eprintln!("Invalid UTF-8 from {}: {}", peer_addr, e);
+                        tracing::error!("Invalid UTF-8 from {}: {}", peer_addr, e);
                         break;
                     }
                 };
                 let message: Message = match serde_json::from_str(message_str) {
                     Ok(m) => m,
                     Err(e) => {
-                        eprintln!("Malformed message from {}: {}", peer_addr, e);
+                        tracing::error!("Malformed message from {}: {}", peer_addr, e);
                         break;
                     }
                 };
@@ -539,9 +539,11 @@ async fn handle_client_connection(
                             room_vec.push(message.user_id);
                         }
                     }
-                    println!(
+                    tracing::info!(
                         "Client registered: {} (ID: {}) in room {}",
-                        message.username, message.user_id, message.room
+                        message.username,
+                        message.user_id,
+                        message.room
                     );
                 }
                 // A single bad message shouldn't kill the connection. Pass the
@@ -556,16 +558,16 @@ async fn handle_client_connection(
                 )
                 .await
                 {
-                    eprintln!("Error handling message from {}: {}", peer_addr, e);
+                    tracing::error!("Error handling message from {}: {}", peer_addr, e);
                 }
             }
 
             Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                println!("client disconnected: {} - {}", peer_addr, e);
+                tracing::info!("client disconnected: {} - {}", peer_addr, e);
                 break;
             }
             Ok(Err(e)) => {
-                eprintln!("Connection closed: {} - {}", peer_addr, e);
+                tracing::error!("Connection closed: {} - {}", peer_addr, e);
                 break;
             }
         }
@@ -575,7 +577,7 @@ async fn handle_client_connection(
     //Clean up with proper error handling
     if let Some(client) = client_info {
         if let Err(e) = clean_client(&state, &app, client.user_id, conn_id, &pool).await {
-            eprintln!("Cleanup error: {}", e);
+            tracing::error!("Cleanup error: {}", e);
         }
     }
 
@@ -608,9 +610,10 @@ async fn clean_client(
             users.retain(|&id| id != client.user_id);
         }
     }
-    println!(
+    tracing::info!(
         "Client disconnected: {} (ID: {})",
-        client.username, client.user_id
+        client.username,
+        client.user_id
     );
 
     //Save the disconnect message to the database
@@ -699,23 +702,23 @@ async fn distribute_message_to_all(
         v
     }; // locks released here
 
-    println!("📡 Broadcasting to {} network clients", targets.len());
+    tracing::info!("📡 Broadcasting to {} network clients", targets.len());
     for (writer, transport, username, user_id) in targets {
         let msg = message.clone();
         tauri::async_runtime::spawn(async move {
             match send_secure(&writer, &transport, &msg).await {
-                Ok(_) => println!(" ✅ Sent to {} ({})", username, user_id),
-                Err(e) => println!("   ❌ Failed to send to {}: {}", username, e),
+                Ok(_) => tracing::info!(" ✅ Sent to {} ({})", username, user_id),
+                Err(e) => tracing::info!("   ❌ Failed to send to {}: {}", username, e),
             }
         });
     }
     // 2. ALWAYS send it to local UI (this machine's interface)
     match serde_json::to_string(message) {
         Ok(payload) => match app.emit("message", payload) {
-            Ok(_) => println!("📱 Emitted to local UI successfully"),
-            Err(e) => eprintln!("📱 Failed to emit to local UI: {}", e),
+            Ok(_) => tracing::info!("📱 Emitted to local UI successfully"),
+            Err(e) => tracing::error!("📱 Failed to emit to local UI: {}", e),
         },
-        Err(e) => eprintln!("📱 Failed to serialize message for local UI: {}", e),
+        Err(e) => tracing::error!("📱 Failed to serialize message for local UI: {}", e),
     }
 }
 
@@ -843,9 +846,10 @@ async fn handle_server_message(
     // peer can't edit/delete another user's message by spoofing message.user_id.
     auth_user_id: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    println!(
+    tracing::info!(
         "🟢 Server handling message: {:?} from {}",
-        message.message_type, message.username
+        message.message_type,
+        message.username
     );
 
     match message.message_type {
@@ -865,7 +869,7 @@ async fn handle_server_message(
                 )
                 .await
                 {
-                    eprintln!("Failed to save connect message to db: {}", e);
+                    tracing::error!("Failed to save connect message to db: {}", e);
                 }
             });
             // Distribute to all participants
@@ -888,7 +892,7 @@ async fn handle_server_message(
                 )
                 .await
                 {
-                    eprintln!("Failed to save chat message to db: {}", e);
+                    tracing::error!("Failed to save chat message to db: {}", e);
                 }
             });
             // Distribute to all participants (exclude sender to avoid duplicate)
@@ -941,7 +945,7 @@ async fn handle_server_message(
                 )
                 .await
                 {
-                    eprintln!("Failed to save room join message to db: {}", e);
+                    tracing::error!("Failed to save room join message to db: {}", e);
                 }
             });
             distribute_message_to_all(&app, &state, &message.room, &message, None).await;
@@ -986,7 +990,7 @@ async fn handle_server_message(
                 )
                 .await
                 {
-                    eprintln!("Failed to save room leave message to db: {}", e);
+                    tracing::error!("Failed to save room leave message to db: {}", e);
                 }
             });
             distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
@@ -1090,7 +1094,7 @@ pub async fn send_as_server_participant(
         )
         .await
         {
-            eprintln!("Failed to save server message to DB: {}", e);
+            tracing::error!("Failed to save server message to DB: {}", e);
         }
     });
 
@@ -1113,7 +1117,7 @@ pub async fn client_connect_to_server(
     room_id: u64,
     password: String,
 ) -> Result<(), String> {
-    println!("🔵 Client connecting to server at {}", host);
+    tracing::info!("🔵 Client connecting to server at {}", host);
 
     let stream = TcpStream::connect(&host)
         .await
@@ -1126,7 +1130,7 @@ pub async fn client_connect_to_server(
     let transport = secure::initiator_handshake(&mut reader, &mut writer, &psk)
         .await
         .map_err(|e| format!("Secure handshake failed (wrong password?): {}", e))?;
-    println!("🔒 Secure session established with {}", host);
+    tracing::info!("🔒 Secure session established with {}", host);
 
     // Update client state
     {
@@ -1183,7 +1187,7 @@ pub async fn client_connect_to_server(
     let heartbeat = spawn_client_heartbeat(Arc::clone(&state.client_stream));
     *state.client_heartbeat.lock().await = Some(heartbeat);
 
-    println!("✅ Client connected successfully");
+    tracing::info!("✅ Client connected successfully");
     Ok(())
 }
 
@@ -1207,7 +1211,7 @@ pub async fn send_as_client(
     let room = state.current_room.read().await.clone();
     let room_id = state.current_room_id.read().await.unwrap_or(1);
 
-    println!("🔵 Client sending: '{}'", message);
+    tracing::info!("🔵 Client sending: '{}'", message);
 
     let chat_message = Message {
         message_type: MessageType::Chat,
@@ -1229,7 +1233,7 @@ pub async fn send_as_client(
     // Show in own UI immediately (don't wait for server echo)
     if let Ok(payload) = serde_json::to_string(&chat_message) {
         if let Err(e) = app.emit("message", payload) {
-            eprintln!("Failed to emit own message to UI: {}", e);
+            tracing::error!("Failed to emit own message to UI: {}", e);
         }
     }
 
@@ -1242,7 +1246,7 @@ fn start_client_listener(
     transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
 ) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
-        println!("🎧 Client listener started");
+        tracing::info!("🎧 Client listener started");
 
         loop {
             // Same capped framing as the server path; each frame is then decrypted with
@@ -1251,16 +1255,16 @@ fn start_client_listener(
             let framed = tokio::time::timeout(READ_TIMEOUT, read_frame(&mut reader)).await;
             let ciphertext = match framed {
                 Err(_elapsed) => {
-                    println!("⏱️  Client read timeout (host gone)");
+                    tracing::info!("⏱️  Client read timeout (host gone)");
                     let _ = app.emit("connection_lost", ());
                     break;
                 }
                 Ok(Ok(None)) => continue, // empty keep-alive frame
                 Ok(Ok(Some(ct))) => ct,
                 Ok(Err(e)) => {
-                    println!("🔴 Client connection lost: {}", e);
+                    tracing::info!("🔴 Client connection lost: {}", e);
                     if let Err(emit_err) = app.emit("connection_lost", ()) {
-                        eprintln!("Failed to emit connection lost: {}", emit_err);
+                        tracing::error!("Failed to emit connection lost: {}", emit_err);
                     }
                     break;
                 }
@@ -1272,24 +1276,24 @@ fn start_client_listener(
                     Some(ts) => match secure::decrypt(ts, &ciphertext) {
                         Ok(p) => p,
                         Err(e) => {
-                            eprintln!("🔒 Client decrypt error: {}", e);
+                            tracing::error!("🔒 Client decrypt error: {}", e);
                             break;
                         }
                     },
                     None => {
-                        eprintln!("🔒 No client transport; dropping frame");
+                        tracing::error!("🔒 No client transport; dropping frame");
                         break;
                     }
                 }
             };
             match String::from_utf8(plaintext) {
                 Ok(message_str) => {
-                    println!("🎧 Client received: {}", message_str);
+                    tracing::info!("🎧 Client received: {}", message_str);
                     if let Err(e) = app.emit("message", message_str) {
-                        eprintln!("Failed to emit received message: {}", e);
+                        tracing::error!("Failed to emit received message: {}", e);
                     }
                 }
-                Err(e) => eprintln!("🔒 Invalid UTF-8 after decrypt: {}", e),
+                Err(e) => tracing::error!("🔒 Invalid UTF-8 after decrypt: {}", e),
             }
         }
     })
@@ -1331,7 +1335,7 @@ pub async fn server_participant_join_room(
         //Remove from old room
         if let Some(users) = room_clients.get_mut(&old_room) {
             users.retain(|&id| id != user_id);
-            println!("🔄 Removed server from room '{}'", old_room);
+            tracing::info!("🔄 Removed server from room '{}'", old_room);
         }
 
         // Add to new room
@@ -1339,9 +1343,9 @@ pub async fn server_participant_join_room(
             .entry(new_room.clone())
             .or_insert_with(Vec::new)
             .push(user_id);
-        println!("🔄 Added server to room '{}'", new_room);
+        tracing::info!("🔄 Added server to room '{}'", new_room);
 
-        println!("🔍 Room tracking after switch: {:?}", *room_clients);
+        tracing::info!("🔍 Room tracking after switch: {:?}", *room_clients);
     }
 
     // Save to database
@@ -1359,7 +1363,7 @@ pub async fn server_participant_join_room(
         )
         .await
         {
-            eprintln!("Failed to save room join: {}", e);
+            tracing::error!("Failed to save room join: {}", e);
         }
     });
 
@@ -1413,7 +1417,7 @@ pub async fn client_join_room(
         listener will receive and display them.
         Emitting locally would cause a duplicate
     */
-    println!("🔄 Client room switch: {} → {}", old_room, new_room);
+    tracing::info!("🔄 Client room switch: {} → {}", old_room, new_room);
     Ok(())
 }
 
@@ -1488,7 +1492,7 @@ pub async fn server_leave_room(
         )
         .await
         {
-            eprintln!("Failed to save room leave: {}", e);
+            tracing::error!("Failed to save room leave: {}", e);
         }
     });
 

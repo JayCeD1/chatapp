@@ -36,8 +36,17 @@ export const loadProfile = (): Partial<SessionProfile> => {
 };
 
 export const saveProfile = (p: SessionProfile): void => {
+  // Persist ONLY the known non-secret fields by name, so a stray property on the
+  // caller's object (e.g. a password) can never leak into storage.
+  const safe: SessionProfile = {
+    username: p.username,
+    email: p.email,
+    departmentId: p.departmentId,
+    mode: p.mode,
+    serverIp: p.serverIp,
+  };
   try {
-    localStorage.setItem(KEY, JSON.stringify(p));
+    localStorage.setItem(KEY, JSON.stringify(safe));
   } catch {
     /* storage may be unavailable (private mode); non-fatal */
   }

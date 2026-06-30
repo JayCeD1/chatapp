@@ -58,17 +58,19 @@ hiding activity, these move to encrypted control messages — a deliberate, sepa
 
 ---
 
-## ADR-0004 — Versioned message envelope (planned, not yet implemented)
+## ADR-0004 — Versioned message envelope
 
-**Status:** Proposed
+**Status:** Accepted (implemented)
 
-**Context.** The wire `Message` has no protocol-version field (Constraint 7), so a future
+**Context.** The wire `Message` had no protocol-version field (Constraint 7), so a future
 ciphertext format couldn't coexist with today's plaintext format without a flag day.
 
-**Decision.** Add a `version` field to the envelope, defaulting to `1`, the next time the
-message format changes (targeted: the unread-spine `LoadOlder` work). Keep message **content**
-under a separable sub-object so "encrypt the content" stays a localized change.
+**Decision.** The envelope now carries `version: u16` (`sockets.rs`, `PROTOCOL_VERSION = 1`),
+serde-defaulted so frames from pre-versioning / older / newer peers still decode. The frontend
+`Message` type carries it through `normalizeMessage` (defaulting to 1). Message **content**
+should still migrate under a separable sub-object so "encrypt the content" stays a localized
+change (not yet done — payload is still the inline `message` field).
 
-**Consequences.** Cheap insurance: v1 (plaintext) and an eventual v2 (ciphertext) coexist;
-older clients can reject unknown versions gracefully. Until implemented, treat the absence of a
-version field as technical debt called out in the gap analysis.
+**Consequences.** Cheap insurance now in place: v1 (plaintext) and an eventual v2 (ciphertext)
+can coexist, and a peer can branch/reject on `version`. Next step toward E2EE is separating
+content from metadata (Constraint 2).

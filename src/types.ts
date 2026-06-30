@@ -22,6 +22,7 @@ export interface ChatRoom {
 }
 
 export interface Message {
+  version?: number; // wire envelope version (see docs/architecture ADR-0004)
   id?: number; // DB row id (history)
   message_id?: string; // stable UUID from the backend, used for dedup + React keys
   room_id: number;

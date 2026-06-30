@@ -40,6 +40,7 @@ const normalizeMessage = (m: any, fallbackRoomId?: number): Message => {
   }
 
   return {
+    version: m?.version ?? 1,
     id: m?.id,
     message_id: m?.message_id,
     room_id: m?.room_id ?? fallbackRoomId ?? 0,

@@ -29,7 +29,33 @@ pub struct ChatRoom {
     pub department_id: Option<i64>,
     pub department_name: Option<String>,
     pub is_private: bool,
+    #[serde(default)]
+    pub is_dm: bool,
+    // For DMs, the display label derived from the *other* members (the stored `name` is a
+    // synthetic key). None for regular channels — the UI falls back to `name`.
+    #[serde(default)]
+    pub display_name: Option<String>,
     pub user_count: Option<i64>,
+}
+
+// Build a ChatRoom from a query row. `is_dm`, `display_name`, `department_name` and
+// `user_count` are optional columns — `try_get` yields the default when a query omits them.
+fn row_to_room(row: &sqlx::sqlite::SqliteRow) -> ChatRoom {
+    ChatRoom {
+        id: row.get::<Option<i64>, _>("id"),
+        name: row.get::<String, _>("name"),
+        description: row.get::<Option<String>, _>("description"),
+        department_id: row.get::<Option<i64>, _>("department_id"),
+        department_name: row
+            .try_get::<Option<String>, _>("department_name")
+            .unwrap_or(None),
+        is_private: row.get::<bool, _>("is_private"),
+        is_dm: row.try_get::<bool, _>("is_dm").unwrap_or(false),
+        display_name: row
+            .try_get::<Option<String>, _>("display_name")
+            .unwrap_or(None),
+        user_count: row.try_get::<Option<i64>, _>("user_count").unwrap_or(None),
+    }
 }
 
 #[derive(Serialize, Deserialize)]
@@ -262,7 +288,13 @@ pub async fn get_chat_rooms(
   cr.description,
   cr.department_id,
   cr.is_private,
+  cr.is_dm,
   d.name AS department_name,
+  CASE WHEN cr.is_dm = 1 THEN (
+    SELECT group_concat(u.name, ', ')
+    FROM user_rooms ur2 JOIN users u ON u.id = ur2.user_id
+    WHERE ur2.room_id = cr.id AND ur2.user_id != $1 AND ur2.is_active = 1
+  ) ELSE NULL END AS display_name,
   COALESCE(urc.user_count, 0) AS user_count
 FROM chat_rooms cr
 LEFT JOIN departments d
@@ -278,7 +310,7 @@ WHERE cr.is_private = 0
    OR cr.created_by = $1
    OR EXISTS (SELECT 1 FROM user_rooms ur
               WHERE ur.room_id = cr.id AND ur.user_id = $1 AND ur.is_active = 1)
-ORDER BY cr.name
+ORDER BY cr.is_dm, cr.name
 ",
     )
     .bind(user_id)
@@ -286,18 +318,7 @@ ORDER BY cr.name
     .await
     .map_err(|e| format!("Failed to get chat rooms: {}", e))?;
 
-    let mut rooms = Vec::new();
-    for row in result {
-        rooms.push(ChatRoom {
-            id: row.get::<Option<i64>, _>("id"),
-            name: row.get::<String, _>("name"),
-            description: row.get::<Option<String>, _>("description"),
-            department_id: row.get::<Option<i64>, _>("department_id"),
-            department_name: row.get::<Option<String>, _>("department_name"),
-            is_private: row.get::<bool, _>("is_private"),
-            user_count: row.get::<Option<i64>, _>("user_count"),
-        });
-    }
+    let rooms = result.iter().map(row_to_room).collect();
     Ok(rooms)
 }
 
@@ -340,18 +361,7 @@ ORDER BY cr.name
     .await
     .map_err(|e| format!("Failed to get rooms by department: {}", e))?;
 
-    let mut rooms = Vec::new();
-    for row in result {
-        rooms.push(ChatRoom {
-            id: row.get::<Option<i64>, _>("id"),
-            name: row.get::<String, _>("name"),
-            description: row.get::<Option<String>, _>("description"),
-            department_id: row.get::<Option<i64>, _>("department_id"),
-            department_name: row.get::<Option<String>, _>("department_name"),
-            is_private: row.get::<bool, _>("is_private"),
-            user_count: row.get::<Option<i64>, _>("user_count"),
-        });
-    }
+    let rooms = result.iter().map(row_to_room).collect();
     Ok(rooms)
 }
 
@@ -416,15 +426,7 @@ pub async fn create_room(
     .await
     .map_err(|e| e.to_string())?;
 
-    Ok(ChatRoom {
-        id: row.get::<Option<i64>, _>("id"),
-        name: row.get::<String, _>("name"),
-        description: row.get::<Option<String>, _>("description"),
-        department_id: row.get::<Option<i64>, _>("department_id"),
-        department_name: row.get::<Option<String>, _>("department_name"),
-        is_private: row.get::<bool, _>("is_private"),
-        user_count: row.get::<Option<i64>, _>("user_count"),
-    })
+    Ok(row_to_room(&row))
 }
 
 #[tauri::command]
@@ -518,6 +520,116 @@ pub async fn add_room_member_internal(
     .await
     .map_err(|e| format!("Failed to add member: {}", e))?;
     Ok(())
+}
+
+/// Find or create a direct-message room between `actor_id` and `target_ids`.
+///
+/// A DM is a private room (`is_private = 1, is_dm = 1`) with a fixed member set. 1:1 DMs use a
+/// deterministic name (`dm:<lo>:<hi>`) so repeat opens reuse the same room; group DMs (3+ people)
+/// get a fresh `dm:g:<uuid>` each time. Returns the room from `actor_id`'s perspective, with
+/// `display_name` set to the *other* members' names.
+pub async fn get_or_create_dm_internal(
+    pool: &SqlitePool,
+    actor_id: i64,
+    target_ids: Vec<i64>,
+) -> Result<ChatRoom, String> {
+    // Normalize to a sorted, de-duplicated member set including the actor.
+    let mut members: Vec<i64> = target_ids;
+    members.push(actor_id);
+    members.sort_unstable();
+    members.dedup();
+    if members.len() < 2 {
+        return Err("A direct message needs at least one other person".to_string());
+    }
+    if members.len() > 32 {
+        return Err("A group message can have at most 32 people".to_string());
+    }
+
+    // Validate every member exists up front so we never create a half-populated DM room
+    // (a missing target would otherwise fail the FK insert *after* the room row is created).
+    for m in &members {
+        let exists: Option<i64> = sqlx::query_scalar("SELECT id FROM users WHERE id = $1")
+            .bind(m)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("Failed to validate DM member: {}", e))?;
+        if exists.is_none() {
+            return Err(format!("Unknown user {}", m));
+        }
+    }
+
+    let is_group = members.len() > 2;
+    let name = if is_group {
+        format!("dm:g:{}", Uuid::new_v4())
+    } else {
+        format!("dm:{}:{}", members[0], members[1])
+    };
+
+    // 1:1 DMs are deduplicated by their deterministic name; group DMs are always new.
+    let existing: Option<i64> = if is_group {
+        None
+    } else {
+        sqlx::query_scalar("SELECT id FROM chat_rooms WHERE name = $1")
+            .bind(&name)
+            .fetch_optional(pool)
+            .await
+            .map_err(|e| format!("Failed to look up direct message: {}", e))?
+    };
+
+    let room_id = match existing {
+        Some(id) => id,
+        None => {
+            let res = sqlx::query(
+                "INSERT INTO chat_rooms (name, description, is_private, is_dm, created_by)
+                 VALUES ($1, NULL, 1, 1, $2)",
+            )
+            .bind(&name)
+            .bind(actor_id)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to create direct message: {}", e))?;
+            res.last_insert_rowid()
+        }
+    };
+
+    // (Re)activate every member — both on first creation and when reopening a 1:1 a member had
+    // left, so the DM is always usable by the full set.
+    for m in &members {
+        sqlx::query(
+            "INSERT INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)
+             ON CONFLICT(user_id, room_id) DO UPDATE SET is_active = 1",
+        )
+        .bind(m)
+        .bind(room_id)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to add direct-message member: {}", e))?;
+    }
+
+    dm_room_view(pool, room_id, actor_id).await
+}
+
+/// Fetch a single room as a ChatRoom from `viewer_id`'s perspective (DM `display_name` =
+/// the other members' names).
+async fn dm_room_view(pool: &SqlitePool, room_id: i64, viewer_id: i64) -> Result<ChatRoom, String> {
+    let row = sqlx::query(
+        "SELECT cr.id, cr.name, cr.description, cr.department_id, cr.is_private, cr.is_dm,
+                NULL AS department_name,
+                CASE WHEN cr.is_dm = 1 THEN (
+                  SELECT group_concat(u.name, ', ')
+                  FROM user_rooms ur JOIN users u ON u.id = ur.user_id
+                  WHERE ur.room_id = cr.id AND ur.user_id != $2 AND ur.is_active = 1
+                ) ELSE NULL END AS display_name,
+                (SELECT COUNT(DISTINCT user_id) FROM user_rooms
+                 WHERE room_id = cr.id AND is_active = 1) AS user_count
+         FROM chat_rooms cr WHERE cr.id = $1",
+    )
+    .bind(room_id)
+    .bind(viewer_id)
+    .fetch_one(pool)
+    .await
+    .map_err(|e| format!("Failed to load direct message: {}", e))?;
+    Ok(row_to_room(&row))
 }
 
 /// A connectable user, for the client-side directory (invite + DM pickers). Clients keep no
@@ -1180,5 +1292,80 @@ mod tests {
             .unwrap();
         assert_eq!(all.len(), 1);
         assert_eq!(all[0].message, "once");
+    }
+
+    #[tokio::test]
+    async fn dm_one_to_one_is_found_or_created_and_labeled_by_other_member() {
+        let pool = setup().await;
+
+        // Alice (1) opens a DM with Bob (2).
+        let dm = get_or_create_dm_internal(&pool, 1, vec![2]).await.unwrap();
+        assert!(dm.is_dm);
+        assert!(dm.is_private);
+        assert_eq!(dm.name, "dm:1:2"); // deterministic, sorted
+                                       // From Alice's perspective the label is the *other* member.
+        assert_eq!(dm.display_name.as_deref(), Some("Bob"));
+
+        // Opening again (in either order) reuses the same room — no duplicate.
+        let again = get_or_create_dm_internal(&pool, 2, vec![1]).await.unwrap();
+        assert_eq!(again.id, dm.id);
+        assert_eq!(again.display_name.as_deref(), Some("Alice")); // Bob's perspective
+    }
+
+    #[tokio::test]
+    async fn dm_group_is_always_new_and_validates_members() {
+        let pool = setup().await;
+        sqlx::raw_sql("INSERT INTO users (id, name, email) VALUES (3, 'Carol', 'c@x')")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        // A 3-person group DM gets a fresh room each time (no dedup).
+        let g1 = get_or_create_dm_internal(&pool, 1, vec![2, 3])
+            .await
+            .unwrap();
+        let g2 = get_or_create_dm_internal(&pool, 1, vec![2, 3])
+            .await
+            .unwrap();
+        assert!(g1.is_dm && g2.is_dm);
+        assert_ne!(g1.id, g2.id);
+        assert!(g1.name.starts_with("dm:g:"));
+
+        // A non-existent target is rejected before any room row is created.
+        let before: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_rooms")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert!(get_or_create_dm_internal(&pool, 1, vec![999])
+            .await
+            .is_err());
+        let after: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM chat_rooms")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(before, after); // no half-created DM room
+
+        // A DM with only yourself is rejected.
+        assert!(get_or_create_dm_internal(&pool, 1, vec![1]).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn dm_rooms_are_listed_only_for_members() {
+        let pool = setup().await;
+        sqlx::raw_sql("INSERT INTO users (id, name, email) VALUES (3, 'Carol', 'c@x')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let dm = get_or_create_dm_internal(&pool, 1, vec![2]).await.unwrap();
+
+        // Members see the DM (labeled by the other member); a non-member (Carol) does not.
+        let allowed = room_join_allowed_internal(&pool, 1, dm.id.unwrap())
+            .await
+            .unwrap();
+        let denied = room_join_allowed_internal(&pool, 3, dm.id.unwrap())
+            .await
+            .unwrap();
+        assert!(allowed);
+        assert!(!denied);
     }
 }

@@ -218,6 +218,15 @@ pub fn get_migrations() -> Vec<Migration> {
             sql: "ALTER TABLE user_rooms ADD COLUMN last_read_at TIMESTAMP;",
             kind: MigrationKind::Up,
         },
+        // Migration 13: mark direct-message rooms. A DM is a private room (is_private = 1)
+        // with is_dm = 1; its stored name is a synthetic key (dm:<a>:<b> for 1:1, dm:g:<uuid>
+        // for groups), while the UI shows a name derived from the other members.
+        Migration {
+            version: 13,
+            description: "add_chat_rooms_is_dm",
+            sql: "ALTER TABLE chat_rooms ADD COLUMN is_dm BOOLEAN NOT NULL DEFAULT 0;",
+            kind: MigrationKind::Up,
+        },
         // Down for v7: remove default chat rooms created in v7
         Migration {
             version: 7,

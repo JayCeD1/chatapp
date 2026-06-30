@@ -30,19 +30,18 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
-    # Code-signing / notarization secrets. All are empty until you add them in the repo
-    # settings — when empty, Tauri builds UNSIGNED, so this workflow keeps working out of
-    # the box. See RELEASING.md for how to generate and set each one.
+    # Needed for the Create Release step to push a release with GITHUB_TOKEN.
+    permissions:
+      contents: write
+
+    # Signing secrets are empty until you add them — when empty the workflow builds
+    # UNSIGNED, so it works out of the box. The Apple cert is deliberately NOT set here:
+    # an empty `APPLE_CERTIFICATE` makes Tauri attempt (and fail) a keychain import, so it's
+    # only set on the signed build step below. See RELEASING.md.
     env:
-      # macOS — Tauri imports the cert into a temp keychain and signs automatically.
-      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
-      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
-      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
-      # macOS notarization (Apple ID method). Notarizes only when all three are set.
-      APPLE_ID: ${{ secrets.APPLE_ID }}
-      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
-      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-      # Windows — base64 .pfx + its password (see the import step below).
+      # 'true' only when an Apple signing cert secret is present → selects the signed build.
+      HAS_APPLE_CERT: ${{ secrets.APPLE_CERTIFICATE != '' }}
+      # Windows — base64 .pfx + its password (consumed only by the guarded import step).
       WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
       WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
 
@@ -90,9 +89,23 @@ jobs:
           $json | ConvertTo-Json -Depth 32 | Set-Content $conf
           Write-Host "Signing with thumbprint $($cert.Thumbprint)"
 
-      - name: Build Tauri app
-        # `npx tauri` runs the CLI directly — `npm run tauri build -- --target X` forwards a
-        # stray `--` that the CLI rejects ("unexpected argument '<target>'").
+      # Two build steps so the Apple signing env is present ONLY when a cert exists (an empty
+      # APPLE_CERTIFICATE would make Tauri try a keychain import and fail). `npx tauri` runs
+      # the CLI directly — `npm run tauri build -- --target X` forwards a stray `--` the CLI
+      # rejects. Windows signing (when configured) happens via the import step + thumbprint.
+      - name: Build Tauri app (unsigned)
+        if: ${{ !(matrix.os == 'macos-latest' && env.HAS_APPLE_CERT == 'true') }}
+        run: npx tauri build --target ${{ matrix.target }}
+
+      - name: Build Tauri app (macOS, signed + notarized)
+        if: ${{ matrix.os == 'macos-latest' && env.HAS_APPLE_CERT == 'true' }}
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: npx tauri build --target ${{ matrix.target }}
 
       - name: Upload artifacts

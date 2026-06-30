@@ -7,6 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-06-30
+
+### Added
+
+- **Direct messages (1:1 and group).** Start a private conversation with one or
+  more people from the directory. 1:1 DMs reuse the same room on reopen; group
+  DMs are distinct. Conversations are labelled by their other participants and
+  live in a dedicated "Direct Messages" section of the sidebar.
+- **Invite people to private channels.** A searchable member picker on private
+  channels, backed by a host-pushed user directory.
+- **App icon** across all platforms.
+
+### Security
+
+- **Membership-gated chat delivery.** Incoming chat frames are now authorized
+  against the connection's canonical identity before a message is persisted or
+  distributed, so a crafted frame can't inject into a private channel or DM
+  history. (Mirrors the existing join/history gates.)
+
+### Changed
+
+- **Canonical identity.** The host is the single authority for user identity
+  (keyed by email), fixing cross-machine id collisions that could drop a third
+  participant's message delivery.
+- **Reconnect generation counter** suppresses a stale listener's
+  `connection_lost` once a newer connection exists, preventing spurious
+  reconnect loops.
+
+## [0.1.x] — initial release line
+
 ### Added
 
 - **End-to-end encryption.** All peer traffic now runs over the Noise protocol
@@ -58,7 +88,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - Added a transport security model and threat boundaries; see
   [SECURITY.md](./SECURITY.md).
 
----
-
-_No tagged releases yet. This section will be split into versioned entries at the
-first release._

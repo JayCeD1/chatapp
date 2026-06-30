@@ -576,6 +576,14 @@ pub async fn get_or_create_dm_internal(
             .map_err(|e| format!("Failed to look up direct message: {}", e))?
     };
 
+    // Create the room and (re)activate every member atomically, so a mid-operation failure
+    // can't leave an orphan room with a partial member set. Re-activation also covers reopening
+    // a 1:1 a member had previously left, keeping the DM usable by the full set.
+    let mut tx = pool
+        .begin()
+        .await
+        .map_err(|e| format!("Failed to open transaction: {}", e))?;
+
     let room_id = match existing {
         Some(id) => id,
         None => {
@@ -585,15 +593,13 @@ pub async fn get_or_create_dm_internal(
             )
             .bind(&name)
             .bind(actor_id)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("Failed to create direct message: {}", e))?;
             res.last_insert_rowid()
         }
     };
 
-    // (Re)activate every member — both on first creation and when reopening a 1:1 a member had
-    // left, so the DM is always usable by the full set.
     for m in &members {
         sqlx::query(
             "INSERT INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)
@@ -601,10 +607,14 @@ pub async fn get_or_create_dm_internal(
         )
         .bind(m)
         .bind(room_id)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to add direct-message member: {}", e))?;
     }
+
+    tx.commit()
+        .await
+        .map_err(|e| format!("Failed to commit direct message: {}", e))?;
 
     dm_room_view(pool, room_id, actor_id).await
 }

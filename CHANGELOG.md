@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.2] - 2026-06-30
+
+### Fixed
+
+- **Client-created channels now sync.** A channel created on a client used to be
+  written only to that client's local database (invisible to everyone else).
+  Channels are now created on the host: public channels appear in every
+  connected client's sidebar, private ones are scoped to the creator. This works
+  whether the host or a client creates the channel.
+- **Failed requests surface an error.** A client request that fails host-side
+  (e.g. a duplicate channel name) now shows an error instead of silently doing
+  nothing.
+
 ## [0.2.1] - 2026-06-30
 
 ### Fixed

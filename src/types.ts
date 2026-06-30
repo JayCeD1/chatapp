@@ -25,6 +25,9 @@ export interface ChatRoom {
   department_id?: number;
   department_name?: string;
   is_private?: boolean;
+  is_dm?: boolean;
+  // For DMs, the label derived from the other members (the stored `name` is a synthetic key).
+  display_name?: string;
   user_count?: number;
 }
 

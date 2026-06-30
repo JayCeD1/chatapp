@@ -1,11 +1,27 @@
 import React, { useState } from "react";
-import { Hash, LogOut, Users, Sun, Moon, Plus, Search } from "lucide-react";
-import { ChatRoom, Department, SearchResult, User } from "../types";
+import {
+  Hash,
+  LogOut,
+  Users,
+  Sun,
+  Moon,
+  Plus,
+  Search,
+  MessageSquare,
+} from "lucide-react";
+import {
+  ChatRoom,
+  Department,
+  DirectoryUser,
+  SearchResult,
+  User,
+} from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
 import { Theme } from "../hooks/useTheme";
 import { initials, avatarColor } from "../utils";
 import { CreateChannelModal } from "./CreateChannelModal";
 import { SearchModal } from "./SearchModal";
+import { NewDmModal } from "./NewDmModal";
 
 interface SidebarProps {
   departments: Department[];
@@ -14,6 +30,7 @@ interface SidebarProps {
   currentUser: User;
   unreadByRoom: Record<number, number>;
   connectionStatus: ConnectionStatus;
+  directory: DirectoryUser[];
   onSelectRoom: (room: ChatRoom) => void;
   onCreateRoom: (
     name: string,
@@ -21,6 +38,7 @@ interface SidebarProps {
     departmentId: number | null,
     isPrivate: boolean,
   ) => Promise<void>;
+  onCreateDm: (targetIds: number[]) => Promise<void> | void;
   onSearch: (query: string) => Promise<SearchResult[]>;
   onJumpToRoom: (roomId: number) => void;
   onLogout: () => void;
@@ -41,8 +59,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
   currentUser,
   unreadByRoom,
   connectionStatus,
+  directory,
   onSelectRoom,
   onCreateRoom,
+  onCreateDm,
   onSearch,
   onJumpToRoom,
   onLogout,
@@ -51,20 +71,84 @@ export const Sidebar: React.FC<SidebarProps> = ({
 }) => {
   const [showCreate, setShowCreate] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
+  const [showNewDm, setShowNewDm] = useState(false);
 
-  // Group rooms by department; keep any unmatched rooms under "Other".
+  // DMs live in their own section; channels are grouped by department.
+  const channels = chatRooms.filter((r) => !r.is_dm);
+  const dms = chatRooms.filter((r) => r.is_dm);
+
+  // Group channels by department; keep any unmatched rooms under "Other".
   const groups = departments
     .map((dep) => ({
       name: dep.name,
-      rooms: chatRooms.filter((r) => r.department_name === dep.name),
+      rooms: channels.filter((r) => r.department_name === dep.name),
     }))
     .filter((g) => g.rooms.length > 0);
 
   const matched = new Set(groups.flatMap((g) => g.rooms.map((r) => r.id)));
-  const orphans = chatRooms.filter((r) => !matched.has(r.id));
+  const orphans = channels.filter((r) => !matched.has(r.id));
   if (orphans.length) groups.push({ name: "Other", rooms: orphans });
 
   const status = statusMeta[connectionStatus];
+
+  // One sidebar row. `Icon` differs for channels (#) vs DMs (message bubble); `label` lets
+  // DMs show their derived display name rather than the synthetic stored name.
+  const roomRow = (
+    room: ChatRoom,
+    label: string,
+    Icon: typeof Hash,
+    showCount: boolean,
+  ) => {
+    const active = currentRoom?.id === room.id;
+    // The active room is always read; don't badge what you're looking at.
+    const unread = active ? 0 : (unreadByRoom[room.id] ?? 0);
+    return (
+      <li key={room.id}>
+        <button
+          onClick={() => onSelectRoom(room)}
+          aria-current={active ? "true" : undefined}
+          className={`group w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-sm transition-colors ${
+            active
+              ? "bg-[var(--surface-3)] text-[var(--text)]"
+              : unread > 0
+                ? "text-[var(--text)] hover:bg-[var(--surface-2)]"
+                : "text-[var(--text-dim)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+          }`}
+        >
+          <Icon
+            className={`w-4 h-4 shrink-0 ${
+              active
+                ? "text-[var(--accent-strong)]"
+                : "text-[var(--text-faint)]"
+            }`}
+          />
+          <span
+            className={`truncate flex-1 text-left ${
+              unread > 0 ? "font-semibold" : ""
+            }`}
+          >
+            {label}
+          </span>
+          {unread > 0 ? (
+            <span
+              className="min-w-[18px] h-[18px] px-1.5 flex items-center justify-center rounded-full bg-[var(--accent)] text-white text-[10px] font-bold shrink-0"
+              aria-label={`${unread} unread message${unread === 1 ? "" : "s"}`}
+            >
+              {unread > 99 ? "99+" : unread}
+            </span>
+          ) : (
+            showCount &&
+            (room.user_count ?? 0) > 0 && (
+              <span className="flex items-center gap-1 text-[11px] text-[var(--text-faint)]">
+                <Users className="w-3 h-3" />
+                {room.user_count}
+              </span>
+            )
+          )}
+        </button>
+      </li>
+    );
+  };
 
   return (
     <aside className="flex h-full flex-col bg-[var(--surface)] border-r border-[var(--border)]">
@@ -110,59 +194,43 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </span>
             </div>
             <ul className="px-2 space-y-0.5">
-              {group.rooms.map((room) => {
-                const active = currentRoom?.id === room.id;
-                // The active room is always read; don't badge what you're looking at.
-                const unread = active ? 0 : (unreadByRoom[room.id] ?? 0);
-                return (
-                  <li key={room.id}>
-                    <button
-                      onClick={() => onSelectRoom(room)}
-                      aria-current={active ? "true" : undefined}
-                      className={`group w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-sm transition-colors ${
-                        active
-                          ? "bg-[var(--surface-3)] text-[var(--text)]"
-                          : unread > 0
-                            ? "text-[var(--text)] hover:bg-[var(--surface-2)]"
-                            : "text-[var(--text-dim)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
-                      }`}
-                    >
-                      <Hash
-                        className={`w-4 h-4 shrink-0 ${
-                          active
-                            ? "text-[var(--accent-strong)]"
-                            : "text-[var(--text-faint)]"
-                        }`}
-                      />
-                      <span
-                        className={`truncate flex-1 text-left ${
-                          unread > 0 ? "font-semibold" : ""
-                        }`}
-                      >
-                        {room.name}
-                      </span>
-                      {unread > 0 ? (
-                        <span
-                          className="min-w-[18px] h-[18px] px-1.5 flex items-center justify-center rounded-full bg-[var(--accent)] text-white text-[10px] font-bold shrink-0"
-                          aria-label={`${unread} unread message${unread === 1 ? "" : "s"}`}
-                        >
-                          {unread > 99 ? "99+" : unread}
-                        </span>
-                      ) : (
-                        (room.user_count ?? 0) > 0 && (
-                          <span className="flex items-center gap-1 text-[11px] text-[var(--text-faint)]">
-                            <Users className="w-3 h-3" />
-                            {room.user_count}
-                          </span>
-                        )
-                      )}
-                    </button>
-                  </li>
-                );
-              })}
+              {group.rooms.map((room) => roomRow(room, room.name, Hash, true))}
             </ul>
           </div>
         ))}
+
+        {/* Direct messages */}
+        <div className="mb-4">
+          <div className="px-4 mb-1 flex items-center justify-between">
+            <span className="text-[11px] font-semibold uppercase tracking-wider text-[var(--text-faint)]">
+              Direct Messages
+            </span>
+            <button
+              onClick={() => setShowNewDm(true)}
+              title="New message"
+              aria-label="New message"
+              className="p-0.5 rounded text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+            >
+              <Plus className="w-3.5 h-3.5" />
+            </button>
+          </div>
+          {dms.length === 0 ? (
+            <p className="px-4 py-1 text-[11px] text-[var(--text-faint)]">
+              No conversations yet.
+            </p>
+          ) : (
+            <ul className="px-2 space-y-0.5">
+              {dms.map((room) =>
+                roomRow(
+                  room,
+                  room.display_name || room.name,
+                  MessageSquare,
+                  false,
+                ),
+              )}
+            </ul>
+          )}
+        </div>
       </nav>
 
       {/* Current user footer */}
@@ -230,6 +298,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
           onSearch={onSearch}
           onJump={onJumpToRoom}
           onClose={() => setShowSearch(false)}
+        />
+      )}
+
+      {showNewDm && (
+        <NewDmModal
+          users={directory}
+          selfName={currentUser.name}
+          onStart={onCreateDm}
+          onClose={() => setShowNewDm(false)}
         />
       )}
     </aside>

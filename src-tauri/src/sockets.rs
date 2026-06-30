@@ -1,8 +1,8 @@
 use crate::db_queries::{
-    add_room_member_internal, delete_message_db, edit_message_db, get_room_messages_internal,
-    get_room_reactions_internal, get_unread_counts_internal, list_users_internal,
-    room_join_allowed_internal, save_message_internal, toggle_reaction_db,
-    touch_last_read_internal, upsert_user_internal,
+    add_room_member_internal, delete_message_db, edit_message_db, get_or_create_dm_internal,
+    get_room_messages_internal, get_room_reactions_internal, get_unread_counts_internal,
+    list_users_internal, room_join_allowed_internal, save_message_internal, toggle_reaction_db,
+    touch_last_read_internal, upsert_user_internal, ChatRoom,
 };
 use crate::secure;
 use serde::{Deserialize, Serialize};
@@ -228,6 +228,11 @@ pub enum MessageType {
     AddMember,
     // Host → a single client: their room membership changed; reload the channel list.
     RoomsChanged,
+    // Client → host: open/create a direct message. `message` carries a JSON array of target
+    // user ids. The host authorizes the creator by the connection's canonical id.
+    DmRequest,
+    // Host → the requesting client: the freshly opened DM room (JSON ChatRoom) to switch to.
+    DmReady,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1008,6 +1013,34 @@ async fn send_rooms_changed(state: &Arc<AppState>, user_id: u64) {
     }
 }
 
+/// Send the requesting client the DM room they just opened (as JSON in `message`), so their
+/// client can switch to it immediately rather than hunting for it after a rooms reload.
+async fn send_dm_ready(state: &Arc<AppState>, user_id: u64, room: &ChatRoom) {
+    let conn = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .get(&user_id)
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+    };
+    if let Some((writer, transport)) = conn {
+        let payload = serde_json::to_string(room).unwrap_or_else(|_| "{}".to_string());
+        let msg = Message {
+            version: PROTOCOL_VERSION,
+            message_type: MessageType::DmReady,
+            username: String::new(),
+            user_id: 0,
+            message: payload,
+            message_id: Uuid::new_v4().to_string(),
+            room: String::new(),
+            room_id: 0,
+            created_at: now_secs(),
+            is_emoji: false,
+            email: None,
+        };
+        let _ = send_secure(&writer, &transport, &msg).await;
+    }
+}
+
 /// After a chat lands in `room`, keep every connected client's unread badge honest:
 /// clients currently viewing the room have it marked read (they see it live); clients
 /// elsewhere get a fresh unread push (their badge for this room may have grown). This is
@@ -1361,6 +1394,35 @@ async fn handle_server_message(
                     {
                         send_rooms_changed(&state, target as u64).await;
                     }
+                }
+            }
+        }
+        // Client opens/creates a DM (`message` = JSON array of target ids). The creator is the
+        // connection's canonical id (never the client-asserted user_id); the room is sent back
+        // to the requester (DmReady) and the other members are told to reload their channel list.
+        MessageType::DmRequest => {
+            if let Some(actor) = auth_user_id {
+                let targets: Vec<i64> = serde_json::from_str(&message.message).unwrap_or_default();
+                match get_or_create_dm_internal(&pool, actor as i64, targets).await {
+                    Ok(room) => {
+                        if let Some(room_id) = room.id {
+                            // Notify every other member so the DM appears in their list.
+                            let others = sqlx::query_scalar::<_, i64>(
+                                "SELECT user_id FROM user_rooms
+                                 WHERE room_id = $1 AND is_active = 1 AND user_id != $2",
+                            )
+                            .bind(room_id)
+                            .bind(actor as i64)
+                            .fetch_all(&pool)
+                            .await
+                            .unwrap_or_default();
+                            for uid in others {
+                                send_rooms_changed(&state, uid as u64).await;
+                            }
+                        }
+                        send_dm_ready(&state, actor, &room).await;
+                    }
+                    Err(e) => tracing::warn!("DM request from {} failed: {}", actor, e),
                 }
             }
         }
@@ -2120,6 +2182,32 @@ pub async fn client_add_member(
         .map_err(|e| format!("Failed to add member: {}", e))
 }
 
+/// Client → host: open/create a DM with `target_ids`. The host creates the room under the
+/// connection's canonical id and replies with a DmReady the client switches to.
+#[tauri::command]
+pub async fn client_create_dm(
+    state: State<'_, Arc<AppState>>,
+    target_ids: Vec<i64>,
+) -> Result<(), String> {
+    let payload = serde_json::to_string(&target_ids).unwrap_or_else(|_| "[]".to_string());
+    let msg = Message {
+        version: PROTOCOL_VERSION,
+        message_type: MessageType::DmRequest,
+        username: String::new(),
+        user_id: 0,
+        message: payload,
+        message_id: Uuid::new_v4().to_string(),
+        room: String::new(),
+        room_id: 0,
+        created_at: now_secs(),
+        is_emoji: false,
+        email: None,
+    };
+    send_secure_client(state.inner(), &msg)
+        .await
+        .map_err(|e| format!("Failed to start direct message: {}", e))
+}
+
 /// Host participant invites a user directly against its own DB, then notifies the invitee.
 #[tauri::command]
 pub async fn server_add_member(
@@ -2132,6 +2220,33 @@ pub async fn server_add_member(
     add_room_member_internal(db.inner(), room_id as i64, target_id, actor_id).await?;
     send_rooms_changed(state.inner(), target_id as u64).await;
     Ok(())
+}
+
+/// Host participant opens/creates a DM against its own DB, notifies the other members so it
+/// appears in their channel list, and returns the room for the host to switch to.
+#[tauri::command]
+pub async fn server_create_dm(
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    actor_id: i64,
+    target_ids: Vec<i64>,
+) -> Result<ChatRoom, String> {
+    let room = get_or_create_dm_internal(db.inner(), actor_id, target_ids).await?;
+    if let Some(room_id) = room.id {
+        let others = sqlx::query_scalar::<_, i64>(
+            "SELECT user_id FROM user_rooms
+             WHERE room_id = $1 AND is_active = 1 AND user_id != $2",
+        )
+        .bind(room_id)
+        .bind(actor_id)
+        .fetch_all(db.inner())
+        .await
+        .unwrap_or_default();
+        for uid in others {
+            send_rooms_changed(state.inner(), uid as u64).await;
+        }
+    }
+    Ok(room)
 }
 
 /// Host participant typing: relay straight to the room's clients (and the local UI

@@ -46,6 +46,7 @@ interface WorkspaceProps {
   onLoadOlder: () => Promise<void>;
   directory: DirectoryUser[];
   onAddMember: (roomId: number, userId: number) => void;
+  onCreateDm: (targetIds: number[]) => Promise<void> | void;
   onLeaveRoom: () => void;
   onLogout: () => void;
   onDismissError: () => void;
@@ -79,6 +80,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   onLoadOlder,
   directory,
   onAddMember,
+  onCreateDm,
   onLeaveRoom,
   onLogout,
   onDismissError,
@@ -113,8 +115,10 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         currentUser={currentUser}
         unreadByRoom={unreadByRoom}
         connectionStatus={connectionStatus}
+        directory={directory}
         onSelectRoom={onSelectRoom}
         onCreateRoom={onCreateRoom}
+        onCreateDm={onCreateDm}
         onSearch={onSearch}
         onJumpToRoom={onJumpToRoom}
         onLogout={onLogout}

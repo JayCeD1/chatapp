@@ -5,6 +5,7 @@ import {
   SmilePlus,
   Hash,
   Lock,
+  MessageSquare,
   UserPlus,
   LogOut,
   ChevronDown,
@@ -85,6 +86,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   directory,
   onAddMember,
 }) => {
+  // DMs are stored under a synthetic name; show the derived label and drop the "#" prefix.
+  const isDm = !!room.is_dm;
+  const title = isDm ? room.display_name || room.name : room.name;
+  const prefix = isDm ? "" : "#";
   const [inputText, setInputText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
   const [showInvite, setShowInvite] = useState(false);
@@ -247,26 +252,28 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       {/* Header */}
       <header className="flex items-center justify-between px-5 h-14 border-b border-[var(--border)] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          {room.is_private ? (
+          {isDm ? (
+            <MessageSquare className="w-4 h-4 text-[var(--text-faint)] shrink-0" />
+          ) : room.is_private ? (
             <Lock className="w-4 h-4 text-[var(--text-faint)] shrink-0" />
           ) : (
             <Hash className="w-5 h-5 text-[var(--text-faint)] shrink-0" />
           )}
-          <h2 className="font-semibold text-[var(--text)] truncate">
-            {room.name}
-          </h2>
-          <span className="text-[var(--text-faint)] text-sm shrink-0">
-            · {memberCount} {memberCount === 1 ? "member" : "members"}
-            {onlineCount > 0 && (
-              <span className="text-[var(--online)]">
-                {" "}
-                · {onlineCount} online
-              </span>
-            )}
-          </span>
+          <h2 className="font-semibold text-[var(--text)] truncate">{title}</h2>
+          {!isDm && (
+            <span className="text-[var(--text-faint)] text-sm shrink-0">
+              · {memberCount} {memberCount === 1 ? "member" : "members"}
+              {onlineCount > 0 && (
+                <span className="text-[var(--online)]">
+                  {" "}
+                  · {onlineCount} online
+                </span>
+              )}
+            </span>
+          )}
         </div>
         <div className="flex items-center gap-1 shrink-0">
-          {room.is_private && (
+          {room.is_private && !isDm && (
             <button
               onClick={() => setShowInvite(true)}
               title="Add people"
@@ -315,14 +322,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           ) : messages.length === 0 ? (
             <div className="flex flex-col items-center justify-center h-full text-center px-6">
               <div className="flex items-center justify-center w-14 h-14 rounded-2xl bg-[var(--surface-2)] mb-4">
-                <Hash className="w-7 h-7 text-[var(--accent-strong)]" />
+                {isDm ? (
+                  <MessageSquare className="w-7 h-7 text-[var(--accent-strong)]" />
+                ) : (
+                  <Hash className="w-7 h-7 text-[var(--accent-strong)]" />
+                )}
               </div>
               <h3 className="text-lg font-semibold text-[var(--text)]">
-                Welcome to #{room.name}
+                {isDm ? `Chat with ${title}` : `Welcome to #${title}`}
               </h3>
               <p className="text-sm text-[var(--text-dim)] mt-1 max-w-sm">
-                {room.description || "This is the start of the channel."} Say
-                hello to get things going.
+                {isDm
+                  ? "This is the start of your conversation."
+                  : `${room.description || "This is the start of the channel."} Say hello to get things going.`}
               </p>
             </div>
           ) : (
@@ -333,7 +345,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 </div>
               ) : !hasMore ? (
                 <div className="text-center py-3 text-[11px] text-[var(--text-faint)]">
-                  You've reached the beginning of #{room.name}
+                  You've reached the beginning of {prefix}
+                  {title}
                 </div>
               ) : null}
               {messages.map((msg, idx) => {
@@ -612,7 +625,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
           <div className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded-xl focus-within:border-[var(--accent)] transition-colors flex items-center">
             <label htmlFor="composer" className="sr-only">
-              Message #{room.name}
+              Message {prefix}
+              {title}
             </label>
             <input
               id="composer"
@@ -620,7 +634,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               value={inputText}
               onChange={handleInputChange}
               onKeyDown={handleKeyDown}
-              placeholder={`Message #${room.name}`}
+              placeholder={`Message ${prefix}${title}`}
               autoComplete="off"
               className="w-full bg-transparent border-none text-[var(--text)] placeholder-[var(--text-faint)] px-4 py-3 focus:outline-none"
             />

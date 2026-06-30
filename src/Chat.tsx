@@ -52,6 +52,7 @@ const Chat = () => {
       onLoadOlder={c.loadOlderMessages}
       directory={c.directory}
       onAddMember={c.addMember}
+      onCreateDm={c.createDm}
       onLeaveRoom={c.leaveRoom}
       onLogout={c.logout}
       onDismissError={c.dismissError}

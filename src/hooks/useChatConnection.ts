@@ -128,6 +128,9 @@ export const useChatConnection = () => {
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
+  // Always-fresh handle to joinRoom so the (stable) ingest callback can open a DM the host
+  // just created (DmReady) without capturing a stale joinRoom closure.
+  const joinRoomRef = useRef<((room: ChatRoom) => Promise<void>) | null>(null);
 
   // Expire stale typing entries (>5s) so a dropped "stop" can't pin an indicator on.
   // Returns the same reference when nothing changed, so idle rooms don't re-render.
@@ -193,6 +196,22 @@ export const useChatConnection = () => {
     // Our room membership changed (e.g. we were invited) → reload the channel list.
     if (nm.message_type === "RoomsChanged") {
       void loadChatRooms();
+      return;
+    }
+
+    // Host opened/created the DM we requested (client mode): add it to the list and switch to it.
+    if (nm.message_type === "DmReady") {
+      try {
+        const room = JSON.parse(nm.message) as ChatRoom;
+        setChatRooms((prev) =>
+          prev.some((r) => r.id === room.id)
+            ? prev.map((r) => (r.id === room.id ? room : r))
+            : [...prev, room],
+        );
+        void joinRoomRef.current?.(room);
+      } catch (err) {
+        console.error("Bad DmReady payload:", err);
+      }
       return;
     }
 
@@ -798,6 +817,28 @@ export const useChatConnection = () => {
       setError(`Couldn't open #${room.name}: ${err}`);
     }
   };
+  // Keep the always-fresh handle in sync (used by ingest's DmReady path).
+  joinRoomRef.current = joinRoom;
+
+  // Open (or create) a direct message with the given users, then switch to it. The host
+  // resolves it locally; a client asks the host and opens it on the DmReady reply.
+  const createDm = async (targetIds: number[]) => {
+    if (!currentUser || targetIds.length === 0) return;
+    try {
+      if (mode === "server") {
+        const room = (await invoke("server_create_dm", {
+          actorId: currentUser.id,
+          targetIds,
+        })) as ChatRoom;
+        await loadChatRooms(currentUser.id);
+        await joinRoom(room);
+      } else {
+        await invoke("client_create_dm", { targetIds });
+      }
+    } catch (err) {
+      setError(`Couldn't start conversation: ${err}`);
+    }
+  };
 
   // Create a new channel, refresh the list, and open it.
   const createRoom = async (
@@ -1037,6 +1078,7 @@ export const useChatConnection = () => {
     unreadByRoom,
     directory,
     addMember,
+    createDm,
     currentUser,
     currentRoom,
     setMode,

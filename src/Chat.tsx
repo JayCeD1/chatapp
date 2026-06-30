@@ -33,7 +33,7 @@ const Chat = () => {
       currentUser={c.currentUser}
       messages={c.messages}
       loadingMessages={c.loadingMessages}
-      onlineUsers={c.onlineUsers}
+      membersByRoom={c.membersByRoom}
       connectionStatus={c.connectionStatus}
       error={c.error}
       onSelectRoom={c.joinRoom}

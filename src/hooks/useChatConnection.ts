@@ -61,7 +61,10 @@ export const useChatConnection = () => {
   const [messagesByRoom, setMessagesByRoom] = useState<
     Record<string, Message[]>
   >({});
-  const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
+  // Live roster per room (server truth via UserList messages), keyed by room name.
+  const [membersByRoom, setMembersByRoom] = useState<Record<string, string[]>>(
+    {},
+  );
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connected");
   const [error, setError] = useState<string | null>(null);
@@ -77,10 +80,23 @@ export const useChatConnection = () => {
   // Active room's messages, derived from the store.
   const messages = currentRoom ? messagesByRoom[currentRoom.name] || [] : [];
 
-  // Route an incoming message into the per-room store (deduped) and update presence.
+  // Route an incoming message into the per-room store (deduped); UserList updates the
+  // live roster instead of appearing as a chat message.
   const ingestMessage = useCallback((m: any) => {
     const nm = normalizeMessage(m);
     if (!nm.room) return;
+
+    if (nm.message_type === "UserList") {
+      try {
+        const names = JSON.parse(nm.message) as string[];
+        if (Array.isArray(names)) {
+          setMembersByRoom((prev) => ({ ...prev, [nm.room]: names }));
+        }
+      } catch {
+        // ignore malformed roster
+      }
+      return;
+    }
 
     setMessagesByRoom((prev) => {
       const list = prev[nm.room] || [];
@@ -100,16 +116,6 @@ export const useChatConnection = () => {
       if (dup) return prev;
       return { ...prev, [nm.room]: [...list, nm] };
     });
-
-    // Derive live-ish presence from lifecycle system messages.
-    const t = nm.message_type;
-    if (t === "Connect" || t === "RoomJoin") {
-      setOnlineUsers((prev) =>
-        prev.includes(nm.username) ? prev : [...prev, nm.username],
-      );
-    } else if (t === "Disconnect" || t === "RoomLeave") {
-      setOnlineUsers((prev) => prev.filter((u) => u !== nm.username));
-    }
   }, []);
 
   // Load departments on mount.
@@ -240,8 +246,12 @@ export const useChatConnection = () => {
 
       passwordRef.current = password;
       setCurrentUser(user);
-      setOnlineUsers([user.name]);
       localStorage.setItem("nutler.userId", String(user.id));
+      // Best-effort DB presence flag (last-seen / online).
+      invoke("update_user_online_status", {
+        userId: user.id,
+        isOnline: true,
+      }).catch(() => {});
 
       if (mode === "server") {
         await invoke("server_listen_as_participant", {
@@ -352,6 +362,12 @@ export const useChatConnection = () => {
   };
 
   const logout = async () => {
+    if (currentUser) {
+      invoke("update_user_online_status", {
+        userId: currentUser.id,
+        isOnline: false,
+      }).catch(() => {});
+    }
     // Tear down the live TCP connection / stop hosting so the socket + port free up.
     try {
       if (mode === "server") {
@@ -377,7 +393,7 @@ export const useChatConnection = () => {
     setCurrentUser(null);
     setCurrentRoom(null);
     setMessagesByRoom({});
-    setOnlineUsers([]);
+    setMembersByRoom({});
     setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
@@ -393,7 +409,7 @@ export const useChatConnection = () => {
     chatRooms,
     messages,
     messagesByRoom,
-    onlineUsers,
+    membersByRoom,
     connectionStatus,
     error,
     loadingMessages,

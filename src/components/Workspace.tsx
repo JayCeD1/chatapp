@@ -14,7 +14,7 @@ interface WorkspaceProps {
   currentUser: User;
   messages: Message[];
   loadingMessages: boolean;
-  onlineUsers: string[];
+  membersByRoom: Record<string, string[]>;
   connectionStatus: ConnectionStatus;
   error: string | null;
   onSelectRoom: (room: ChatRoom) => void;
@@ -33,7 +33,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   currentUser,
   messages,
   loadingMessages,
-  onlineUsers,
+  membersByRoom,
   connectionStatus,
   error,
   onSelectRoom,
@@ -44,24 +44,24 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   theme,
   onToggleTheme,
 }) => {
-  // Build the member list for the active room from who has posted + live presence.
+  // Live roster for the active room (server truth via UserList). Everyone in it is
+  // connected; ensure the current user shows even before the first roster arrives.
   const members: Member[] = useMemo(() => {
     if (!currentRoom) return [];
-    const names = new Set<string>([currentUser.name]);
-    for (const m of messages) if (m.username) names.add(m.username);
+    const names = new Set<string>(membersByRoom[currentRoom.name] || []);
+    names.add(currentUser.name);
     return Array.from(names)
       .map((name) => ({
         name,
-        online: name === currentUser.name || onlineUsers.includes(name),
+        online: true,
         isYou: name === currentUser.name,
       }))
-      .sort(
-        (a, b) =>
-          Number(b.online) - Number(a.online) || a.name.localeCompare(b.name),
+      .sort((a, b) =>
+        a.isYou ? -1 : b.isYou ? 1 : a.name.localeCompare(b.name),
       );
-  }, [currentRoom, messages, onlineUsers, currentUser.name]);
+  }, [currentRoom, membersByRoom, currentUser.name]);
 
-  const onlineCount = members.filter((m) => m.online).length;
+  const onlineCount = members.length;
 
   return (
     <div className="h-dvh w-full grid grid-cols-[clamp(220px,22vw,280px)_1fr] lg:grid-cols-[clamp(220px,22vw,280px)_1fr_clamp(200px,18vw,260px)] bg-[var(--bg)] text-[var(--text)] overflow-hidden">

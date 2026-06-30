@@ -610,7 +610,7 @@ async fn clean_client(
     )
     .await?;
 
-    //Broadcast disconnect
+    //Broadcast disconnect + the updated roster
     distribute_message_to_all(
         app,
         state,
@@ -619,6 +619,7 @@ async fn clean_client(
         Some(client.user_id),
     )
     .await;
+    broadcast_user_list(app, state, &client.current_room).await;
 
     Ok(())
 }
@@ -690,6 +691,46 @@ async fn distribute_message_to_all(
     }
 }
 
+/// Build the list of usernames currently present in `room` (server truth, from the
+/// host's room_clients). Includes the host itself when it participates in the room.
+async fn room_member_names(state: &Arc<AppState>, room: &str) -> Vec<String> {
+    let host_id = *state.user_id.read().await;
+    let host_name = state.username.read().await.clone();
+    // Consistent lock order: server_streams before room_clients.
+    let streams = state.server_streams.lock().await;
+    let room_clients = state.room_clients.lock().await;
+    let mut names = Vec::new();
+    if let Some(ids) = room_clients.get(room) {
+        for &uid in ids {
+            if let Some(conn) = streams.get(&uid) {
+                names.push(conn.username.clone());
+            } else if Some(uid) == host_id && !host_name.is_empty() {
+                names.push(host_name.clone());
+            }
+        }
+    }
+    names
+}
+
+/// Broadcast the live roster of `room` to everyone in it (and the host's own UI) as a
+/// UserList message, so member panels reflect server truth on every membership change.
+async fn broadcast_user_list(app: &tauri::AppHandle, state: &Arc<AppState>, room: &str) {
+    let names = room_member_names(state, room).await;
+    let payload = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string());
+    let msg = Message {
+        message_type: MessageType::UserList,
+        username: String::new(),
+        user_id: 0,
+        message: payload,
+        message_id: Uuid::new_v4().to_string(),
+        room: room.to_string(),
+        room_id: 0,
+        created_at: now_secs(),
+        is_emoji: false,
+    };
+    distribute_message_to_all(app, state, room, &msg, None).await;
+}
+
 async fn handle_server_message(
     app: tauri::AppHandle,
     state: Arc<AppState>,
@@ -723,6 +764,7 @@ async fn handle_server_message(
             });
             // Distribute to all participants
             distribute_message_to_all(&app, &state, &message.room, &message, None).await;
+            broadcast_user_list(&app, &state, &message.room).await;
         }
         MessageType::Chat => {
             //save to db
@@ -749,26 +791,28 @@ async fn handle_server_message(
         }
         MessageType::RoomJoin => {
             //Update client's room and room tracking
+            let mut old_room: Option<String> = None;
             {
                 let mut server_streams_guard = state.server_streams.lock().await;
                 let mut room_clients_guard = state.room_clients.lock().await;
 
-                {
-                    if let Some(client) = server_streams_guard.get_mut(&message.user_id) {
-                        //Remove from the old room
-                        if let Some(users) = room_clients_guard.get_mut(&client.current_room) {
-                            users.retain(|&id| id != message.user_id);
-                        }
+                if let Some(client) = server_streams_guard.get_mut(&message.user_id) {
+                    //Remember + remove from the old room
+                    old_room = Some(client.current_room.clone());
+                    if let Some(users) = room_clients_guard.get_mut(&client.current_room) {
+                        users.retain(|&id| id != message.user_id);
+                    }
 
-                        //Update client info
-                        client.current_room = message.room.clone();
-                        client.room_id = message.room_id;
+                    //Update client info
+                    client.current_room = message.room.clone();
+                    client.room_id = message.room_id;
 
-                        //Add to a new room
-                        room_clients_guard
-                            .entry(message.room.clone())
-                            .or_insert_with(Vec::new)
-                            .push(message.user_id);
+                    //Add to a new room (deduped)
+                    let room_vec = room_clients_guard
+                        .entry(message.room.clone())
+                        .or_insert_with(Vec::new);
+                    if !room_vec.contains(&message.user_id) {
+                        room_vec.push(message.user_id);
                     }
                 }
             }
@@ -792,6 +836,12 @@ async fn handle_server_message(
                 }
             });
             distribute_message_to_all(&app, &state, &message.room, &message, None).await;
+            broadcast_user_list(&app, &state, &message.room).await;
+            if let Some(old) = old_room {
+                if old != message.room {
+                    broadcast_user_list(&app, &state, &old).await;
+                }
+            }
         }
         MessageType::RoomLeave => {
             // Remove the user from the room they are leaving so the host stops relaying
@@ -821,6 +871,7 @@ async fn handle_server_message(
             });
             distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
                 .await;
+            broadcast_user_list(&app, &state, &message.room).await;
         }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
         _ => {}
@@ -1150,6 +1201,10 @@ pub async fn server_participant_join_room(
 
     // Distribute room join message
     distribute_message_to_all(&app, state.inner(), &new_room, &room_join_msg, None).await;
+    broadcast_user_list(&app, state.inner(), &new_room).await;
+    if old_room != new_room {
+        broadcast_user_list(&app, state.inner(), &old_room).await;
+    }
 
     Ok(())
 }
@@ -1274,6 +1329,7 @@ pub async fn server_leave_room(
     });
 
     distribute_message_to_all(&app, state.inner(), &room, &leave_msg, Some(user_id)).await;
+    broadcast_user_list(&app, state.inner(), &room).await;
     Ok(())
 }
 

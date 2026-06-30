@@ -281,6 +281,16 @@ pub async fn get_chat_rooms(
     db: State<'_, SqlitePool>,
     user_id: i64,
 ) -> Result<Vec<ChatRoom>, String> {
+    get_chat_rooms_internal(&db, user_id).await
+}
+
+/// Pool-based room listing so the socket layer can compute a client's authoritative room list
+/// (public rooms + private rooms / DMs they belong to) on the HOST db and push it to them —
+/// clients keep no usable local copy of host-created rooms.
+pub async fn get_chat_rooms_internal(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Vec<ChatRoom>, String> {
     let result = sqlx::query(
         "SELECT
   cr.id,
@@ -314,7 +324,7 @@ ORDER BY cr.is_dm, cr.name
 ",
     )
     .bind(user_id)
-    .fetch_all(&*db)
+    .fetch_all(pool)
     .await
     .map_err(|e| format!("Failed to get chat rooms: {}", e))?;
 

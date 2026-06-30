@@ -1,7 +1,7 @@
 use crate::db_queries::{
     delete_message_db, edit_message_db, get_room_messages_internal, get_room_reactions_internal,
-    get_unread_counts_internal, save_message_internal, toggle_reaction_db,
-    touch_last_read_internal,
+    get_unread_counts_internal, room_join_allowed_internal, save_message_internal,
+    toggle_reaction_db, touch_last_read_internal,
 };
 use crate::secure;
 use serde::{Deserialize, Serialize};
@@ -1027,6 +1027,19 @@ async fn handle_server_message(
             // Use the connection-bound id, never the (spoofable) one in the frame, so a
             // peer can't relocate another user's room or redirect their delivery.
             let actor = auth_user_id.unwrap_or(message.user_id);
+            // Enforce private-channel access: a non-member can't join (or pull history for)
+            // a private room, even by sending a raw RoomJoin frame.
+            if !room_join_allowed_internal(&pool, actor as i64, message.room_id as i64)
+                .await
+                .unwrap_or(false)
+            {
+                tracing::warn!(
+                    "Denied join to private room {} for user {}",
+                    message.room_id,
+                    actor
+                );
+                return Ok(());
+            }
             //Update client's room and room tracking
             let mut old_room: Option<String> = None;
             {
@@ -1181,6 +1194,20 @@ async fn handle_server_message(
         // Reply (only to the authenticated requester) with a HistoryPage to prepend.
         MessageType::HistoryRequest => {
             if let Some(requester) = auth_user_id {
+                // Same private-channel gate as RoomJoin — this is an independent path into
+                // send_room_history, so without it a non-member could page a private room's
+                // history with crafted frames.
+                if !room_join_allowed_internal(&pool, requester as i64, message.room_id as i64)
+                    .await
+                    .unwrap_or(false)
+                {
+                    tracing::warn!(
+                        "Denied history for private room {} to user {}",
+                        message.room_id,
+                        requester
+                    );
+                    return Ok(());
+                }
                 let before_id = message.message.parse::<i64>().ok();
                 send_room_history(
                     &state,

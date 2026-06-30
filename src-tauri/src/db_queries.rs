@@ -239,7 +239,10 @@ pub async fn get_departments(db: State<'_, SqlitePool>) -> Result<Vec<Department
 
 // Chat room management
 #[tauri::command]
-pub async fn get_chat_rooms(db: State<'_, SqlitePool>) -> Result<Vec<ChatRoom>, String> {
+pub async fn get_chat_rooms(
+    db: State<'_, SqlitePool>,
+    user_id: i64,
+) -> Result<Vec<ChatRoom>, String> {
     let result = sqlx::query(
         "SELECT
   cr.id,
@@ -259,9 +262,14 @@ LEFT JOIN (
   GROUP BY room_id
 ) urc
   ON urc.room_id = cr.id
+WHERE cr.is_private = 0
+   OR cr.created_by = $1
+   OR EXISTS (SELECT 1 FROM user_rooms ur
+              WHERE ur.room_id = cr.id AND ur.user_id = $1 AND ur.is_active = 1)
 ORDER BY cr.name
 ",
     )
+    .bind(user_id)
     .fetch_all(&*db)
     .await
     .map_err(|e| format!("Failed to get chat rooms: {}", e))?;
@@ -285,6 +293,7 @@ ORDER BY cr.name
 pub async fn get_rooms_by_department(
     db: State<'_, SqlitePool>,
     department_id: i64,
+    user_id: i64,
 ) -> Result<Vec<ChatRoom>, String> {
     let result = sqlx::query(
         "SELECT
@@ -306,10 +315,15 @@ LEFT JOIN (
 ) urc
   ON urc.room_id = cr.id
 WHERE cr.department_id = $1
+  AND (cr.is_private = 0
+       OR cr.created_by = $2
+       OR EXISTS (SELECT 1 FROM user_rooms ur
+                  WHERE ur.room_id = cr.id AND ur.user_id = $2 AND ur.is_active = 1))
 ORDER BY cr.name
 ",
     )
     .bind(department_id)
+    .bind(user_id)
     .fetch_all(&*db)
     .await
     .map_err(|e| format!("Failed to get rooms by department: {}", e))?;
@@ -364,6 +378,21 @@ pub async fn create_room(
     })?;
 
     let id = result.last_insert_rowid();
+
+    // The creator is the first member — without this a private room would have no members
+    // and be unjoinable (and unlistable) even by the person who made it.
+    if let Some(creator) = created_by {
+        sqlx::query(
+            "INSERT INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)
+             ON CONFLICT(user_id, room_id) DO UPDATE SET is_active = 1",
+        )
+        .bind(creator)
+        .bind(id)
+        .execute(&*db)
+        .await
+        .map_err(|e| format!("Failed to add creator to channel: {}", e))?;
+    }
+
     let row = sqlx::query(
         "SELECT cr.id, cr.name, cr.description, cr.department_id, cr.is_private,
                 d.name as department_name, 0 as user_count
@@ -419,6 +448,53 @@ pub async fn leave_room(
         .await
         .map_err(|e| format!("Failed to leave room: {}", e))?;
 
+    Ok(())
+}
+
+/// Whether `user_id` may open `room_id`: the room is public, or the user created it, or the
+/// user is an active member. Unknown room → not allowed. Used to enforce private channels.
+pub async fn room_join_allowed_internal(
+    pool: &SqlitePool,
+    user_id: i64,
+    room_id: i64,
+) -> Result<bool, String> {
+    let allowed: Option<bool> = sqlx::query_scalar(
+        "SELECT (cr.is_private = 0
+                 OR cr.created_by = $1
+                 OR EXISTS (SELECT 1 FROM user_rooms ur
+                            WHERE ur.room_id = cr.id AND ur.user_id = $1 AND ur.is_active = 1))
+         FROM chat_rooms cr
+         WHERE cr.id = $2",
+    )
+    .bind(user_id)
+    .bind(room_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to check room access: {}", e))?;
+    Ok(allowed.unwrap_or(false))
+}
+
+/// Add `user_id` to `room_id` (an invite). Only someone who can already access the room
+/// (its creator or an active member) may add others.
+#[tauri::command]
+pub async fn add_room_member(
+    db: State<'_, SqlitePool>,
+    room_id: i64,
+    user_id: i64,
+    actor_id: i64,
+) -> Result<(), String> {
+    if !room_join_allowed_internal(&db, actor_id, room_id).await? {
+        return Err("Only members can add people to this channel".to_string());
+    }
+    sqlx::query(
+        "INSERT INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)
+         ON CONFLICT(user_id, room_id) DO UPDATE SET is_active = 1",
+    )
+    .bind(user_id)
+    .bind(room_id)
+    .execute(&*db)
+    .await
+    .map_err(|e| format!("Failed to add member: {}", e))?;
     Ok(())
 }
 
@@ -995,6 +1071,38 @@ mod tests {
         // ...but Bob still sees it as his own.
         let agg_bob = get_room_reactions_internal(&pool, 1, 2).await.unwrap();
         assert!(agg_bob[0].me);
+    }
+
+    #[tokio::test]
+    async fn private_room_access_is_member_scoped() {
+        let pool = setup().await;
+        // Public room (room 1 is pre-seeded, is_private=0): anyone is allowed.
+        assert!(room_join_allowed_internal(&pool, 2, 1).await.unwrap());
+
+        // A private room owned by Alice (1).
+        sqlx::raw_sql(
+            "INSERT INTO chat_rooms (id, name, is_private, created_by) VALUES (100, 'secret', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(room_join_allowed_internal(&pool, 1, 100).await.unwrap()); // creator
+        assert!(!room_join_allowed_internal(&pool, 2, 100).await.unwrap()); // non-member denied
+
+        // Add Bob (2) as a member → now allowed.
+        sqlx::raw_sql("INSERT INTO user_rooms (user_id, room_id, is_active) VALUES (2, 100, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(room_join_allowed_internal(&pool, 2, 100).await.unwrap());
+
+        // Leaving (is_active=0) revokes access; unknown room is denied.
+        sqlx::raw_sql("UPDATE user_rooms SET is_active = 0 WHERE user_id = 2 AND room_id = 100")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(!room_join_allowed_internal(&pool, 2, 100).await.unwrap());
+        assert!(!room_join_allowed_internal(&pool, 1, 999).await.unwrap());
     }
 
     #[tokio::test]

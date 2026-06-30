@@ -267,7 +267,16 @@ export const useChatConnection = () => {
           me: r.me,
         });
       }
-      setReactionsByMessage((prev) => ({ ...prev, ...byMsg }));
+      // Authoritative, room-scoped replace: set each loaded message's reactions to the
+      // aggregate (or [] if none) so emptied reactions can't leave phantom chips. A plain
+      // spread merge could never clear a key the aggregate no longer returns.
+      setReactionsByMessage((prev) => {
+        const next = { ...prev };
+        for (const m of normalized) {
+          if (m.message_id) next[m.message_id] = byMsg[m.message_id] || [];
+        }
+        return next;
+      });
     } catch (err) {
       console.error("Error loading messages:", err);
     } finally {

@@ -647,27 +647,37 @@ pub async fn toggle_reaction_db(
     user_id: i64,
     emoji: &str,
 ) -> Result<bool, String> {
+    // Run the DELETE-or-INSERT pair in one transaction so concurrent toggles of the same
+    // (message, user, emoji) serialize (no count drift), and ON CONFLICT DO NOTHING so a
+    // lost insert race can never surface a UNIQUE error.
+    let mut tx = pool.begin().await.map_err(|e| e.to_string())?;
     let del =
         sqlx::query("DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3")
             .bind(message_id)
             .bind(user_id)
             .bind(emoji)
-            .execute(pool)
+            .execute(&mut *tx)
             .await
             .map_err(|e| format!("Failed to remove reaction: {}", e))?;
 
-    if del.rows_affected() > 0 {
-        return Ok(false); // removed
-    }
-
-    sqlx::query("INSERT INTO reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)")
+    let added = if del.rows_affected() > 0 {
+        false // removed
+    } else {
+        sqlx::query(
+            "INSERT INTO reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)
+             ON CONFLICT(message_id, user_id, emoji) DO NOTHING",
+        )
         .bind(message_id)
         .bind(user_id)
         .bind(emoji)
-        .execute(pool)
+        .execute(&mut *tx)
         .await
         .map_err(|e| format!("Failed to add reaction: {}", e))?;
-    Ok(true) // added
+        true // added
+    };
+
+    tx.commit().await.map_err(|e| e.to_string())?;
+    Ok(added)
 }
 
 /// Aggregated reactions for every message in a room: per (message_id, emoji), the count

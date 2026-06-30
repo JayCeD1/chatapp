@@ -10,6 +10,7 @@ import {
   Reaction,
   ReactionAggregate,
   SearchResult,
+  ServerInfo,
   User,
   ViewState,
 } from "../types";
@@ -970,6 +971,16 @@ export const useChatConnection = () => {
     [],
   );
 
+  // Find Nutler hosts on the LAN (UDP broadcast). User-triggered from the login screen.
+  const discoverServers = useCallback(async (): Promise<ServerInfo[]> => {
+    try {
+      return (await invoke("discover_servers")) as ServerInfo[];
+    } catch (err) {
+      console.error("Discovery failed:", err);
+      return [];
+    }
+  }, []);
+
   // Open a room by id (e.g. from a search result).
   const jumpToRoom = (roomId: number) => {
     const room = chatRooms.find((r) => r.id === roomId);
@@ -1175,6 +1186,7 @@ export const useChatConnection = () => {
     reactionsByMessage,
     loadOlderMessages,
     searchMessages,
+    discoverServers,
     jumpToRoom,
     logout,
     dismissError,

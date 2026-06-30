@@ -18,8 +18,6 @@ use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::Semaphore;
-use tokio::task::JoinSet;
-use tokio::time::timeout;
 use uuid::Uuid;
 
 /// Maximum size of a single length-prefixed frame payload (10 MiB).
@@ -161,6 +159,8 @@ pub struct AppState {
     // disconnect can cancel the stale tasks before starting new ones.
     pub client_listener: Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     pub client_heartbeat: Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    // Host-side LAN discovery responder task, so hosting teardown can abort it (frees udp/3626).
+    pub discovery_responder: Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     // Track which users are in which rooms for efficient broadcasting
     pub room_clients: Arc<tokio::sync::Mutex<HashMap<String, Vec<u64>>>>,
     // Live connection count per remote IP, for the per-IP connection cap.
@@ -182,6 +182,42 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 fn default_protocol_version() -> u16 {
     PROTOCOL_VERSION
+}
+
+// ---- LAN server discovery (UDP announce/respond) ----
+// Discovery is plaintext, best-effort, and ADVISORY: it only surfaces that a Nutler host
+// exists on the LAN plus its public metadata (name, TCP port, live user count). It carries no
+// secret and is NOT an access-control gate — the real trust boundary stays the Noise PSK
+// handshake on TCP connect (a forged announce just yields an address whose handshake fails).
+// A distinct UDP port + magic + version means only real Nutler hosts are ever listed, which
+// closes the false-positive port-scan problem (IMPROVEMENTS.md finding 2.10). The discovery
+// format versions independently of the TCP envelope (PROTOCOL_VERSION).
+const DISCOVERY_PORT: u16 = 3626;
+const DISCOVERY_MAGIC: &str = "nutler-disc";
+const DISCOVERY_VERSION: u16 = 1;
+const DISCOVERY_MAX_PACKET: usize = 1500;
+const DISCOVERY_WINDOW_MS: u64 = 600;
+
+/// A discovery datagram. `kind` is "probe" (client → broadcast) or "announce" (host → probe
+/// source). Announce fields are advisory display hints only.
+#[derive(Serialize, Deserialize)]
+struct DiscoveryPacket {
+    magic: String,
+    version: u16,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    user_count: Option<usize>,
+}
+
+/// A discovery datagram is only accepted if it carries our magic, a known version, and the
+/// expected kind — so unrelated traffic on the port is ignored and a forged/old responder
+/// can't be listed (IMPROVEMENTS.md 2.10; version branch per ADR-0004).
+fn discovery_packet_valid(pkt: &DiscoveryPacket, kind: &str) -> bool {
+    pkt.magic == DISCOVERY_MAGIC && pkt.version == DISCOVERY_VERSION && pkt.kind == kind
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -263,60 +299,127 @@ pub struct ServerInfo {
     pub user_count: usize,
 }
 
-// Network discovery - scan for servers on a local network
+/// Discover Nutler hosts on the LAN by UDP broadcast — replaces the old TCP port-scan.
+///
+/// Broadcasts one versioned probe to the local segment (no hardcoded IP ranges, no per-host
+/// scan) and collects `announce` replies for a short window, deduped by source IP. Only
+/// well-formed Nutler announces of a known version are listed, so an unrelated open port is
+/// never reported as a server (IMPROVEMENTS.md 2.10). User-triggered, so it's consent-gated.
 #[tauri::command]
 pub async fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
-    let port = 3625;
-    let base_ip = "192.168.1"; // Primary range | Common local network range
-    let mut targets = Vec::new();
-    let other_ranges = ["10.0.0", "172.16.0", "192.168.0"];
-
-    // Scan common local network ranges | Primary /24
-    for i in 1..=254 {
-        targets.push((format!("{}:{}", base_ip, i), port));
-    }
-    //Smaller slices of other ranges
-    for range in other_ranges {
-        for i in 1..=50 {
-            targets.push((format!("{}.{}", range, i), port));
+    let socket = match tokio::net::UdpSocket::bind(("0.0.0.0", 0)).await {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!("Discovery: failed to bind UDP socket: {}", e);
+            return Vec::new();
         }
+    };
+    if let Err(e) = socket.set_broadcast(true) {
+        tracing::warn!("Discovery: set_broadcast failed: {}", e);
+        return Vec::new();
     }
-    // Limit concurrency to avoid overwhelming the system
-    let concurrency = 128;
-    let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut tasks = JoinSet::new();
 
-    for (ip, port) in targets {
-        let permit = match semaphore.clone().acquire_owned().await {
-            Ok(p) => p,
-            Err(_) => break, // semaphore closed; stop scheduling probes
-        };
-        tasks.spawn(async move {
-            // Hold the permit for the duration of the probe
-            let _p = permit;
-            let addr = format!("{}:{}", ip, port);
+    let probe = DiscoveryPacket {
+        magic: DISCOVERY_MAGIC.to_string(),
+        version: DISCOVERY_VERSION,
+        kind: "probe".to_string(),
+        name: None,
+        port: None,
+        user_count: None,
+    };
+    let bytes = match serde_json::to_vec(&probe) {
+        Ok(b) => b,
+        Err(_) => return Vec::new(),
+    };
+    // Limited broadcast to the local segment.
+    if let Err(e) = socket
+        .send_to(&bytes, (std::net::Ipv4Addr::BROADCAST, DISCOVERY_PORT))
+        .await
+    {
+        tracing::warn!("Discovery: broadcast send failed: {}", e);
+        return Vec::new();
+    }
 
-            // 100ms timeout for probe
-            let probe = timeout(Duration::from_millis(100), TcpStream::connect(&addr)).await;
-            if let Ok(Ok(_)) = probe {
-                Some(ServerInfo {
-                    address: ip.clone(),
-                    port,
-                    name: format!("Chat Server at {}", ip),
-                    user_count: 0,
-                })
-            } else {
-                None
+    // Collect announces until the window closes, one entry per host.
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(DISCOVERY_WINDOW_MS);
+    let mut found: HashMap<IpAddr, ServerInfo> = HashMap::new();
+    let mut buf = vec![0u8; DISCOVERY_MAX_PACKET];
+    loop {
+        match tokio::time::timeout_at(deadline, socket.recv_from(&mut buf)).await {
+            Ok(Ok((len, src))) => {
+                if let Ok(pkt) = serde_json::from_slice::<DiscoveryPacket>(&buf[..len]) {
+                    if discovery_packet_valid(&pkt, "announce") {
+                        let ip = src.ip();
+                        found.entry(ip).or_insert_with(|| ServerInfo {
+                            address: ip.to_string(),
+                            port: pkt.port.unwrap_or(3625),
+                            name: pkt.name.unwrap_or_else(|| "Nutler host".to_string()),
+                            user_count: pkt.user_count.unwrap_or(0),
+                        });
+                    }
+                }
             }
-        });
-    }
-    let mut servers = Vec::new();
-    while let Some(result) = tasks.join_next().await {
-        if let Ok(Some(info)) = result {
-            servers.push(info);
+            Ok(Err(e)) => tracing::warn!("Discovery: recv error: {}", e),
+            Err(_) => break, // window elapsed
         }
     }
-    servers
+    found.into_values().collect()
+}
+
+/// Best-effort LAN discovery responder for the host: answers Nutler probes with this host's
+/// name, TCP port, and live user count. Plaintext + advisory; the password handshake still
+/// gates the actual connection. Spawned alongside the TCP listener, aborted on host teardown.
+/// A bind failure disables discovery but never blocks hosting.
+fn spawn_discovery_responder(
+    state: Arc<AppState>,
+    tcp_port: u16,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let socket = match tokio::net::UdpSocket::bind(("0.0.0.0", DISCOVERY_PORT)).await {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!(
+                    "Discovery responder disabled (bind udp/{} failed: {})",
+                    DISCOVERY_PORT,
+                    e
+                );
+                return;
+            }
+        };
+        tracing::info!("📡 Discovery responder listening on udp/{}", DISCOVERY_PORT);
+        let mut buf = vec![0u8; DISCOVERY_MAX_PACKET];
+        loop {
+            let (len, src) = match socket.recv_from(&mut buf).await {
+                Ok(v) => v,
+                Err(e) => {
+                    tracing::warn!("Discovery responder recv error: {}", e);
+                    continue;
+                }
+            };
+            // Only answer well-formed Nutler probes of a known version; ignore anything else.
+            let pkt: DiscoveryPacket = match serde_json::from_slice(&buf[..len]) {
+                Ok(p) => p,
+                Err(_) => continue,
+            };
+            if !discovery_packet_valid(&pkt, "probe") {
+                continue;
+            }
+            let name = state.username.read().await.clone();
+            // Connected clients + the host's own participant.
+            let user_count = state.server_streams.lock().await.len() + 1;
+            let reply = DiscoveryPacket {
+                magic: DISCOVERY_MAGIC.to_string(),
+                version: DISCOVERY_VERSION,
+                kind: "announce".to_string(),
+                name: Some(name),
+                port: Some(tcp_port),
+                user_count: Some(user_count),
+            };
+            if let Ok(out) = serde_json::to_vec(&reply) {
+                let _ = socket.send_to(&out, src).await;
+            }
+        }
+    })
 }
 
 // MAIN SERVER START FUNCTION - Server as Participant
@@ -365,6 +468,13 @@ pub async fn server_listen_as_participant(
         // Register server as a participant in the room
         let mut rooms = state.room_clients.lock().await;
         rooms.entry(room.clone()).or_default().push(user_id);
+    }
+
+    // Start the best-effort LAN discovery responder alongside the TCP listener so clients can
+    // find this host without hand-typing its IP. Store the handle for teardown.
+    {
+        let responder = spawn_discovery_responder(Arc::clone(state.inner()), port);
+        *state.discovery_responder.lock().await = Some(responder);
     }
     // Send server join message to its own UI immediately
     let join_message = Message {
@@ -2687,6 +2797,10 @@ pub async fn server_participant_disconnect(
     for (writer, transport) in &targets {
         let _ = send_secure(writer, transport, &disconnect_msg).await;
     }
+    // Stop the LAN discovery responder so udp/3626 frees for a future host session.
+    if let Some(handle) = state.discovery_responder.lock().await.take() {
+        handle.abort();
+    }
     // Clear room->clients index
     {
         let mut rooms = state.room_clients.lock().await;
@@ -2715,4 +2829,83 @@ pub async fn server_participant_disconnect(
     let _ = app.emit("server_stopped", ());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod discovery_tests {
+    use super::*;
+
+    fn probe() -> DiscoveryPacket {
+        DiscoveryPacket {
+            magic: DISCOVERY_MAGIC.to_string(),
+            version: DISCOVERY_VERSION,
+            kind: "probe".to_string(),
+            name: None,
+            port: None,
+            user_count: None,
+        }
+    }
+
+    #[test]
+    fn packet_round_trips_and_validates_by_magic_version_kind() {
+        let bytes = serde_json::to_vec(&probe()).unwrap();
+        let back: DiscoveryPacket = serde_json::from_slice(&bytes).unwrap();
+        assert!(discovery_packet_valid(&back, "probe"));
+        // A probe is not an announce (kind gate).
+        assert!(!discovery_packet_valid(&back, "announce"));
+    }
+
+    #[test]
+    fn rejects_foreign_magic_and_unknown_version() {
+        let mut wrong_magic = probe();
+        wrong_magic.magic = "not-nutler".to_string();
+        assert!(!discovery_packet_valid(&wrong_magic, "probe"));
+
+        let mut wrong_version = probe();
+        wrong_version.version = DISCOVERY_VERSION + 1;
+        assert!(!discovery_packet_valid(&wrong_version, "probe"));
+    }
+
+    // Full probe → announce → parse round-trip over real loopback UDP (no fixed ports), so the
+    // wire exchange the responder/discover use is exercised end to end.
+    #[tokio::test]
+    async fn loopback_probe_gets_an_announce() {
+        let responder = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let responder_addr = responder.local_addr().unwrap();
+        let client = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+
+        // Responder side: wait for a valid probe, reply with an announce.
+        let server = tokio::spawn(async move {
+            let mut buf = vec![0u8; DISCOVERY_MAX_PACKET];
+            let (len, src) = responder.recv_from(&mut buf).await.unwrap();
+            let pkt: DiscoveryPacket = serde_json::from_slice(&buf[..len]).unwrap();
+            assert!(discovery_packet_valid(&pkt, "probe"));
+            let reply = DiscoveryPacket {
+                magic: DISCOVERY_MAGIC.to_string(),
+                version: DISCOVERY_VERSION,
+                kind: "announce".to_string(),
+                name: Some("Alice's host".to_string()),
+                port: Some(3625),
+                user_count: Some(3),
+            };
+            responder
+                .send_to(&serde_json::to_vec(&reply).unwrap(), src)
+                .await
+                .unwrap();
+        });
+
+        client
+            .send_to(&serde_json::to_vec(&probe()).unwrap(), responder_addr)
+            .await
+            .unwrap();
+        let mut buf = vec![0u8; DISCOVERY_MAX_PACKET];
+        let (len, _) = client.recv_from(&mut buf).await.unwrap();
+        let ann: DiscoveryPacket = serde_json::from_slice(&buf[..len]).unwrap();
+
+        assert!(discovery_packet_valid(&ann, "announce"));
+        assert_eq!(ann.name.as_deref(), Some("Alice's host"));
+        assert_eq!(ann.port, Some(3625));
+        assert_eq!(ann.user_count, Some(3));
+        server.await.unwrap();
+    }
 }

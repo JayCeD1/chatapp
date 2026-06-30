@@ -1,6 +1,14 @@
 import React, { useState, useEffect } from "react";
-import { User, Server, Hash, Lock, Mail, AlertCircle } from "lucide-react";
-import { Department, ConnectionMode } from "../types";
+import {
+  User,
+  Server,
+  Hash,
+  Lock,
+  Mail,
+  AlertCircle,
+  Wifi,
+} from "lucide-react";
+import { Department, ConnectionMode, ServerInfo } from "../types";
 import { loadProfile } from "../session";
 
 interface LoginViewProps {
@@ -9,6 +17,7 @@ interface LoginViewProps {
   setMode: (mode: ConnectionMode) => void;
   serverIp: string;
   setServerIp: (ip: string) => void;
+  onDiscover?: () => Promise<ServerInfo[]>;
   onLogin: (
     username: string,
     email: string,
@@ -26,6 +35,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
   setMode,
   serverIp,
   setServerIp,
+  onDiscover,
   onLogin,
 }) => {
   // Pre-fill from the remembered profile (never the password).
@@ -37,6 +47,27 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // LAN discovery (client mode): results + state for the "Find hosts" affordance.
+  const [discovered, setDiscovered] = useState<ServerInfo[]>([]);
+  const [discovering, setDiscovering] = useState(false);
+  const [discoverNote, setDiscoverNote] = useState<string | null>(null);
+
+  const handleDiscover = async () => {
+    if (!onDiscover || discovering) return;
+    setDiscovering(true);
+    setDiscoverNote(null);
+    try {
+      const found = await onDiscover();
+      setDiscovered(found);
+      setDiscoverNote(
+        found.length === 0 ? "No hosts found on your network." : null,
+      );
+    } catch {
+      setDiscoverNote("Discovery failed.");
+    } finally {
+      setDiscovering(false);
+    }
+  };
   // If the form is pre-filled, drop the user straight on the password field.
   const [returning] = useState(() => !!loadProfile().username);
 
@@ -122,15 +153,63 @@ export const LoginView: React.FC<LoginViewProps> = ({
 
       <form className="space-y-3.5" onSubmit={handleSubmit}>
         {mode === "client" && (
-          <Field icon={<Server className="w-4 h-4" />} label="Server address">
-            <input
-              type="text"
-              value={serverIp}
-              onChange={(e) => setServerIp(e.target.value)}
-              placeholder="Server IP (e.g. 127.0.0.1:3625)"
-              className={inputClass}
-            />
-          </Field>
+          <div className="space-y-2">
+            <Field icon={<Server className="w-4 h-4" />} label="Server address">
+              <input
+                type="text"
+                value={serverIp}
+                onChange={(e) => setServerIp(e.target.value)}
+                placeholder="Server IP (e.g. 127.0.0.1:3625)"
+                className={inputClass}
+              />
+            </Field>
+            {onDiscover && (
+              <div>
+                <button
+                  type="button"
+                  onClick={handleDiscover}
+                  disabled={discovering}
+                  className="flex items-center gap-1.5 text-xs font-medium text-[var(--accent-strong)] hover:underline disabled:opacity-60 disabled:no-underline"
+                >
+                  {discovering ? (
+                    <span className="w-3.5 h-3.5 border-2 border-[var(--accent-strong)]/30 border-t-[var(--accent-strong)] rounded-full animate-spin" />
+                  ) : (
+                    <Wifi className="w-3.5 h-3.5" />
+                  )}
+                  {discovering ? "Searching…" : "Find hosts on your network"}
+                </button>
+                {discovered.length > 0 && (
+                  <ul className="mt-1.5 border border-[var(--border)] rounded-lg divide-y divide-[var(--border)] overflow-hidden">
+                    {discovered.map((s) => (
+                      <li key={`${s.address}:${s.port}`}>
+                        <button
+                          type="button"
+                          onClick={() => {
+                            setServerIp(`${s.address}:${s.port}`);
+                            setDiscovered([]);
+                            setDiscoverNote(null);
+                          }}
+                          className="w-full text-left px-3 py-2 hover:bg-[var(--surface-2)] transition-colors"
+                        >
+                          <div className="text-sm text-[var(--text)] truncate">
+                            {s.name}
+                          </div>
+                          <div className="text-[11px] text-[var(--text-faint)]">
+                            {s.address}:{s.port} · {s.user_count} online
+                          </div>
+                        </button>
+                      </li>
+                    ))}
+                  </ul>
+                )}
+                {discoverNote && (
+                  <p className="mt-1 text-[11px] text-[var(--text-faint)]">
+                    {discoverNote}
+                  </p>
+                )}
+              </div>
+            )}
+          </div>
         )}
 
         <Field icon={<Lock className="w-4 h-4" />} label="Room password">

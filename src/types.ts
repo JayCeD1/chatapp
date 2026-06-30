@@ -18,6 +18,15 @@ export interface DirectoryUser {
   is_online: boolean;
 }
 
+// A Nutler host found on the LAN via UDP discovery. Advisory display hints — the room
+// password (Noise handshake) still gates the actual connection.
+export interface ServerInfo {
+  address: string;
+  port: number;
+  name: string;
+  user_count: number;
+}
+
 export interface ChatRoom {
   id: number;
   name: string;

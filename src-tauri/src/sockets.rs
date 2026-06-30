@@ -534,60 +534,82 @@ async fn handle_client_connection(
                     // The host is the identity authority: upsert the connecting user into the
                     // host's OWN DB by email and use that globally-unique id, because the id
                     // the client asserts is assigned by its local DB and collides across
-                    // machines. Fall back to the asserted id only if no email was sent.
+                    // machines. No email / a failed upsert means we can't establish a trusted
+                    // identity, so we DON'T register — the connection stays unauthenticated and
+                    // its later frames are rejected below (closes the asserted-id-hijack hole).
+                    // department_id is left None: on a reconnect, room_id is the user's CURRENT
+                    // room (not their department), so binding it here would corrupt the record.
                     let canonical = match &message.email {
                         Some(email) => upsert_user_internal(
                             &pool,
                             message.username.clone(),
                             email.clone(),
-                            Some(message.room_id as i64),
+                            None,
                         )
                         .await
                         .ok()
                         .and_then(|u| u.id),
                         None => None,
                     };
-                    let uid = canonical.map(|id| id as u64).unwrap_or(message.user_id);
+                    if let Some(uid) = canonical.map(|id| id as u64) {
+                        let conn = ClientConnection {
+                            writer: Arc::clone(&writer_arc),
+                            transport: Arc::clone(&transport_arc),
+                            username: message.username.clone(),
+                            current_room: message.room.clone(),
+                            room_id: message.room_id,
+                            user_id: uid,
+                            conn_id,
+                        };
+                        client_info = Some(conn.clone());
 
-                    let conn = ClientConnection {
-                        writer: Arc::clone(&writer_arc),
-                        transport: Arc::clone(&transport_arc),
-                        username: message.username.clone(),
-                        current_room: message.room.clone(),
-                        room_id: message.room_id,
-                        user_id: uid,
-                        conn_id,
-                    };
-                    client_info = Some(conn.clone());
+                        //Add to the server's stream list using the canonical user_id as the key
+                        {
+                            let mut streams = state.server_streams.lock().await;
+                            let mut rooms = state.room_clients.lock().await;
 
-                    //Add to the server's stream list using the canonical user_id as the key
-                    {
-                        let mut streams = state.server_streams.lock().await;
-                        let mut rooms = state.room_clients.lock().await;
+                            // Idempotent (re)registration: if this user is already known
+                            // (reconnect / duplicate Connect), drop it from every room first so
+                            // membership can't accumulate duplicates that double-deliver.
+                            if streams.contains_key(&uid) {
+                                for users in rooms.values_mut() {
+                                    users.retain(|&id| id != uid);
+                                }
+                            }
 
-                        // Idempotent (re)registration: if this user is already known
-                        // (reconnect / duplicate Connect), drop it from every room first so
-                        // membership can't accumulate duplicates that double-deliver.
-                        if streams.contains_key(&uid) {
-                            for users in rooms.values_mut() {
-                                users.retain(|&id| id != uid);
+                            streams.insert(uid, conn);
+
+                            //Add to room tracking (deduped)
+                            let room_vec =
+                                rooms.entry(message.room.clone()).or_insert_with(Vec::new);
+                            if !room_vec.contains(&uid) {
+                                room_vec.push(uid);
                             }
                         }
-
-                        streams.insert(uid, conn);
-
-                        //Add to room tracking (deduped)
-                        let room_vec = rooms.entry(message.room.clone()).or_insert_with(Vec::new);
-                        if !room_vec.contains(&uid) {
-                            room_vec.push(uid);
-                        }
+                        tracing::info!(
+                            "Client registered: {} (id {}) in room {}",
+                            message.username,
+                            uid,
+                            message.room
+                        );
+                    } else {
+                        tracing::warn!(
+                            "Rejecting Connect from {} — no resolvable identity (missing/invalid email)",
+                            peer_addr
+                        );
                     }
-                    tracing::info!(
-                        "Client registered: {} (id {}) in room {}",
-                        message.username,
-                        uid,
-                        message.room
+                }
+
+                // Reject any frame from a connection that never authenticated (no successful
+                // Connect). Without this, a peer could send a first-frame Edit/Delete with a
+                // spoofed canonical author id and bypass authorship checks.
+                if client_info.is_none() {
+                    tracing::warn!(
+                        "Ignoring {:?} from unauthenticated connection {}",
+                        message.message_type,
+                        peer_addr
                     );
+                    continue;
                 }
                 // A single bad message shouldn't kill the connection. Pass the
                 // connection's authenticated user_id so edit/delete can't be spoofed.
@@ -992,6 +1014,9 @@ async fn handle_server_message(
     if let Some(uid) = auth_user_id {
         message.user_id = uid;
     }
+    // The email was already consumed during Connect registration (above, in the read loop);
+    // drop it so it's never relayed to other clients in the distributed Connect notice.
+    message.email = None;
 
     tracing::info!(
         "🟢 Server handling message: {:?} from {}",

@@ -8,6 +8,8 @@
     "build": "tsc && vite build",
     "preview": "vite preview",
     "typecheck": "tsc --noEmit",
+    "version:check": "node scripts/check-versions.mjs",
+    "version:sync": "node scripts/check-versions.mjs --write",
     "lint": "eslint .",
     "test": "vitest run",
     "test:watch": "vitest",

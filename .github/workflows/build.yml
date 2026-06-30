@@ -27,6 +27,22 @@ jobs:
 
     runs-on: ${{ matrix.os }}
 
+    # Code-signing / notarization secrets. All are empty until you add them in the repo
+    # settings — when empty, Tauri builds UNSIGNED, so this workflow keeps working out of
+    # the box. See RELEASING.md for how to generate and set each one.
+    env:
+      # macOS — Tauri imports the cert into a temp keychain and signs automatically.
+      APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+      APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+      APPLE_SIGNING_IDENTITY: ${{ secrets.APPLE_SIGNING_IDENTITY }}
+      # macOS notarization (Apple ID method). Notarizes only when all three are set.
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_PASSWORD: ${{ secrets.APPLE_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+      # Windows — base64 .pfx + its password (see the import step below).
+      WINDOWS_CERTIFICATE: ${{ secrets.WINDOWS_CERTIFICATE }}
+      WINDOWS_CERTIFICATE_PASSWORD: ${{ secrets.WINDOWS_CERTIFICATE_PASSWORD }}
+
     steps:
       - uses: actions/checkout@v4
 
@@ -49,6 +65,27 @@ jobs:
 
       - name: Install Node.js dependencies
         run: npm install
+
+      # Guard against shipping a release with mismatched versions across
+      # package.json / tauri.conf.json / Cargo.toml.
+      - name: Check version sync
+        run: npm run version:check
+
+      # Windows signing: import the .pfx into the cert store and inject its thumbprint
+      # into tauri.conf.json so the bundler signs with it. Skipped when no cert secret.
+      - name: Import Windows signing certificate
+        if: matrix.os == 'windows-latest' && env.WINDOWS_CERTIFICATE != ''
+        shell: pwsh
+        run: |
+          $pfx = Join-Path $env:RUNNER_TEMP 'cert.pfx'
+          [IO.File]::WriteAllBytes($pfx, [Convert]::FromBase64String($env:WINDOWS_CERTIFICATE))
+          $pw = ConvertTo-SecureString -String $env:WINDOWS_CERTIFICATE_PASSWORD -Force -AsPlainText
+          $cert = Import-PfxCertificate -FilePath $pfx -CertStoreLocation Cert:\CurrentUser\My -Password $pw
+          $conf = 'src-tauri/tauri.conf.json'
+          $json = Get-Content $conf -Raw | ConvertFrom-Json
+          $json.bundle.windows.certificateThumbprint = $cert.Thumbprint
+          $json | ConvertTo-Json -Depth 32 | Set-Content $conf
+          Write-Host "Signing with thumbprint $($cert.Thumbprint)"
 
       - name: Build Tauri app
         run: npm run tauri build -- --target ${{ matrix.target }}

@@ -52,6 +52,7 @@ Run the same checks CI runs. All of these must be clean:
 **Frontend**
 
 ```bash
+npm run version:check  # package.json / tauri.conf.json / Cargo.toml agree
 npm run typecheck      # tsc --noEmit
 npm run lint           # eslint
 npm run format:check   # prettier --check
@@ -97,6 +98,11 @@ narrowly as possible with a comment explaining why.
   tested it (a two-instance smoke test for anything touching networking).
 - Reference any related issue. Update `CHANGELOG.md` under `[Unreleased]` for
   user-facing changes.
+
+## Releasing (maintainers)
+
+Cutting a release (tagging, the per-platform build matrix, and code
+signing/notarization setup) is documented in [RELEASING.md](./RELEASING.md).
 
 ## Reporting bugs & security issues
 

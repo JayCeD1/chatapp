@@ -87,7 +87,6 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. design-team"
-                autoFocus
                 maxLength={64}
                 className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-xl py-2.5 pl-9 pr-3 text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent-soft)] transition-colors"
               />

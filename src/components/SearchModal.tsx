@@ -68,7 +68,6 @@ export const SearchModal: React.FC<SearchModalProps> = ({
         <div className="flex items-center gap-2 px-4 h-14 border-b border-[var(--border)]">
           <Search className="w-4 h-4 text-[var(--text-faint)] shrink-0" />
           <input
-            autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
             placeholder="Search messages…"

@@ -13,9 +13,17 @@ export function useFocusTrap<T extends HTMLElement>(onClose: () => void) {
   const onCloseRef = useRef(onClose);
   onCloseRef.current = onClose;
 
+  // Capture the element to restore on close at RENDER time — before the dialog commits
+  // and moves focus inward. Capturing inside the effect would record the dialog's own
+  // first field (focus has already moved by then), so close would drop focus to <body>.
+  const restoreTo = useRef<HTMLElement | null>(null);
+  if (restoreTo.current === null) {
+    restoreTo.current = document.activeElement as HTMLElement | null;
+  }
+
   useEffect(() => {
     const node = ref.current;
-    const previouslyFocused = document.activeElement as HTMLElement | null;
+    const previouslyFocused = restoreTo.current;
     const selector =
       'a[href], button:not([disabled]), textarea:not([disabled]), input:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
     const focusable = () =>

@@ -1194,6 +1194,20 @@ async fn handle_server_message(
         // Reply (only to the authenticated requester) with a HistoryPage to prepend.
         MessageType::HistoryRequest => {
             if let Some(requester) = auth_user_id {
+                // Same private-channel gate as RoomJoin — this is an independent path into
+                // send_room_history, so without it a non-member could page a private room's
+                // history with crafted frames.
+                if !room_join_allowed_internal(&pool, requester as i64, message.room_id as i64)
+                    .await
+                    .unwrap_or(false)
+                {
+                    tracing::warn!(
+                        "Denied history for private room {} to user {}",
+                        message.room_id,
+                        requester
+                    );
+                    return Ok(());
+                }
                 let before_id = message.message.parse::<i64>().ok();
                 send_room_history(
                     &state,

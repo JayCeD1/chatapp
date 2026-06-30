@@ -158,6 +158,24 @@ export const useChatConnection = () => {
   // live roster instead of appearing as a chat message.
   const ingestMessage = useCallback((m: any) => {
     const nm = normalizeMessage(m);
+
+    // Authoritative per-room unread counts (room_id → count). Handled BEFORE the
+    // room-required guard below, because this frame intentionally carries no room.
+    if (nm.message_type === "UnreadCounts") {
+      try {
+        const arr = JSON.parse(nm.message) as {
+          room_id: number;
+          count: number;
+        }[];
+        const next: Record<number, number> = {};
+        for (const u of arr) next[u.room_id] = u.count;
+        setUnreadByRoom(next);
+      } catch (err) {
+        console.error("Bad unread payload:", err);
+      }
+      return;
+    }
+
     if (!nm.room) return;
 
     // Host → client scrollback: a JSON batch of {messages, reactions} for a room.
@@ -288,22 +306,6 @@ export const useChatConnection = () => {
       return;
     }
 
-    // Host → client: authoritative per-room unread counts (room_id → count).
-    if (nm.message_type === "UnreadCounts") {
-      try {
-        const arr = JSON.parse(nm.message) as {
-          room_id: number;
-          count: number;
-        }[];
-        const next: Record<number, number> = {};
-        for (const u of arr) next[u.room_id] = u.count;
-        setUnreadByRoom(next);
-      } catch (err) {
-        console.error("Bad unread payload:", err);
-      }
-      return;
-    }
-
     // Ephemeral typing signal — is_emoji carries start(true)/stop(false). Ignore
     // our own echo; entries also expire on a ticker in case a "stop" never arrives.
     if (nm.message_type === "Typing") {
@@ -423,31 +425,9 @@ export const useChatConnection = () => {
         notify(`#${nm.room}`, `${nm.username}: ${nm.message}`);
       }
     }
-
-    // Host owns the DB, so it recomputes its own unread locally on chat activity (the
-    // client instead receives UnreadCounts pushes). Keep the host's CURRENT room read.
-    if (
-      modeRef.current === "server" &&
-      me &&
-      (nm.message_type === "Chat" || !nm.message_type)
-    ) {
-      const cur = currentRoomRef.current;
-      void (async () => {
-        try {
-          if (cur && nm.room === cur.name) {
-            await invoke("touch_last_read", { userId: me.id, roomId: cur.id });
-          }
-          const arr = (await invoke("get_unread_counts", {
-            userId: me.id,
-          })) as { room_id: number; count: number }[];
-          const next: Record<number, number> = {};
-          for (const u of arr) next[u.room_id] = u.count;
-          setUnreadByRoom(next);
-        } catch {
-          /* best-effort */
-        }
-      })();
-    }
+    // Note: host unread badges are refreshed by the backend, which emits authoritative
+    // UnreadCounts to the local UI after each chat is persisted (handled above) — so no
+    // pre-save recompute here (it would read stale, pre-insert counts).
   }, []);
 
   // Load departments on mount.

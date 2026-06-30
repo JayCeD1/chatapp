@@ -881,6 +881,7 @@ async fn push_unread(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64) {
 /// elsewhere get a fresh unread push (their badge for this room may have grown). This is
 /// what makes background-room badges work despite the host only relaying the active room.
 async fn notify_unread_for_room(
+    app: &tauri::AppHandle,
     state: &Arc<AppState>,
     pool: &SqlitePool,
     room: &str,
@@ -898,6 +899,35 @@ async fn notify_unread_for_room(
             let _ = touch_last_read_internal(pool, uid as i64, room_id as i64).await;
         } else {
             push_unread(state, pool, uid).await;
+        }
+    }
+
+    // The host participant isn't in server_streams, so refresh its own badges here:
+    // mark its current room read, then emit authoritative (post-save) counts to its UI.
+    if *state.is_server.read().await {
+        if let Some(host_id) = *state.user_id.read().await {
+            if *state.current_room.read().await == room {
+                let _ = touch_last_read_internal(pool, host_id as i64, room_id as i64).await;
+            }
+            let counts = get_unread_counts_internal(pool, host_id as i64)
+                .await
+                .unwrap_or_default();
+            if let Ok(payload) = serde_json::to_string(&counts) {
+                let msg = Message {
+                    message_type: MessageType::UnreadCounts,
+                    username: String::new(),
+                    user_id: 0,
+                    message: payload,
+                    message_id: Uuid::new_v4().to_string(),
+                    room: String::new(),
+                    room_id: 0,
+                    created_at: now_secs(),
+                    is_emoji: false,
+                };
+                if let Ok(s) = serde_json::to_string(&msg) {
+                    let _ = app.emit("message", s);
+                }
+            }
         }
     }
 }
@@ -953,6 +983,7 @@ async fn handle_server_message(
 
             let pool_clone = pool.clone();
             let state_clone = Arc::clone(&state);
+            let app_clone = app.clone();
             let room = message.room.clone();
             let room_id = message.room_id;
             let msg_clone = message.clone();
@@ -971,7 +1002,7 @@ async fn handle_server_message(
                     tracing::error!("Failed to save chat message to db: {}", e);
                     return;
                 }
-                notify_unread_for_room(&state_clone, &pool_clone, &room, room_id).await;
+                notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id).await;
             });
         }
         MessageType::RoomJoin => {
@@ -1190,6 +1221,7 @@ pub async fn send_as_server_participant(
 
     let pool_clone = db.inner().clone();
     let state_clone = Arc::clone(state.inner());
+    let app_clone = app.clone();
     let room = chat_message.room.clone();
     let room_id = chat_message.room_id;
     let msg_clone = chat_message.clone();
@@ -1208,7 +1240,7 @@ pub async fn send_as_server_participant(
             tracing::error!("Failed to save server message to DB: {}", e);
             return;
         }
-        notify_unread_for_room(&state_clone, &pool_clone, &room, room_id).await;
+        notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id).await;
     });
 
     Ok(())

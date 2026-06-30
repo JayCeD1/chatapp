@@ -428,10 +428,13 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 - [x] History pagination (cursor-based `before_id`, load-older on scroll-up with viewport anchoring) (7) (`a6f8d0e`) — **M**
 - [x] Message edit/delete (migration v10 `edited_at`/`deleted_at`, authorship-checked, `MessageType::Edit/Delete`, hover actions + inline edit) (7) (`1d138c2`) — **M**
 - [x] @mentions (highlight + me-emphasis) + desktop notifications (`tauri-plugin-notification`, on unfocused/mention) (7) (`158f877`) — **M**
+- [x] Message search (`search_messages` LIKE, escaped; debounced SearchModal → jump to channel) (7) (`650c2b8`) — **M**
+- [x] Emoji reactions (migration v11, atomic toggle, host-authoritative; chips + picker) (7) (`5f3f7f6` + `968e333` review fixes) — **M**
 - [ ] Persistent identity + session restore via `get_user_by_id` (7) — **L**
-- [ ] Unread tracking (`last_read_at` + badges) — depends on multi-room delivery, not just the listener (backend currently delivers only the active room) (7) — **M**
+- [ ] **Client history sync (architectural gap surfaced by review):** clients' local DB has no host data, so history/search/reactions only fully populate on the HOST; clients see live data only. Needs a host→client history/reaction sync over the socket. Underlies unread tracking too. — **L**
+- [ ] Unread tracking (`last_read_at` + badges) — depends on multi-room delivery + client history sync (7) — **M**
 - [ ] Working discovery in UI (handshake + mDNS/UDP, replace port scan) (7/2.10) — **M**
-- [ ] DMs, reactions, typing indicators, search, settings persistence (7). _Avatars + theme persistence already done in Phase 2._ — **S→L each**
+- [ ] DMs, typing indicators, settings persistence (7). _Avatars + theme persistence done in Phase 2._ — **S→L each**
 
 ### Phase 4 — Polish, tests, CI, release
 - [ ] Rust unit + `tokio::test` integration tests; Vitest + RTL frontend tests (8.1) — **L**

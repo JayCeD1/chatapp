@@ -98,9 +98,16 @@ export const useChatConnection = () => {
   const [typingByRoom, setTypingByRoom] = useState<
     Record<string, Record<number, { username: string; at: number }>>
   >({});
+  // Unread message counts per room id (host computes them; client gets pushes).
+  const [unreadByRoom, setUnreadByRoom] = useState<Record<number, number>>({});
 
   // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
+  // Resolver for an in-flight client-mode "load older" request, settled when the matching
+  // HistoryPage arrives (so the caller can await the prepend and anchor the scroll).
+  const pendingOlderRef = useRef<{ room: string; resolve: () => void } | null>(
+    null,
+  );
   const modeRef = useRef(mode);
   useEffect(() => {
     modeRef.current = mode;
@@ -200,8 +207,12 @@ export const useChatConnection = () => {
           });
           return { ...prev, [nm.room]: merged };
         });
-        // Recent batch only (full pagination is host-side for now).
-        setHasMoreByRoom((prev) => ({ ...prev, [nm.room]: false }));
+        // A full page may have older messages behind it; clients page back via
+        // HistoryRequest (load-older), the host via its local DB.
+        setHasMoreByRoom((prev) => ({
+          ...prev,
+          [nm.room]: msgs.length >= PAGE_SIZE,
+        }));
 
         const byMsg: Record<string, Reaction[]> = {};
         for (const r of batch.reactions || []) {
@@ -222,6 +233,73 @@ export const useChatConnection = () => {
       } catch (err) {
         console.error("Bad history payload:", err);
         setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
+      }
+      return;
+    }
+
+    // Host → client: an older page (response to a load-older request) — PREPEND it,
+    // deduped, then settle the pending loadOlder promise so the scroll can anchor.
+    if (nm.message_type === "HistoryPage") {
+      try {
+        const batch = JSON.parse(nm.message) as {
+          messages: any[];
+          reactions: any[];
+        };
+        const older = (batch.messages || []).map((m) =>
+          normalizeMessage({ ...m, room: nm.room }),
+        );
+        setMessagesByRoom((prev) => {
+          const existing = prev[nm.room] || [];
+          const seen = new Set(existing.map((x) => x.message_id));
+          const fresh = older.filter(
+            (x) => x.message_id && !seen.has(x.message_id),
+          );
+          return { ...prev, [nm.room]: [...fresh, ...existing] };
+        });
+        setHasMoreByRoom((prev) => ({
+          ...prev,
+          [nm.room]: older.length >= PAGE_SIZE,
+        }));
+        const byMsg: Record<string, Reaction[]> = {};
+        for (const r of batch.reactions || []) {
+          (byMsg[r.message_id] ||= []).push({
+            emoji: r.emoji,
+            count: r.count,
+            me: r.me,
+          });
+        }
+        setReactionsByMessage((prev) => {
+          const next = { ...prev };
+          for (const m of older) {
+            if (m.message_id && next[m.message_id] === undefined) {
+              next[m.message_id] = byMsg[m.message_id] || [];
+            }
+          }
+          return next;
+        });
+      } catch (err) {
+        console.error("Bad history page:", err);
+      } finally {
+        if (pendingOlderRef.current?.room === nm.room) {
+          pendingOlderRef.current.resolve();
+          pendingOlderRef.current = null;
+        }
+      }
+      return;
+    }
+
+    // Host → client: authoritative per-room unread counts (room_id → count).
+    if (nm.message_type === "UnreadCounts") {
+      try {
+        const arr = JSON.parse(nm.message) as {
+          room_id: number;
+          count: number;
+        }[];
+        const next: Record<number, number> = {};
+        for (const u of arr) next[u.room_id] = u.count;
+        setUnreadByRoom(next);
+      } catch (err) {
+        console.error("Bad unread payload:", err);
       }
       return;
     }
@@ -345,6 +423,31 @@ export const useChatConnection = () => {
         notify(`#${nm.room}`, `${nm.username}: ${nm.message}`);
       }
     }
+
+    // Host owns the DB, so it recomputes its own unread locally on chat activity (the
+    // client instead receives UnreadCounts pushes). Keep the host's CURRENT room read.
+    if (
+      modeRef.current === "server" &&
+      me &&
+      (nm.message_type === "Chat" || !nm.message_type)
+    ) {
+      const cur = currentRoomRef.current;
+      void (async () => {
+        try {
+          if (cur && nm.room === cur.name) {
+            await invoke("touch_last_read", { userId: me.id, roomId: cur.id });
+          }
+          const arr = (await invoke("get_unread_counts", {
+            userId: me.id,
+          })) as { room_id: number; count: number }[];
+          const next: Record<number, number> = {};
+          for (const u of arr) next[u.room_id] = u.count;
+          setUnreadByRoom(next);
+        } catch {
+          /* best-effort */
+        }
+      })();
+    }
   }, []);
 
   // Load departments on mount.
@@ -423,6 +526,33 @@ export const useChatConnection = () => {
     const list = messagesByRoomRef.current[room.name] || [];
     const oldest = list.find((m) => m.id != null);
     if (!oldest?.id) return;
+
+    // Client mode: the host owns the data, so request the page over the socket and resolve
+    // only when the HistoryPage push lands (or a timeout), so ChatPane can anchor the scroll.
+    if (modeRef.current !== "server") {
+      await new Promise<void>((resolve) => {
+        let done = false;
+        const finish = () => {
+          if (done) return;
+          done = true;
+          clearTimeout(timer);
+          resolve();
+        };
+        const timer = setTimeout(finish, 5000);
+        pendingOlderRef.current = { room: room.name, resolve: finish };
+        invoke("request_history", {
+          room: room.name,
+          roomId: room.id,
+          beforeId: oldest.id,
+        }).catch(() => {
+          if (pendingOlderRef.current?.resolve === finish)
+            pendingOlderRef.current = null;
+          finish();
+        });
+      });
+      return;
+    }
+
     try {
       const older = (await invoke("get_room_messages", {
         roomId: room.id,
@@ -573,6 +703,19 @@ export const useChatConnection = () => {
       await loadChatRooms();
       setConnectionStatus("connected");
       setView("workspace");
+      // Host owns the DB → seed its unread badges now; a client gets a push on Connect.
+      if (mode === "server") {
+        try {
+          const arr = (await invoke("get_unread_counts", {
+            userId: user.id,
+          })) as { room_id: number; count: number }[];
+          const next: Record<number, number> = {};
+          for (const u of arr) next[u.room_id] = u.count;
+          setUnreadByRoom(next);
+        } catch {
+          /* best-effort */
+        }
+      }
     } catch (err) {
       console.error("Login failed:", err);
       const msg = String(err);
@@ -608,12 +751,31 @@ export const useChatConnection = () => {
 
       await invoke("join_room", { userId: currentUser.id, roomId: room.id });
       setCurrentRoom(room);
+      // Opening a room reads it: clear its badge immediately for snappy UX.
+      setUnreadByRoom((prev) =>
+        prev[room.id] ? { ...prev, [room.id]: 0 } : prev,
+      );
       if (mode === "server") {
-        // Host owns the data — read it locally.
+        // Host owns the data — read it locally + mark read + recompute badges.
         loadRoomMessages(room);
+        try {
+          await invoke("touch_last_read", {
+            userId: currentUser.id,
+            roomId: room.id,
+          });
+          const arr = (await invoke("get_unread_counts", {
+            userId: currentUser.id,
+          })) as { room_id: number; count: number }[];
+          const next: Record<number, number> = {};
+          for (const u of arr) next[u.room_id] = u.count;
+          setUnreadByRoom(next);
+        } catch {
+          /* best-effort */
+        }
       } else {
         // Client's local DB has none of the host's history; show a loading
         // state and wait for the host's HistoryResponse push (see ingestMessage).
+        // The host also marks the room read on RoomJoin and pushes fresh UnreadCounts.
         setLoadingByRoom((prev) => ({ ...prev, [room.name]: true }));
         setMessagesByRoom((prev) =>
           prev[room.name] ? prev : { ...prev, [room.name]: [] },
@@ -812,6 +974,7 @@ export const useChatConnection = () => {
     setMessagesByRoom({});
     setMembersByRoom({});
     setReactionsByMessage({});
+    setUnreadByRoom({});
     setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
@@ -840,6 +1003,7 @@ export const useChatConnection = () => {
         )
       : [],
     sendTyping,
+    unreadByRoom,
     currentUser,
     currentRoom,
     setMode,

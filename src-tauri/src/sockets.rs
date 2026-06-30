@@ -1,6 +1,7 @@
 use crate::db_queries::{
     delete_message_db, edit_message_db, get_room_messages_internal, get_room_reactions_internal,
-    save_message_internal, toggle_reaction_db,
+    get_unread_counts_internal, save_message_internal, toggle_reaction_db,
+    touch_last_read_internal,
 };
 use crate::secure;
 use serde::{Deserialize, Serialize};
@@ -179,7 +180,7 @@ pub struct Message {
     pub is_emoji: bool,
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+#[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
 pub enum MessageType {
     Connect,
     Disconnect,
@@ -197,6 +198,12 @@ pub enum MessageType {
     // Ephemeral "user is typing" signal, relayed to the room and never persisted.
     // `is_emoji` carries start(true)/stop(false).
     Typing,
+    // Client → host: request an older page of a room (`message` carries the before_id
+    // cursor as a string). Host → client reply is a HistoryPage to PREPEND.
+    HistoryRequest,
+    HistoryPage,
+    // Host → a single client: JSON [{room_id, count}] of per-room unread counts.
+    UnreadCounts,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -771,6 +778,8 @@ async fn send_room_history(
     user_id: u64,
     room: &str,
     room_id: u64,
+    before_id: Option<i64>,
+    msg_type: MessageType,
 ) {
     let conn = {
         let streams = state.server_streams.lock().await;
@@ -782,16 +791,16 @@ async fn send_room_history(
         return;
     };
 
-    let mut messages = get_room_messages_internal(pool, room_id as i64, 50, None)
+    let mut messages = get_room_messages_internal(pool, room_id as i64, 50, before_id)
         .await
         .unwrap_or_default();
     let all_reactions = get_room_reactions_internal(pool, room_id as i64, user_id as i64)
         .await
         .unwrap_or_default();
 
-    // Build a HistoryResponse for a given message set, carrying ONLY the reactions
-    // whose target survives the trim (reactions are room-wide, so an untrimmed list
-    // could overflow the frame on its own).
+    // Build the batch for a given message set, carrying ONLY the reactions whose target
+    // survives the trim (reactions are room-wide, so an untrimmed list could overflow the
+    // frame on its own).
     let make = |msgs: &[crate::db_queries::Message]| -> Message {
         let ids: std::collections::HashSet<&str> = msgs
             .iter()
@@ -803,7 +812,7 @@ async fn send_room_history(
             .collect();
         let payload = serde_json::json!({ "messages": msgs, "reactions": reactions }).to_string();
         Message {
-            message_type: MessageType::HistoryResponse,
+            message_type: msg_type,
             username: String::new(),
             user_id: 0,
             message: payload,
@@ -834,6 +843,62 @@ async fn send_room_history(
     if send_secure(&writer, &transport, &resp).await.is_err() {
         let empty = make(&[]);
         let _ = send_secure(&writer, &transport, &empty).await;
+    }
+}
+
+/// Compute a client's per-room unread counts from the host DB and push them as an
+/// UnreadCounts frame to just that client. No-op if the client isn't connected.
+async fn push_unread(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64) {
+    let conn = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .get(&user_id)
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+    };
+    let Some((writer, transport)) = conn else {
+        return;
+    };
+    let counts = get_unread_counts_internal(pool, user_id as i64)
+        .await
+        .unwrap_or_default();
+    let payload = serde_json::to_string(&counts).unwrap_or_else(|_| "[]".to_string());
+    let msg = Message {
+        message_type: MessageType::UnreadCounts,
+        username: String::new(),
+        user_id: 0,
+        message: payload,
+        message_id: Uuid::new_v4().to_string(),
+        room: String::new(),
+        room_id: 0,
+        created_at: now_secs(),
+        is_emoji: false,
+    };
+    let _ = send_secure(&writer, &transport, &msg).await;
+}
+
+/// After a chat lands in `room`, keep every connected client's unread badge honest:
+/// clients currently viewing the room have it marked read (they see it live); clients
+/// elsewhere get a fresh unread push (their badge for this room may have grown). This is
+/// what makes background-room badges work despite the host only relaying the active room.
+async fn notify_unread_for_room(
+    state: &Arc<AppState>,
+    pool: &SqlitePool,
+    room: &str,
+    room_id: u64,
+) {
+    let clients: Vec<(u64, String)> = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .values()
+            .map(|c| (c.user_id, c.current_room.clone()))
+            .collect()
+    };
+    for (uid, current_room) in clients {
+        if current_room == room {
+            let _ = touch_last_read_internal(pool, uid as i64, room_id as i64).await;
+        } else {
+            push_unread(state, pool, uid).await;
+        }
     }
 }
 
@@ -875,10 +940,21 @@ async fn handle_server_message(
             // Distribute to all participants
             distribute_message_to_all(&app, &state, &message.room, &message, None).await;
             broadcast_user_list(&app, &state, &message.room).await;
+            // Seed the freshly-connected client's unread badges.
+            if let Some(requester) = auth_user_id {
+                push_unread(&state, &pool, requester).await;
+            }
         }
         MessageType::Chat => {
-            //save to db
+            // Distribute first (live delivery to in-room clients), then persist and refresh
+            // unread badges in a single task so the unread recompute sees the saved row.
+            distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
+                .await;
+
             let pool_clone = pool.clone();
+            let state_clone = Arc::clone(&state);
+            let room = message.room.clone();
+            let room_id = message.room_id;
             let msg_clone = message.clone();
             tauri::async_runtime::spawn(async move {
                 if let Err(e) = save_message_internal(
@@ -893,11 +969,10 @@ async fn handle_server_message(
                 .await
                 {
                     tracing::error!("Failed to save chat message to db: {}", e);
+                    return;
                 }
+                notify_unread_for_room(&state_clone, &pool_clone, &room, room_id).await;
             });
-            // Distribute to all participants (exclude sender to avoid duplicate)
-            distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
-                .await;
         }
         MessageType::RoomJoin => {
             // Use the connection-bound id, never the (spoofable) one in the frame, so a
@@ -958,7 +1033,20 @@ async fn handle_server_message(
             // Give the joining client scrollback for the room they just opened.
             // Only for authenticated connections — never push to a spoofed user_id.
             if let Some(requester) = auth_user_id {
-                send_room_history(&state, &pool, requester, &message.room, message.room_id).await;
+                send_room_history(
+                    &state,
+                    &pool,
+                    requester,
+                    &message.room,
+                    message.room_id,
+                    None,
+                    MessageType::HistoryResponse,
+                )
+                .await;
+                // Opening a room marks it read; refresh the client's badges.
+                let _ =
+                    touch_last_read_internal(&pool, requester as i64, message.room_id as i64).await;
+                push_unread(&state, &pool, requester).await;
             }
         }
         MessageType::RoomLeave => {
@@ -1040,6 +1128,23 @@ async fn handle_server_message(
             let actor = auth_user_id.unwrap_or(message.user_id);
             distribute_message_to_all(&app, &state, &message.room, &message, Some(actor)).await;
         }
+        // Client wants an older page of a room; `message` carries the before_id cursor.
+        // Reply (only to the authenticated requester) with a HistoryPage to prepend.
+        MessageType::HistoryRequest => {
+            if let Some(requester) = auth_user_id {
+                let before_id = message.message.parse::<i64>().ok();
+                send_room_history(
+                    &state,
+                    &pool,
+                    requester,
+                    &message.room,
+                    message.room_id,
+                    before_id,
+                    MessageType::HistoryPage,
+                )
+                .await;
+            }
+        }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
         _ => {}
     }
@@ -1080,7 +1185,13 @@ pub async fn send_as_server_participant(
     };
 
     // Save to database
+    // Distribute to everyone, no exclusions for server messages
+    distribute_message_to_all(&app, state.inner(), &chat_message.room, &chat_message, None).await;
+
     let pool_clone = db.inner().clone();
+    let state_clone = Arc::clone(state.inner());
+    let room = chat_message.room.clone();
+    let room_id = chat_message.room_id;
     let msg_clone = chat_message.clone();
     tauri::async_runtime::spawn(async move {
         if let Err(e) = save_message_internal(
@@ -1095,11 +1206,10 @@ pub async fn send_as_server_participant(
         .await
         {
             tracing::error!("Failed to save server message to DB: {}", e);
+            return;
         }
+        notify_unread_for_room(&state_clone, &pool_clone, &room, room_id).await;
     });
-
-    // Distribute to everyone Send to everyone, no exclusions for server messages
-    distribute_message_to_all(&app, state.inner(), &chat_message.room, &chat_message, None).await;
 
     Ok(())
 }
@@ -1718,6 +1828,31 @@ pub async fn client_typing(
     msg.is_emoji = typing; // start(true)/stop(false)
     let _ = send_secure_client(state.inner(), &msg).await;
     Ok(())
+}
+
+/// Client → host: ask for the page of messages older than `before_id` in a room. The host
+/// replies with a HistoryPage the client listener prepends.
+#[tauri::command]
+pub async fn request_history(
+    state: State<'_, Arc<AppState>>,
+    room: String,
+    room_id: u64,
+    before_id: i64,
+) -> Result<(), String> {
+    let msg = Message {
+        message_type: MessageType::HistoryRequest,
+        username: String::new(),
+        user_id: 0,
+        message: before_id.to_string(),
+        message_id: Uuid::new_v4().to_string(),
+        room,
+        room_id,
+        created_at: now_secs(),
+        is_emoji: false,
+    };
+    send_secure_client(state.inner(), &msg)
+        .await
+        .map_err(|e| format!("Failed to request history: {}", e))
 }
 
 /// Host participant typing: relay straight to the room's clients (and the local UI

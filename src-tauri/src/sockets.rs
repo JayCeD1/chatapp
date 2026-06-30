@@ -1,5 +1,7 @@
 use crate::db_queries::save_message_internal;
+use crate::secure;
 use serde::{Deserialize, Serialize};
+use snow::TransportState;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -63,25 +65,24 @@ fn now_secs() -> u64 {
 }
 
 //Better indexing and room management
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct ClientConnection {
-    // Store only the write half for sending/broadcasting
-    pub stream: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-    pub addr: SocketAddr,
+    // Write half + per-connection Noise transport, used together to send/broadcast.
+    pub writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    pub transport: Arc<tokio::sync::Mutex<TransportState>>,
     pub username: String,
     pub current_room: String,
     pub room_id: u64,
     pub user_id: u64,
-    pub connected_at: std::time::SystemTime,
 }
 
-#[derive(Debug)]
 pub struct AppState {
     // Async collections behind Arcs so AppState can be shared easily
     // Use user_id as key for O(1) lookups
     pub server_streams: Arc<tokio::sync::Mutex<HashMap<u64, ClientConnection>>>,
-    // Separate client stream management
+    // Separate client stream management (write half + matching Noise transport)
     pub client_stream: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+    pub client_transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
     // Track which users are in which rooms for efficient broadcasting
     pub room_clients: Arc<tokio::sync::Mutex<HashMap<String, Vec<u64>>>>,
 
@@ -207,7 +208,14 @@ pub async fn server_listen_as_participant(
     port: Option<u16>,
     room: String,
     room_id: u64,
+    password: String,
 ) -> Result<(), String> {
+    if password.is_empty() {
+        return Err("A room password is required to host".to_string());
+    }
+    // PSK derived from the room password; every client must present the same password.
+    let psk = secure::derive_psk(&password);
+
     let port = port.unwrap_or(3625);
     let bind_addr = format!("0.0.0.0:{}", port); // Bind to all interfaces for network access
 
@@ -302,9 +310,14 @@ pub async fn server_listen_as_participant(
                     // Use tokio::spawn for individual client handling (pure network I/O)
                     tokio::spawn(async move {
                         let _permit = permit; // released when the connection ends
-                        if let Err(e) =
-                            handle_client_connection(app_handle, state_handle, stream, pool_handle)
-                                .await
+                        if let Err(e) = handle_client_connection(
+                            app_handle,
+                            state_handle,
+                            stream,
+                            pool_handle,
+                            psk,
+                        )
+                        .await
                         {
                             eprintln!("Failed to handle client connection: {}", e);
                         }
@@ -326,42 +339,67 @@ async fn handle_client_connection(
     state: Arc<AppState>,
     stream: TcpStream,
     pool: SqlitePool,
+    psk: [u8; 32],
 ) -> Result<(), Box<dyn std::error::Error>> {
     let peer_addr = stream.peer_addr()?;
     println!("New client connection from: {}", peer_addr);
 
-    let mut client_info: Option<ClientConnection> = None;
-    // Split once into owned halves: reader for this loop, writer for broadcasts
-    let (mut reader, writer) = stream.into_split();
+    // Split once into owned halves: reader for this loop, writer for broadcasts.
+    let (mut reader, mut writer) = stream.into_split();
+
+    // Authenticate + establish encryption BEFORE trusting anything from this peer.
+    // A wrong password fails the handshake and the connection is dropped.
+    let transport = match secure::responder_handshake(&mut reader, &mut writer, &psk).await {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("🔒 Rejected {}: {}", peer_addr, e);
+            return Ok(());
+        }
+    };
+    println!("🔒 Secure session established with {}", peer_addr);
+
     let writer_arc = Arc::new(tokio::sync::Mutex::new(writer));
+    let transport_arc = Arc::new(tokio::sync::Mutex::new(transport));
+
+    let mut client_info: Option<ClientConnection> = None;
     loop {
-        // Read one framed message (header + payload), capped at MAX_FRAME_BYTES.
+        // Read one encrypted frame (capped at MAX_FRAME_BYTES), then decrypt it.
         match read_frame(&mut reader).await {
             // Recoverable: empty keep-alive frame → ignore and wait for next
             Ok(None) => {
                 println!("Ignoring empty message");
                 continue;
             }
-            Ok(Some(message_buffer)) => {
-                let message_str = std::str::from_utf8(&message_buffer)?;
+            Ok(Some(ciphertext)) => {
+                let plaintext = {
+                    let mut ts = transport_arc.lock().await;
+                    match secure::decrypt(&mut ts, &ciphertext) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("🔒 Decrypt error from {}: {}", peer_addr, e);
+                            break;
+                        }
+                    }
+                };
+                let message_str = std::str::from_utf8(&plaintext)?;
                 let message: Message = serde_json::from_str(message_str)?;
 
                 //Handle client registration
                 if message.message_type == MessageType::Connect {
-                    client_info = Some(ClientConnection {
-                        stream: Arc::clone(&writer_arc),
-                        addr: peer_addr,
+                    let conn = ClientConnection {
+                        writer: Arc::clone(&writer_arc),
+                        transport: Arc::clone(&transport_arc),
                         username: message.username.clone(),
                         current_room: message.room.clone(),
                         room_id: message.room_id,
                         user_id: message.user_id,
-                        connected_at: std::time::SystemTime::now(),
-                    });
+                    };
+                    client_info = Some(conn.clone());
 
                     //Add to the server's stream list using user_id as a key
                     {
                         let mut streams = state.server_streams.lock().await;
-                        streams.insert(message.user_id, client_info.as_ref().unwrap().clone());
+                        streams.insert(message.user_id, conn);
 
                         //Add to room tracking
                         let mut rooms = state.room_clients.lock().await;
@@ -379,7 +417,7 @@ async fn handle_client_connection(
             }
 
             Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
-                print!("client disconnected: {} - {}", peer_addr, e);
+                println!("client disconnected: {} - {}", peer_addr, e);
                 break;
             }
             Err(e) => {
@@ -466,49 +504,54 @@ async fn distribute_message_to_all(
     message: &Message,
     exclude_user_id: Option<u64>,
 ) {
-    let streams = state.server_streams.lock().await;
-    let room_clients = state.room_clients.lock().await;
+    // Read scalar flags first, then briefly hold the collection locks to snapshot the
+    // target writers, and release ALL locks before any network I/O or emit (avoids
+    // holding mutexes across .await fan-out).
     let is_server = *state.is_server.read().await;
     let server_user_id = *state.user_id.read().await;
 
-    println!(
-        "🔍 Room '{}' contains users: {:?}",
-        target_room,
-        room_clients.get(target_room)
+    type Target = (
+        Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+        Arc<tokio::sync::Mutex<TransportState>>,
+        String,
+        u64,
     );
-
-    //Only iterate over users in the target room i.e., Send to network clients (other machines)
-    if let Some(user_ids) = room_clients.get(target_room) {
-        println!("📡 Broadcasting to {} network clients", user_ids.len());
-
-        for &user_id in user_ids {
-            //Skip the excluded user (usually the sender)
-            if let Some(exclude_user_id) = exclude_user_id {
-                if user_id == exclude_user_id {
+    let targets: Vec<Target> = {
+        let streams = state.server_streams.lock().await;
+        let room_clients = state.room_clients.lock().await;
+        let mut v = Vec::new();
+        if let Some(user_ids) = room_clients.get(target_room) {
+            for &user_id in user_ids {
+                //Skip the excluded user (usually the sender)
+                if Some(user_id) == exclude_user_id {
                     continue;
                 }
-            }
-
-            // Skip server's own user_id for network broadcast
-            // (server talks to its UI directly, not via network)
-            if is_server && Some(user_id) == server_user_id {
-                continue;
-            }
-
-            if let Some(client_conn) = streams.get(&user_id) {
-                //Spawn an async task to send using the write half.
-                let username = client_conn.username.clone();
-                let stream_arc = Arc::clone(&client_conn.stream);
-                let msg = message.clone();
-                tauri::async_runtime::spawn(async move {
-                    let mut guard = stream_arc.lock().await;
-                    match send_message_with_length(&mut *guard, &msg).await {
-                        Ok(_) => println!(" ✅ Sent to {} ({})", username, user_id),
-                        Err(e) => println!("   ❌ Failed to send to {}: {}", username, e),
-                    }
-                });
+                // Skip server's own user_id (it talks to its UI directly, not via network)
+                if is_server && Some(user_id) == server_user_id {
+                    continue;
+                }
+                if let Some(conn) = streams.get(&user_id) {
+                    v.push((
+                        Arc::clone(&conn.writer),
+                        Arc::clone(&conn.transport),
+                        conn.username.clone(),
+                        user_id,
+                    ));
+                }
             }
         }
+        v
+    }; // locks released here
+
+    println!("📡 Broadcasting to {} network clients", targets.len());
+    for (writer, transport, username, user_id) in targets {
+        let msg = message.clone();
+        tauri::async_runtime::spawn(async move {
+            match send_secure(&writer, &transport, &msg).await {
+                Ok(_) => println!(" ✅ Sent to {} ({})", username, user_id),
+                Err(e) => println!("   ❌ Failed to send to {}: {}", username, e),
+            }
+        });
     }
     // 2. ALWAYS send it to local UI (this machine's interface)
     match serde_json::to_string(message) {
@@ -696,6 +739,7 @@ pub async fn client_connect_to_server(
     user_id: u64,
     room: String,
     room_id: u64,
+    password: String,
 ) -> Result<(), String> {
     println!("🔵 Client connecting to server at {}", host);
 
@@ -703,7 +747,14 @@ pub async fn client_connect_to_server(
         .await
         .map_err(|e| format!("Failed to connect to {}: {}", host, e))?;
 
-    let (reader, mut writer) = stream.into_split();
+    let (mut reader, mut writer) = stream.into_split();
+
+    // Authenticate + establish encryption. A wrong password fails the handshake here.
+    let psk = secure::derive_psk(&password);
+    let transport = secure::initiator_handshake(&mut reader, &mut writer, &psk)
+        .await
+        .map_err(|e| format!("Secure handshake failed (wrong password?): {}", e))?;
+    println!("🔒 Secure session established with {}", host);
 
     // Update client state
     {
@@ -714,7 +765,17 @@ pub async fn client_connect_to_server(
         *state.is_server.write().await = false;
     };
 
-    // Send connect message BEFORE storing the writer (fully async, no blocking)
+    // Store the writer + transport for later (encrypted) sends.
+    {
+        let mut guard = state.client_stream.lock().await;
+        *guard = Some(writer);
+    }
+    {
+        let mut guard = state.client_transport.lock().await;
+        *guard = Some(transport);
+    }
+
+    // Send the (encrypted) connect message now that the transport is stored.
     let connect_message = Message {
         message_type: MessageType::Connect,
         username: username.clone(),
@@ -726,18 +787,11 @@ pub async fn client_connect_to_server(
         is_emoji: false,
         message_id: Uuid::new_v4().to_string(),
     };
-
-    send_message_with_length(&mut writer, &connect_message)
+    send_secure_client(state.inner(), &connect_message)
         .await
         .map_err(|e| format!("Failed to send connect message to server: {}", e))?;
 
-    // Now store the writer for later sends (await AFTER the std::Mutex is dropped)
-    {
-        let mut guard = state.client_stream.lock().await;
-        *guard = Some(writer);
-    }
-
-    start_client_listener(app, reader);
+    start_client_listener(app, reader, Arc::clone(&state.client_transport));
 
     println!("✅ Client connected successfully");
     Ok(())
@@ -777,17 +831,10 @@ pub async fn send_as_client(
         message_id: Uuid::new_v4().to_string(),
     };
 
-    // Send to server via async write half (no blocking, no std::Mutex held)
-    {
-        let mut guard = state.client_stream.lock().await;
-        if let Some(writer) = guard.as_mut() {
-            send_message_with_length(writer, &chat_message)
-                .await
-                .map_err(|e| format!("Failed to send message to server: {}", e))?;
-        } else {
-            return Err("Not connected to server".to_string());
-        }
-    }
+    // Send to server over the encrypted channel.
+    send_secure_client(state.inner(), &chat_message)
+        .await
+        .map_err(|e| format!("Failed to send message to server: {}", e))?;
 
     // Show in own UI immediately (don't wait for server echo)
     if let Ok(payload) = serde_json::to_string(&chat_message) {
@@ -799,21 +846,44 @@ pub async fn send_as_client(
     Ok(())
 }
 
-fn start_client_listener(app: tauri::AppHandle, mut reader: tokio::net::tcp::OwnedReadHalf) {
+fn start_client_listener(
+    app: tauri::AppHandle,
+    mut reader: tokio::net::tcp::OwnedReadHalf,
+    transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
+) {
     tauri::async_runtime::spawn(async move {
         println!("🎧 Client listener started");
 
         loop {
-            // Same capped framing as the server path (read_frame rejects oversized frames),
-            // so a malicious or buggy host cannot trigger a huge client-side allocation.
+            // Same capped framing as the server path (read_frame rejects oversized frames);
+            // each frame is then decrypted with the shared client transport.
             match read_frame(&mut reader).await {
                 Ok(None) => continue, // empty keep-alive frame
-                Ok(Some(message_buffer)) => {
-                    if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
-                        println!("🎧 Client received: {}", message_str);
-                        if let Err(e) = app.emit("message", message_str) {
-                            eprintln!("Failed to emit received message: {}", e);
+                Ok(Some(ciphertext)) => {
+                    let plaintext = {
+                        let mut guard = transport.lock().await;
+                        match guard.as_mut() {
+                            Some(ts) => match secure::decrypt(ts, &ciphertext) {
+                                Ok(p) => p,
+                                Err(e) => {
+                                    eprintln!("🔒 Client decrypt error: {}", e);
+                                    break;
+                                }
+                            },
+                            None => {
+                                eprintln!("🔒 No client transport; dropping frame");
+                                break;
+                            }
                         }
+                    };
+                    match String::from_utf8(plaintext) {
+                        Ok(message_str) => {
+                            println!("🎧 Client received: {}", message_str);
+                            if let Err(e) = app.emit("message", message_str) {
+                                eprintln!("Failed to emit received message: {}", e);
+                            }
+                        }
+                        Err(e) => eprintln!("🔒 Invalid UTF-8 after decrypt: {}", e),
                     }
                 }
                 Err(e) => {
@@ -932,17 +1002,10 @@ pub async fn client_join_room(
         message_id: Uuid::new_v4().to_string(),
     };
 
-    // Send room join to server via async write half
-    {
-        let mut guard = state.client_stream.lock().await;
-        if let Some(writer) = guard.as_mut() {
-            send_message_with_length(writer, &room_join_msg)
-                .await
-                .map_err(|e| format!("Failed to send room join: {}", e))?;
-        } else {
-            return Err("Not connected to server".to_string());
-        }
-    }
+    // Send room join to server over the encrypted channel.
+    send_secure_client(state.inner(), &room_join_msg)
+        .await
+        .map_err(|e| format!("Failed to send room join: {}", e))?;
     /*-
         - For Connect/RoomJoin/RoomLeave
         The server broadcasts these to everyone (including the sender), and your client
@@ -959,19 +1022,42 @@ pub async fn get_server_info(state: State<'_, Arc<AppState>>) -> Result<Option<S
     Ok(addr)
 }
 
-async fn send_message_with_length(
-    stream: &mut tokio::net::tcp::OwnedWriteHalf,
+/// Encrypt and send a message to one peer over its Noise transport. The transport
+/// lock is held across encrypt + write so Noise nonces always reach the wire in order
+/// (out-of-order frames would fail to decrypt).
+async fn send_secure(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    transport: &Arc<tokio::sync::Mutex<TransportState>>,
     message: &Message,
-) -> Result<(), Box<dyn std::error::Error>> {
-    // Serialize message to JSON
-    let payload = serde_json::to_string(message)?;
-    let len = payload.len() as u32;
+) -> Result<(), String> {
+    let payload = serde_json::to_string(message).map_err(|e| e.to_string())?;
+    let mut ts = transport.lock().await;
+    let ciphertext = secure::encrypt(&mut ts, payload.as_bytes())?;
+    let mut w = writer.lock().await;
+    w.write_all(&(ciphertext.len() as u32).to_be_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    w.write_all(&ciphertext).await.map_err(|e| e.to_string())?;
+    Ok(())
+}
 
-    // Send length (4 bytes) then payload
-    stream.write_all(&len.to_be_bytes()).await?;
-    stream.write_all(payload.as_bytes()).await?;
-    // No explicit flush needed for Tokio TCP; OS buffers will handle it.
-
+/// Client-side equivalent: encrypt and send to the server over the single client
+/// transport. Locks transport then writer (consistent order) to keep nonces ordered.
+async fn send_secure_client(state: &Arc<AppState>, message: &Message) -> Result<(), String> {
+    let payload = serde_json::to_string(message).map_err(|e| e.to_string())?;
+    let mut ts_guard = state.client_transport.lock().await;
+    let ts = ts_guard
+        .as_mut()
+        .ok_or_else(|| "Not connected (no secure session)".to_string())?;
+    let ciphertext = secure::encrypt(ts, payload.as_bytes())?;
+    let mut w_guard = state.client_stream.lock().await;
+    let w = w_guard
+        .as_mut()
+        .ok_or_else(|| "Not connected to server".to_string())?;
+    w.write_all(&(ciphertext.len() as u32).to_be_bytes())
+        .await
+        .map_err(|e| e.to_string())?;
+    w.write_all(&ciphertext).await.map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -986,26 +1072,26 @@ pub async fn client_disconnect(
     let room = { state.current_room.read().await.clone() };
     let room_id_opt = { *state.current_room_id.read().await };
 
-    // Best-effort: send a Disconnect to the server before closing
-    if let Some(mut write_half) = {
+    // Best-effort: send an (encrypted) Disconnect to the server, then drop the session.
+    let disconnect_msg = Message {
+        message_type: MessageType::Disconnect,
+        username: username.clone(),
+        user_id: user_id_opt.unwrap_or(0),
+        message: "client disconnect".to_string(),
+        message_id: Uuid::new_v4().to_string(),
+        room: room.clone(),
+        room_id: room_id_opt.unwrap_or(0),
+        created_at: now_secs(),
+        is_emoji: false,
+    };
+    let _ = send_secure_client(state.inner(), &disconnect_msg).await;
+    {
         let mut guard = state.client_stream.lock().await;
-        guard.take()
-    } {
-        // Build a disconnect message (room context if available)
-        let disconnect_msg = Message {
-            message_type: MessageType::Disconnect,
-            username: username.clone(),
-            user_id: user_id_opt.unwrap_or(0),
-            message: "client disconnect".to_string(),
-            message_id: Uuid::new_v4().to_string(),
-            room: room.clone(),
-            room_id: room_id_opt.unwrap_or(0),
-            created_at: now_secs(),
-            is_emoji: false,
-        };
-
-        // Ignore any send error; we're disconnecting anyway
-        let _ = send_message_with_length(&mut write_half, &disconnect_msg).await;
+        guard.take();
+    }
+    {
+        let mut guard = state.client_transport.lock().await;
+        guard.take();
     }
 
     // Clear local client-mode state
@@ -1049,16 +1135,13 @@ pub async fn server_participant_disconnect(
         is_emoji: false,
     };
 
-    // Best-effort: broadcast to all connected clients
+    // Best-effort: send an encrypted disconnect notice to each client, then drop them.
     {
         let mut guard = state.server_streams.lock().await;
         for (_uid, conn) in guard.iter() {
-            // Try to send the disconnect notice to each client
-            if let Ok(mut wh) = conn.stream.try_lock() {
-                let _ = send_message_with_length(&mut wh, &disconnect_msg).await;
-            }
+            let _ = send_secure(&conn.writer, &conn.transport, &disconnect_msg).await;
         }
-        // After sending, close all connections by dropping their write halves
+        // Dropping the ClientConnections closes their write halves.
         guard.clear();
     }
     // Clear room->clients index
@@ -1066,10 +1149,14 @@ pub async fn server_participant_disconnect(
         let mut rooms = state.room_clients.lock().await;
         rooms.clear();
     }
-    // Also clear any client-mode writer if it exists (host may have a client_stream if it connected out)
+    // Also clear any client-mode writer/transport if present (host may have connected out).
     {
         let mut client_w = state.client_stream.lock().await;
-        client_w.take(); // drop if present
+        client_w.take();
+    }
+    {
+        let mut client_t = state.client_transport.lock().await;
+        client_t.take();
     }
     // Reset identity and server flags
     {

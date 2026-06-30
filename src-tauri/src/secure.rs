@@ -8,10 +8,7 @@
 //
 // Handshake messages and transport messages are framed identically to the rest of the
 // protocol (a 4-byte big-endian length prefix), so this layers cleanly on top of TCP.
-//
-// TODO(phase-1): currently unit-tested in isolation; the next step wires these into
-// sockets.rs (responder on accept, initiator on connect) and the send/broadcast paths.
-#![allow(dead_code)]
+// Wired into sockets.rs: responder on accept, initiator on connect.
 
 use sha2::{Digest, Sha256};
 use snow::{Builder, TransportState};
@@ -76,7 +73,9 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let params = NOISE_PARAMS.parse().map_err(|e| format!("bad noise params: {e}"))?;
+    let params = NOISE_PARAMS
+        .parse()
+        .map_err(|e| format!("bad noise params: {e}"))?;
     let mut handshake = Builder::new(params)
         .psk(0, psk)
         .build_responder()
@@ -85,7 +84,9 @@ where
     let mut buf = vec![0u8; NOISE_MAX_MESSAGE];
 
     // <- e  (read the initiator's first message; wrong psk fails the tag here)
-    let msg1 = read_frame(reader).await.map_err(|e| format!("read handshake msg1: {e}"))?;
+    let msg1 = read_frame(reader)
+        .await
+        .map_err(|e| format!("read handshake msg1: {e}"))?;
     handshake
         .read_message(&msg1, &mut buf)
         .map_err(|_| "handshake failed (wrong password?)".to_string())?;
@@ -94,9 +95,13 @@ where
     let n = handshake
         .write_message(&[], &mut buf)
         .map_err(|e| format!("write handshake msg2: {e}"))?;
-    write_frame(writer, &buf[..n]).await.map_err(|e| format!("send handshake msg2: {e}"))?;
+    write_frame(writer, &buf[..n])
+        .await
+        .map_err(|e| format!("send handshake msg2: {e}"))?;
 
-    handshake.into_transport_mode().map_err(|e| format!("enter transport mode: {e}"))
+    handshake
+        .into_transport_mode()
+        .map_err(|e| format!("enter transport mode: {e}"))
 }
 
 /// Perform the Noise handshake as the initiator (a client connecting to a host).
@@ -109,7 +114,9 @@ where
     R: AsyncReadExt + Unpin,
     W: AsyncWriteExt + Unpin,
 {
-    let params = NOISE_PARAMS.parse().map_err(|e| format!("bad noise params: {e}"))?;
+    let params = NOISE_PARAMS
+        .parse()
+        .map_err(|e| format!("bad noise params: {e}"))?;
     let mut handshake = Builder::new(params)
         .psk(0, psk)
         .build_initiator()
@@ -121,15 +128,21 @@ where
     let n = handshake
         .write_message(&[], &mut buf)
         .map_err(|e| format!("write handshake msg1: {e}"))?;
-    write_frame(writer, &buf[..n]).await.map_err(|e| format!("send handshake msg1: {e}"))?;
+    write_frame(writer, &buf[..n])
+        .await
+        .map_err(|e| format!("send handshake msg1: {e}"))?;
 
     // <- e, ee  (wrong psk fails the tag here on the initiator side)
-    let msg2 = read_frame(reader).await.map_err(|e| format!("read handshake msg2: {e}"))?;
+    let msg2 = read_frame(reader)
+        .await
+        .map_err(|e| format!("read handshake msg2: {e}"))?;
     handshake
         .read_message(&msg2, &mut buf)
         .map_err(|_| "handshake failed (wrong password?)".to_string())?;
 
-    handshake.into_transport_mode().map_err(|e| format!("enter transport mode: {e}"))
+    handshake
+        .into_transport_mode()
+        .map_err(|e| format!("enter transport mode: {e}"))
 }
 
 /// Encrypt one plaintext message into a Noise transport message. The caller frames

@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { User, Server, Globe } from "lucide-react";
+import { User, Server, Globe, Lock } from "lucide-react";
 import { Department, ConnectionMode } from "../types";
 
 interface LoginViewProps {
@@ -8,7 +8,12 @@ interface LoginViewProps {
   setMode: (mode: ConnectionMode) => void;
   serverIp: string;
   setServerIp: (ip: string) => void;
-  onLogin: (username: string, email: string, departmentId: number) => Promise<void>;
+  onLogin: (
+    username: string,
+    email: string,
+    departmentId: number,
+    password: string,
+  ) => Promise<void>;
 }
 
 export const LoginView: React.FC<LoginViewProps> = ({
@@ -22,13 +27,14 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [username, setUsername] = useState("");
   const [email, setEmail] = useState("");
   const [departmentId, setDepartmentId] = useState<number | null>(null);
+  const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
 
   const handleSubmit = async () => {
-    if (!username || !email || !departmentId) return;
+    if (!username || !email || !departmentId || !password) return;
     setLoading(true);
     try {
-      await onLogin(username, email, departmentId);
+      await onLogin(username, email, departmentId, password);
     } catch (e) {
       console.error(e);
     } finally {
@@ -42,7 +48,9 @@ export const LoginView: React.FC<LoginViewProps> = ({
         <div className="inline-flex items-center justify-center p-4 bg-gradient-to-br from-violet-500 to-fuchsia-500 rounded-2xl shadow-lg mb-4">
           <Globe className="text-white w-8 h-8" />
         </div>
-        <h1 className="text-3xl font-bold text-white tracking-tight">Welcome Back</h1>
+        <h1 className="text-3xl font-bold text-white tracking-tight">
+          Welcome Back
+        </h1>
         <p className="text-white/60 mt-2">Connect with your team workspace</p>
       </div>
 
@@ -88,6 +96,19 @@ export const LoginView: React.FC<LoginViewProps> = ({
         </div>
 
         <div className="relative group">
+          <Lock className="absolute left-3 top-3.5 w-5 h-5 text-white/50 group-focus-within:text-white transition-colors" />
+          <input
+            type="password"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            placeholder={
+              mode === "server" ? "Set a room password" : "Room password"
+            }
+            className="w-full bg-white/5 border border-white/10 rounded-xl py-3 pl-10 pr-4 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:bg-white/10 transition-all"
+          />
+        </div>
+
+        <div className="relative group">
           <User className="absolute left-3 top-3.5 w-5 h-5 text-white/50 group-focus-within:text-white transition-colors" />
           <input
             type="text"
@@ -114,26 +135,46 @@ export const LoginView: React.FC<LoginViewProps> = ({
             onChange={(e) => setDepartmentId(Number(e.target.value))}
             className="w-full bg-white/5 border border-white/10 rounded-xl py-3 px-4 text-white focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:bg-white/10 transition-all appearance-none cursor-pointer"
           >
-            <option value="" className="bg-gray-800 text-gray-300">Select Department</option>
+            <option value="" className="bg-gray-800 text-gray-300">
+              Select Department
+            </option>
             {departments.map((dep) => (
-              <option key={dep.id} value={dep.id} className="bg-gray-800 text-white">
+              <option
+                key={dep.id}
+                value={dep.id}
+                className="bg-gray-800 text-white"
+              >
                 {dep.name}
               </option>
             ))}
           </select>
           <div className="absolute right-4 top-3.5 pointer-events-none">
-            <svg className="w-5 h-5 text-white/50" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M19 9l-7 7-7-7"></path></svg>
+            <svg
+              className="w-5 h-5 text-white/50"
+              fill="none"
+              stroke="currentColor"
+              viewBox="0 0 24 24"
+            >
+              <path
+                strokeLinecap="round"
+                strokeLinejoin="round"
+                strokeWidth="2"
+                d="M19 9l-7 7-7-7"
+              ></path>
+            </svg>
           </div>
         </div>
 
         <button
           onClick={handleSubmit}
-          disabled={loading || !username || !email || !departmentId}
+          disabled={
+            loading || !username || !email || !departmentId || !password
+          }
           className="w-full bg-gradient-to-r from-violet-500 to-fuchsia-500 hover:from-violet-400 hover:to-fuchsia-400 text-white font-bold py-3.5 rounded-xl shadow-lg hover:shadow-violet-500/25 transform hover:-translate-y-0.5 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none mt-4"
         >
           {loading ? (
             <span className="flex items-center justify-center gap-2">
-              <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin"/>
+              <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
               Connecting...
             </span>
           ) : (

@@ -66,6 +66,7 @@ This creates distributable packages for your platform.
 2. **Start Server Mode**: 
    - Open the application
    - Select "Host Server" mode
+   - **Set a room password** — every client must enter the same password to connect
    - The server will bind to `0.0.0.0:3625` (accessible from all network interfaces)
 3. **Note the IP Address**: The server will display its IP address (e.g., `192.168.1.100:3625`)
 
@@ -78,7 +79,7 @@ This creates distributable packages for your platform.
 3. **Connect to Server**:
    - Select "Join Server" mode
    - Enter the server IP address (e.g., `192.168.1.100:3625`)
-   - Or use the "Discover Servers" feature to find servers automatically
+   - Enter the **room password** set by the host
 
 ## 🏗️ Architecture
 
@@ -187,7 +188,7 @@ Each department gets a general chat room:
 
 - **Local Network Only**: Application is designed for internal company networks
 - **No Internet Required**: All communication happens within the local network
-- **User Authentication**: Basic user registration with department assignment
+- **Encrypted, Authenticated Transport**: Peers connect over the Noise protocol with a key derived from a shared **room password** — all traffic is encrypted (ChaCha20-Poly1305) and a wrong password fails the handshake
 - **Message Persistence**: Messages are stored locally in SQLite database
 
 ## 🐛 Troubleshooting

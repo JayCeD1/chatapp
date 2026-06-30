@@ -1,4 +1,4 @@
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
@@ -56,6 +56,10 @@ export const useChatConnection = () => {
   const [departments, setDepartments] = useState<Department[]>([]);
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
+
+  // Held in a ref (not state/localStorage) so reconnect can re-derive the Noise key
+  // without persisting the room password to disk.
+  const passwordRef = useRef("");
 
   // Load departments on mount
   useEffect(() => {
@@ -169,6 +173,7 @@ export const useChatConnection = () => {
               userId: currentUser.id,
               room: currentRoom?.department_name || currentUser.department_name, // Fallback
               roomId: currentRoom?.id || currentUser.department_id,
+              password: passwordRef.current,
             })
               .then(() => {
                 console.log("Reconnected successfully");
@@ -196,6 +201,7 @@ export const useChatConnection = () => {
     username: string,
     email: string,
     departmentId: number,
+    password: string,
   ) => {
     try {
       const user = (await invoke("upsert_user", {
@@ -204,6 +210,7 @@ export const useChatConnection = () => {
         departmentId,
       })) as User;
 
+      passwordRef.current = password;
       setCurrentUser(user);
       localStorage.setItem("nutler.userId", String(user.id));
 
@@ -214,6 +221,7 @@ export const useChatConnection = () => {
           port: 3625,
           room: user.department_name,
           roomId: user.department_id,
+          password,
         });
       } else {
         await invoke("client_connect_to_server", {
@@ -222,6 +230,7 @@ export const useChatConnection = () => {
           userId: user.id,
           room: user.department_name,
           roomId: user.department_id,
+          password,
         });
       }
 

@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { User, Server, Hash, Lock, Mail, AlertCircle } from "lucide-react";
 import { Department, ConnectionMode } from "../types";
+import { loadProfile } from "../session";
 
 interface LoginViewProps {
   departments: Department[];
@@ -27,12 +28,17 @@ export const LoginView: React.FC<LoginViewProps> = ({
   setServerIp,
   onLogin,
 }) => {
-  const [username, setUsername] = useState("");
-  const [email, setEmail] = useState("");
-  const [departmentId, setDepartmentId] = useState<number | null>(null);
+  // Pre-fill from the remembered profile (never the password).
+  const [username, setUsername] = useState(() => loadProfile().username ?? "");
+  const [email, setEmail] = useState(() => loadProfile().email ?? "");
+  const [departmentId, setDepartmentId] = useState<number | null>(
+    () => loadProfile().departmentId ?? null,
+  );
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // If the form is pre-filled, drop the user straight on the password field.
+  const [returning] = useState(() => !!loadProfile().username);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -125,6 +131,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
             autoComplete={
               mode === "server" ? "new-password" : "current-password"
             }
+            autoFocus={returning}
             className={inputClass}
           />
         </Field>
@@ -135,7 +142,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             placeholder="Username"
-            autoFocus
+            autoFocus={!returning}
             className={inputClass}
           />
         </Field>

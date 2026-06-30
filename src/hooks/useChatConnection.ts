@@ -14,6 +14,7 @@ import {
 } from "../types";
 import { mentionsUser } from "../utils";
 import { notify, ensureNotificationPermission } from "../notifications";
+import { loadProfile, saveProfile } from "../session";
 
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
@@ -56,8 +57,13 @@ const normalizeMessage = (m: any, fallbackRoomId?: number): Message => {
 
 export const useChatConnection = () => {
   const [view, setView] = useState<ViewState>("login");
-  const [mode, setMode] = useState<ConnectionMode>("client");
-  const [serverIp, setServerIp] = useState("127.0.0.1:3625");
+  // Restore the last-used mode/server from the saved profile (password excluded).
+  const [mode, setMode] = useState<ConnectionMode>(
+    () => loadProfile().mode ?? "client",
+  );
+  const [serverIp, setServerIp] = useState(
+    () => loadProfile().serverIp ?? "127.0.0.1:3625",
+  );
 
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [currentRoom, setCurrentRoom] = useState<ChatRoom | null>(null);
@@ -532,6 +538,8 @@ export const useChatConnection = () => {
       passwordRef.current = password;
       setCurrentUser(user);
       localStorage.setItem("nutler.userId", String(user.id));
+      // Remember the non-secret fields to pre-fill next launch.
+      saveProfile({ username, email, departmentId, mode, serverIp });
       ensureNotificationPermission(); // ask once, up front
 
       // Best-effort DB presence flag (last-seen / online).

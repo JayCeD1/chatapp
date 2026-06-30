@@ -85,6 +85,28 @@ pub fn run() {
                 tauri::async_runtime::block_on(async { SqlitePool::connect_with(options).await })
                     .expect("Failed to connect to database");
 
+            // The DB holds message history and is not encrypted at rest, so restrict it to
+            // the owner on Unix (other local accounts shouldn't be able to read it). The
+            // WAL/SHM sidecars carry data too; lock them and the parent dir down as well.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let _ = std::fs::set_permissions(
+                    &app_config_dir,
+                    std::fs::Permissions::from_mode(0o700),
+                );
+                for p in [
+                    db_path.clone(),
+                    db_path.with_extension("db-wal"),
+                    db_path.with_extension("db-shm"),
+                ] {
+                    if p.exists() {
+                        let _ =
+                            std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600));
+                    }
+                }
+            }
+
             app.manage(pool); // makes the pool available to commands
 
             Ok(())

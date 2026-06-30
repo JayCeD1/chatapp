@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { X, Hash, AlertCircle } from "lucide-react";
 import { Department } from "../types";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 
 interface CreateChannelModalProps {
   departments: Department[];
@@ -28,6 +29,7 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
   const [isPrivate, setIsPrivate] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const trapRef = useFocusTrap<HTMLDivElement>(onClose);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -55,6 +57,7 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
       aria-label="Create a channel"
     >
       <div
+        ref={trapRef}
         className="w-full max-w-md bg-[var(--surface)] border border-[var(--border)] rounded-2xl shadow-2xl animate-scale-in"
         onMouseDown={(e) => e.stopPropagation()}
       >

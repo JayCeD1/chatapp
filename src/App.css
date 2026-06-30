@@ -53,6 +53,21 @@ body,
   color: var(--text);
 }
 
+/* Consistent keyboard-focus indicator for every interactive element (WCAG 2.4.7).
+   Inputs already opt into Tailwind focus rings; this covers buttons, channel rows,
+   message-hover actions, links, and selects without per-element classes. Mouse users
+   don't see it (:focus-visible), so it doesn't disturb the visual design. */
+:focus-visible {
+  outline: 2px solid var(--accent-strong);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+/* Elements that paint their own focus state shouldn't get a double ring. */
+input:focus-visible,
+textarea:focus-visible {
+  outline: none;
+}
+
 @layer utilities {
   .scrollbar-thin::-webkit-scrollbar {
     width: 6px;

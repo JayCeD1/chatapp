@@ -22,3 +22,9 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Local SQLite DB artifacts (the real DB lives in the OS app-data dir; these are
+# strays from running the app/tests inside the repo)
+*.db
+*.db-wal
+*.db-shm

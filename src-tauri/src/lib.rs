@@ -4,9 +4,10 @@ use crate::db_queries::{
     upsert_user,
 };
 use crate::sockets::{
-    client_connect_to_server, client_disconnect, client_join_room, discover_servers,
-    get_server_info, send_as_client, send_as_server_participant, server_listen_as_participant,
-    server_participant_disconnect, server_participant_join_room, AppState,
+    client_connect_to_server, client_disconnect, client_join_room, client_leave_room,
+    discover_servers, get_server_info, send_as_client, send_as_server_participant,
+    server_leave_room, server_listen_as_participant, server_participant_disconnect,
+    server_participant_join_room, AppState,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::SqlitePool;
@@ -27,6 +28,7 @@ pub fn run() {
             server_streams: Arc::new(tokio::sync::Mutex::new(Default::default())),
             client_stream: Arc::new(tokio::sync::Mutex::new(None)),
             client_transport: Arc::new(tokio::sync::Mutex::new(None)),
+            client_listener: Arc::new(tokio::sync::Mutex::new(None)),
             room_clients: Arc::new(tokio::sync::Mutex::new(Default::default())),
             username: tokio::sync::RwLock::new(String::new()),
             user_id: tokio::sync::RwLock::new(None),
@@ -99,6 +101,8 @@ pub fn run() {
             send_as_client,
             server_participant_join_room,
             client_join_room,
+            client_leave_room,
+            server_leave_room,
             // Logout/teardown
             client_disconnect,
             server_participant_disconnect

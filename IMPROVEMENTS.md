@@ -398,9 +398,9 @@ No eslint config/dep; `prettier` present with no `lint`/`format` script. Anti-pa
 
 ### Phase 1 — Security + reliability foundation _(in progress)_
 - [x] **Auth + encryption (2.1/2.2/2.3)** — **shared room password + Noise (NNpsk0) encryption**, end-to-end. `secure.rs` transport (built + unit-tested) is now wired into both handshake sites: responder on accept, initiator on connect; all transport frames are encrypted; a wrong password fails the handshake and the connection is dropped. Login UI has a password field (host sets it, clients enter it); reconnect re-derives the key from a ref (not persisted). _Live two-instance verification still recommended (can't GUI-test here). Per-user identity remains self-asserted among authenticated peers — that's inherent to the shared-password model chosen over per-user tokens._ — **L**
-- [ ] Make `Connect` idempotent on the host; cancel old client listener on reconnect (1.7) — **M**
-- [ ] Implement `RoomLeave` end-to-end + handle `Disconnect`/`RoomLeave` in server match; fix stale-cleanup room (1.8/1.9) — **M**
-- [ ] Refactor broadcast: collect targets, drop locks before emit/spawn, sequential ordered sends, write timeout + heartbeat (3.2/3.3) — **M**
+- [x] Make `Connect` idempotent on the host (re-register replaces entry + dedupes room membership); cancel old client listener on reconnect via a stored `JoinHandle` (1.7) — **M**
+- [x] `RoomLeave` end-to-end (`client_leave_room`/`server_leave_room` + server match arm + frontend `leaveRoom`); authoritative stale-cleanup (cleanup reads the live `server_streams` room, not the Connect-time snapshot) (1.8/1.9). _Disconnect is handled by the connection EOF/`clean_client` path._ — **M**
+- [~] Broadcast: snapshot targets + drop all locks before fan-out ✅ (3.2); per-connection ordered encrypt+write ✅ (3.3 ordering). _Dead-client eviction + heartbeat still pending._ — **M**
 - [~] Bounded accept loop ✅ (2.5); per-IP cap + rate limit + read-timeout still pending (read-timeout pairs with the heartbeat in 3.3) — **M**
 - [x] Replace network-path `unwrap`/`expect` with graceful handling; `now_secs()` helper (2.6) — **M**
 - [x] Remove `sql:allow-execute` (+ `sql:default` + unused `dialog`); set strict CSP (2.7) — **S**

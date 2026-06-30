@@ -274,11 +274,24 @@ export const useChatConnection = () => {
 
   const leaveRoom = async () => {
     if (!currentUser || !currentRoom) return;
+    const room = currentRoom;
     try {
-      await invoke("leave_room", {
-        userId: currentUser.id,
-        roomId: currentRoom.id,
-      });
+      // Notify the socket layer so peers see us leave and the host stops relaying.
+      if (mode === "server") {
+        await invoke("server_leave_room", {
+          userId: currentUser.id,
+          room: room.name,
+          roomId: room.id,
+        });
+      } else {
+        await invoke("client_leave_room", {
+          userId: currentUser.id,
+          room: room.name,
+          roomId: room.id,
+        });
+      }
+      // Mark the room inactive in the DB.
+      await invoke("leave_room", { userId: currentUser.id, roomId: room.id });
       setCurrentRoom(null);
       setView("rooms");
       setMessages([]);

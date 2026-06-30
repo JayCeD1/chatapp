@@ -83,6 +83,9 @@ pub struct AppState {
     // Separate client stream management (write half + matching Noise transport)
     pub client_stream: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
     pub client_transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
+    // Handle to the current client read-listener task, so reconnect/disconnect can
+    // cancel a stale listener before starting a new one.
+    pub client_listener: Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     // Track which users are in which rooms for efficient broadcasting
     pub room_clients: Arc<tokio::sync::Mutex<HashMap<String, Vec<u64>>>>,
 
@@ -399,14 +402,24 @@ async fn handle_client_connection(
                     //Add to the server's stream list using user_id as a key
                     {
                         let mut streams = state.server_streams.lock().await;
+                        let mut rooms = state.room_clients.lock().await;
+
+                        // Idempotent (re)registration: if this user_id is already known
+                        // (reconnect / duplicate Connect), drop it from every room first so
+                        // membership can't accumulate duplicates that double-deliver.
+                        if streams.contains_key(&message.user_id) {
+                            for users in rooms.values_mut() {
+                                users.retain(|&id| id != message.user_id);
+                            }
+                        }
+
                         streams.insert(message.user_id, conn);
 
-                        //Add to room tracking
-                        let mut rooms = state.room_clients.lock().await;
-                        rooms
-                            .entry(message.room.clone())
-                            .or_insert_with(Vec::new)
-                            .push(message.user_id);
+                        //Add to room tracking (deduped)
+                        let room_vec = rooms.entry(message.room.clone()).or_insert_with(Vec::new);
+                        if !room_vec.contains(&message.user_id) {
+                            room_vec.push(message.user_id);
+                        }
                     }
                     println!(
                         "Client registered: {} (ID: {}) in room {}",
@@ -428,7 +441,7 @@ async fn handle_client_connection(
     }
     //Clean up with proper error handling
     if let Some(client) = client_info {
-        if let Err(e) = clean_client(&state, &app, client, &pool).await {
+        if let Err(e) = clean_client(&state, &app, client.user_id, &pool).await {
             eprintln!("Cleanup error: {}", e);
         }
     }
@@ -439,15 +452,20 @@ async fn handle_client_connection(
 async fn clean_client(
     state: &Arc<AppState>,
     app: &tauri::AppHandle,
-    client: ClientConnection,
+    user_id: u64,
     pool: &SqlitePool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    {
-        //Remove from server's stream list
+    // Remove the LIVE entry: its current_room reflects any RoomJoin since connect,
+    // so we remove the user from the room they are ACTUALLY in (not a stale snapshot).
+    let removed = {
         let mut streams = state.server_streams.lock().await;
-        streams.remove(&client.user_id);
-
-        //Remove from room tracking
+        streams.remove(&user_id)
+    };
+    let Some(client) = removed else {
+        // Already cleaned up (e.g. by server_participant_disconnect).
+        return Ok(());
+    };
+    {
         let mut rooms = state.room_clients.lock().await;
         if let Some(users) = rooms.get_mut(&client.current_room) {
             users.retain(|&id| id != client.user_id);
@@ -666,6 +684,36 @@ async fn handle_server_message(
             });
             distribute_message_to_all(&app, &state, &message.room, &message, None).await;
         }
+        MessageType::RoomLeave => {
+            // Remove the user from the room they are leaving so the host stops relaying
+            // that room to them, then tell the remaining members.
+            {
+                let mut rooms = state.room_clients.lock().await;
+                if let Some(users) = rooms.get_mut(&message.room) {
+                    users.retain(|&id| id != message.user_id);
+                }
+            }
+            let pool_clone = pool.clone();
+            let msg_clone = message.clone();
+            tauri::async_runtime::spawn(async move {
+                if let Err(e) = save_message_internal(
+                    &pool_clone,
+                    msg_clone.room_id as i64,
+                    msg_clone.user_id as i64,
+                    msg_clone.message,
+                    "RoomLeave".to_string(),
+                    false,
+                    msg_clone.message_id,
+                )
+                .await
+                {
+                    eprintln!("Failed to save room leave message to db: {}", e);
+                }
+            });
+            distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
+                .await;
+        }
+        // Disconnect is handled by the connection's EOF cleanup path (clean_client).
         _ => {}
     }
     Ok(())
@@ -791,7 +839,20 @@ pub async fn client_connect_to_server(
         .await
         .map_err(|e| format!("Failed to send connect message to server: {}", e))?;
 
-    start_client_listener(app, reader, Arc::clone(&state.client_transport));
+    // Cancel any previous listener (e.g. from a dropped connection) BEFORE starting the
+    // new one, so the stale task can't emit a spurious connection_lost and trigger an
+    // unwanted reconnect loop.
+    {
+        let mut guard = state.client_listener.lock().await;
+        if let Some(old) = guard.take() {
+            old.abort();
+        }
+    }
+    let handle = start_client_listener(app, reader, Arc::clone(&state.client_transport));
+    {
+        let mut guard = state.client_listener.lock().await;
+        *guard = Some(handle);
+    }
 
     println!("✅ Client connected successfully");
     Ok(())
@@ -850,7 +911,7 @@ fn start_client_listener(
     app: tauri::AppHandle,
     mut reader: tokio::net::tcp::OwnedReadHalf,
     transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
-) {
+) -> tauri::async_runtime::JoinHandle<()> {
     tauri::async_runtime::spawn(async move {
         println!("🎧 Client listener started");
 
@@ -895,7 +956,7 @@ fn start_client_listener(
                 }
             }
         }
-    });
+    })
 }
 
 #[tauri::command]
@@ -1016,6 +1077,85 @@ pub async fn client_join_room(
     Ok(())
 }
 
+// A client leaves its current room (back to the lobby): tell the server so it stops
+// relaying that room and notifies the other members.
+#[tauri::command]
+pub async fn client_leave_room(
+    state: State<'_, Arc<AppState>>,
+    user_id: u64,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    let username = state.username.read().await.clone();
+    let leave_msg = Message {
+        message_type: MessageType::RoomLeave,
+        username: username.clone(),
+        user_id,
+        message: format!("👋 {} left {}", username, room),
+        room: room.clone(),
+        room_id,
+        created_at: now_secs(),
+        is_emoji: false,
+        message_id: Uuid::new_v4().to_string(),
+    };
+    send_secure_client(state.inner(), &leave_msg)
+        .await
+        .map_err(|e| format!("Failed to send room leave: {}", e))?;
+    Ok(())
+}
+
+// The host (server participant) leaves a room: update tracking locally and broadcast.
+#[tauri::command]
+pub async fn server_leave_room(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    user_id: u64,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    let username = state.username.read().await.clone();
+    let leave_msg = Message {
+        message_type: MessageType::RoomLeave,
+        username: username.clone(),
+        user_id,
+        message: format!("👋 {} left {}", username, room),
+        room: room.clone(),
+        room_id,
+        created_at: now_secs(),
+        is_emoji: false,
+        message_id: Uuid::new_v4().to_string(),
+    };
+
+    {
+        let mut rooms = state.room_clients.lock().await;
+        if let Some(users) = rooms.get_mut(&room) {
+            users.retain(|&id| id != user_id);
+        }
+    }
+
+    let pool_clone = db.inner().clone();
+    let msg_clone = leave_msg.clone();
+    tauri::async_runtime::spawn(async move {
+        if let Err(e) = save_message_internal(
+            &pool_clone,
+            msg_clone.room_id as i64,
+            msg_clone.user_id as i64,
+            msg_clone.message,
+            "RoomLeave".to_string(),
+            false,
+            msg_clone.message_id,
+        )
+        .await
+        {
+            eprintln!("Failed to save room leave: {}", e);
+        }
+    });
+
+    distribute_message_to_all(&app, state.inner(), &room, &leave_msg, Some(user_id)).await;
+    Ok(())
+}
+
 #[tauri::command]
 pub async fn get_server_info(state: State<'_, Arc<AppState>>) -> Result<Option<String>, String> {
     let addr = state.server_addr.read().await.map(|addr| addr.to_string());
@@ -1092,6 +1232,13 @@ pub async fn client_disconnect(
     {
         let mut guard = state.client_transport.lock().await;
         guard.take();
+    }
+    // Stop the read listener so it doesn't emit connection_lost as we tear down.
+    {
+        let mut guard = state.client_listener.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
     }
 
     // Clear local client-mode state

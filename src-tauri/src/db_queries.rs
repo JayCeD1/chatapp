@@ -487,14 +487,17 @@ pub async fn get_room_messages(
     let limit = limit.unwrap_or(50);
 
     // before_id = None → newest `limit`. before_id = Some(id) → the `limit` messages
-    // immediately older than `id` (for "load older" pagination).
+    // immediately older than `id`. Order + paginate by `id` (the monotonic insertion
+    // order) so the cursor and the sort key always agree — ordering by the wall-clock
+    // created_at would disagree with the `id < before_id` cursor under clock skew and
+    // silently drop history.
     let result = sqlx::query(
         "SELECT m.id, m.message_id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
                 m.edited_at, m.deleted_at, COALESCE(u.name, 'Unknown') as username
          FROM messages m
          LEFT JOIN users u ON m.user_id = u.id
          WHERE m.room_id = $1 AND ($2 IS NULL OR m.id < $2)
-         ORDER BY m.created_at DESC, m.id DESC
+         ORDER BY m.id DESC
          LIMIT $3",
     )
     .bind(&room_id)

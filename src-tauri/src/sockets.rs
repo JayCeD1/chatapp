@@ -113,6 +113,11 @@ fn now_secs() -> u64 {
         .unwrap_or(0)
 }
 
+/// Monotonic id assigned to each accepted connection, so a stale connection's
+/// teardown can tell whether it still owns the server_streams entry for its user_id
+/// (a reconnect may have replaced it).
+static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 //Better indexing and room management
 #[derive(Clone)]
 pub struct ClientConnection {
@@ -123,6 +128,7 @@ pub struct ClientConnection {
     pub current_room: String,
     pub room_id: u64,
     pub user_id: u64,
+    pub conn_id: u64,
 }
 
 pub struct AppState {
@@ -444,6 +450,7 @@ async fn handle_client_connection(
 
     let writer_arc = Arc::new(tokio::sync::Mutex::new(writer));
     let transport_arc = Arc::new(tokio::sync::Mutex::new(transport));
+    let conn_id = NEXT_CONN_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
 
     // Keep the connection alive and let the read-timeout below detect a dead peer.
     let heartbeat = spawn_heartbeat(Arc::clone(&writer_arc));
@@ -500,6 +507,7 @@ async fn handle_client_connection(
                         current_room: message.room.clone(),
                         room_id: message.room_id,
                         user_id: message.user_id,
+                        conn_id,
                     };
                     client_info = Some(conn.clone());
 
@@ -530,9 +538,17 @@ async fn handle_client_connection(
                         message.username, message.user_id, message.room
                     );
                 }
-                // A single bad message shouldn't kill the connection.
-                if let Err(e) =
-                    handle_server_message(app.clone(), state.clone(), message, pool.clone()).await
+                // A single bad message shouldn't kill the connection. Pass the
+                // connection's authenticated user_id so edit/delete can't be spoofed.
+                let auth_user_id = client_info.as_ref().map(|c| c.user_id);
+                if let Err(e) = handle_server_message(
+                    app.clone(),
+                    state.clone(),
+                    message,
+                    pool.clone(),
+                    auth_user_id,
+                )
+                .await
                 {
                     eprintln!("Error handling message from {}: {}", peer_addr, e);
                 }
@@ -552,7 +568,7 @@ async fn handle_client_connection(
 
     //Clean up with proper error handling
     if let Some(client) = client_info {
-        if let Err(e) = clean_client(&state, &app, client.user_id, &pool).await {
+        if let Err(e) = clean_client(&state, &app, client.user_id, conn_id, &pool).await {
             eprintln!("Cleanup error: {}", e);
         }
     }
@@ -564,16 +580,20 @@ async fn clean_client(
     state: &Arc<AppState>,
     app: &tauri::AppHandle,
     user_id: u64,
+    conn_id: u64,
     pool: &SqlitePool,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Remove the LIVE entry: its current_room reflects any RoomJoin since connect,
-    // so we remove the user from the room they are ACTUALLY in (not a stale snapshot).
+    // Remove the LIVE entry ONLY if it's still THIS connection: a reconnect may have
+    // replaced server_streams[user_id] with a newer, live connection — tearing that one
+    // down would silently drop an actively-connected user. Compare-and-remove by conn_id.
     let removed = {
         let mut streams = state.server_streams.lock().await;
-        streams.remove(&user_id)
+        match streams.get(&user_id) {
+            Some(c) if c.conn_id == conn_id => streams.remove(&user_id),
+            _ => None, // superseded by a newer connection (or already gone) → no-op
+        }
     };
     let Some(client) = removed else {
-        // Already cleaned up (e.g. by server_participant_disconnect).
         return Ok(());
     };
     {
@@ -738,6 +758,9 @@ async fn handle_server_message(
     state: Arc<AppState>,
     message: Message,
     pool: SqlitePool,
+    // The user_id bound to THIS connection at Connect; used for authorship checks so a
+    // peer can't edit/delete another user's message by spoofing message.user_id.
+    auth_user_id: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     println!(
         "🟢 Server handling message: {:?} from {}",
@@ -779,7 +802,7 @@ async fn handle_server_message(
                     msg_clone.user_id as i64,
                     msg_clone.message,
                     "Chat".to_string(),
-                    false,
+                    msg_clone.is_emoji,
                     msg_clone.message_id,
                 )
                 .await
@@ -849,7 +872,13 @@ async fn handle_server_message(
             // Remove the user from the room they are leaving so the host stops relaying
             // that room to them, then tell the remaining members.
             {
+                let mut streams = state.server_streams.lock().await;
                 let mut rooms = state.room_clients.lock().await;
+                // Clear the connection's current_room (now in the lobby) so a later
+                // disconnect doesn't broadcast a stale "left" into the room they left.
+                if let Some(conn) = streams.get_mut(&message.user_id) {
+                    conn.current_room = String::new();
+                }
                 if let Some(users) = rooms.get_mut(&message.room) {
                     users.retain(|&id| id != message.user_id);
                 }
@@ -875,16 +904,13 @@ async fn handle_server_message(
                 .await;
             broadcast_user_list(&app, &state, &message.room).await;
         }
-        // Edit/Delete events use `message_id` as the TARGET message id. The DB update
-        // is authorship-checked (user_id), so an unauthorized request is a no-op.
+        // Edit/Delete events use `message_id` as the TARGET message id. Authorize with
+        // the connection's bound user_id (NOT the client-supplied message.user_id), so a
+        // peer can only modify messages they actually authored.
         MessageType::Edit => {
-            if let Ok(rows) = edit_message_db(
-                &pool,
-                &message.message_id,
-                &message.message,
-                message.user_id as i64,
-            )
-            .await
+            let editor = auth_user_id.unwrap_or(message.user_id) as i64;
+            if let Ok(rows) =
+                edit_message_db(&pool, &message.message_id, &message.message, editor).await
             {
                 if rows > 0 {
                     distribute_message_to_all(&app, &state, &message.room, &message, None).await;
@@ -892,9 +918,8 @@ async fn handle_server_message(
             }
         }
         MessageType::Delete => {
-            if let Ok(rows) =
-                delete_message_db(&pool, &message.message_id, message.user_id as i64).await
-            {
+            let editor = auth_user_id.unwrap_or(message.user_id) as i64;
+            if let Ok(rows) = delete_message_db(&pool, &message.message_id, editor).await {
                 if rows > 0 {
                     let mut del = message.clone();
                     del.message = String::new();
@@ -951,7 +976,7 @@ pub async fn send_as_server_participant(
             msg_clone.user_id as i64,
             msg_clone.message,
             "Chat".to_string(),
-            false,
+            msg_clone.is_emoji,
             msg_clone.message_id,
         )
         .await
@@ -1633,13 +1658,23 @@ pub async fn server_participant_disconnect(
     };
 
     // Best-effort: send an encrypted disconnect notice to each client, then drop them.
-    {
+    // Snapshot the writers/transports under the lock, RELEASE it, then do the network
+    // sends — never hold the global server_streams Mutex across .await I/O.
+    let targets: Vec<(
+        Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+        Arc<tokio::sync::Mutex<TransportState>>,
+    )> = {
         let mut guard = state.server_streams.lock().await;
-        for (_uid, conn) in guard.iter() {
-            let _ = send_secure(&conn.writer, &conn.transport, &disconnect_msg).await;
-        }
+        let snapshot = guard
+            .values()
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+            .collect();
         // Dropping the ClientConnections closes their write halves.
         guard.clear();
+        snapshot
+    };
+    for (writer, transport) in &targets {
+        let _ = send_secure(writer, transport, &disconnect_msg).await;
     }
     // Clear room->clients index
     {

@@ -118,9 +118,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     }
   }, [messages]);
 
-  // Start pinned to the bottom whenever the open channel changes.
+  // Reset per-room view state whenever the open channel changes (ChatPane is reused,
+  // not remounted): pin to bottom, close any open editor, release scroll/load guards.
   useEffect(() => {
     setAtBottom(true);
+    setEditingId(null);
+    setEditText("");
+    restoreRef.current = null;
+    loadingOlderRef.current = false;
   }, [room.id]);
 
   const onScroll = () => {
@@ -137,6 +142,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       onLoadOlder().finally(() => {
         loadingOlderRef.current = false;
         setLoadingOlder(false);
+        // Release the scroll anchor even if the page was empty (no [messages] change,
+        // so the layout effect never ran) — otherwise auto-scroll stays dead.
+        restoreRef.current = null;
       });
     }
   };

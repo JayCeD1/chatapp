@@ -78,6 +78,7 @@ where
         .map_err(|e| format!("bad noise params: {e}"))?;
     let mut handshake = Builder::new(params)
         .psk(0, psk)
+        .map_err(|e| format!("set psk: {e}"))?
         .build_responder()
         .map_err(|e| format!("build responder: {e}"))?;
 
@@ -119,6 +120,7 @@ where
         .map_err(|e| format!("bad noise params: {e}"))?;
     let mut handshake = Builder::new(params)
         .psk(0, psk)
+        .map_err(|e| format!("set psk: {e}"))?
         .build_initiator()
         .map_err(|e| format!("build initiator: {e}"))?;
 

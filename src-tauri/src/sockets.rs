@@ -1,7 +1,8 @@
 use crate::db_queries::{
-    delete_message_db, edit_message_db, get_room_messages_internal, get_room_reactions_internal,
-    get_unread_counts_internal, room_join_allowed_internal, save_message_internal,
-    toggle_reaction_db, touch_last_read_internal, upsert_user_internal,
+    add_room_member_internal, delete_message_db, edit_message_db, get_room_messages_internal,
+    get_room_reactions_internal, get_unread_counts_internal, list_users_internal,
+    room_join_allowed_internal, save_message_internal, toggle_reaction_db,
+    touch_last_read_internal, upsert_user_internal,
 };
 use crate::secure;
 use serde::{Deserialize, Serialize};
@@ -220,6 +221,13 @@ pub enum MessageType {
     HistoryPage,
     // Host → a single client: JSON [{room_id, count}] of per-room unread counts.
     UnreadCounts,
+    // Host → clients: JSON [{id, name, is_online}] directory of users to invite/DM.
+    UserDirectory,
+    // Client → host: invite a user to a (private) room. `message` carries the target
+    // user id; `room_id` the room. The host authorizes by the connection's canonical id.
+    AddMember,
+    // Host → a single client: their room membership changed; reload the channel list.
+    RoomsChanged,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -940,6 +948,66 @@ async fn push_unread(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64) {
     let _ = send_secure(&writer, &transport, &msg).await;
 }
 
+/// Push the user directory (everyone in the host DB) to every connected client + the host's
+/// own UI, so invite/DM pickers have someone to choose. Cheap; called when the roster changes.
+async fn push_user_directory(app: &tauri::AppHandle, state: &Arc<AppState>, pool: &SqlitePool) {
+    let users = list_users_internal(pool).await.unwrap_or_default();
+    let payload = serde_json::to_string(&users).unwrap_or_else(|_| "[]".to_string());
+    let msg = Message {
+        version: PROTOCOL_VERSION,
+        message_type: MessageType::UserDirectory,
+        username: String::new(),
+        user_id: 0,
+        message: payload,
+        message_id: Uuid::new_v4().to_string(),
+        room: String::new(),
+        room_id: 0,
+        created_at: now_secs(),
+        is_emoji: false,
+        email: None,
+    };
+    let conns: Vec<_> = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .values()
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+            .collect()
+    };
+    for (writer, transport) in conns {
+        let _ = send_secure(&writer, &transport, &msg).await;
+    }
+    if let Ok(s) = serde_json::to_string(&msg) {
+        let _ = app.emit("message", s);
+    }
+}
+
+/// Tell one user (if connected) that their room membership changed, so their client reloads
+/// the channel list (e.g. after being invited to a private channel or DM).
+async fn send_rooms_changed(state: &Arc<AppState>, user_id: u64) {
+    let conn = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .get(&user_id)
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+    };
+    if let Some((writer, transport)) = conn {
+        let msg = Message {
+            version: PROTOCOL_VERSION,
+            message_type: MessageType::RoomsChanged,
+            username: String::new(),
+            user_id: 0,
+            message: String::new(),
+            message_id: Uuid::new_v4().to_string(),
+            room: String::new(),
+            room_id: 0,
+            created_at: now_secs(),
+            is_emoji: false,
+            email: None,
+        };
+        let _ = send_secure(&writer, &transport, &msg).await;
+    }
+}
+
 /// After a chat lands in `room`, keep every connected client's unread badge honest:
 /// clients currently viewing the room have it marked read (they see it live); clients
 /// elsewhere get a fresh unread push (their badge for this room may have grown). This is
@@ -1051,6 +1119,8 @@ async fn handle_server_message(
             if let Some(requester) = auth_user_id {
                 push_unread(&state, &pool, requester).await;
             }
+            // The roster grew → refresh everyone's invite/DM directory.
+            push_user_directory(&app, &state, &pool).await;
         }
         MessageType::Chat => {
             // Distribute first (live delivery to in-room clients), then persist and refresh
@@ -1278,6 +1348,20 @@ async fn handle_server_message(
                     MessageType::HistoryPage,
                 )
                 .await;
+            }
+        }
+        // Client invites a user (`message` = target user id) to a room. Authorized by the
+        // connection's canonical id; the invited user (if online) is told to reload rooms.
+        MessageType::AddMember => {
+            if let Some(actor) = auth_user_id {
+                if let Ok(target) = message.message.parse::<i64>() {
+                    if add_room_member_internal(&pool, message.room_id as i64, target, actor as i64)
+                        .await
+                        .is_ok()
+                    {
+                        send_rooms_changed(&state, target as u64).await;
+                    }
+                }
             }
         }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
@@ -2008,6 +2092,46 @@ pub async fn request_history(
     send_secure_client(state.inner(), &msg)
         .await
         .map_err(|e| format!("Failed to request history: {}", e))
+}
+
+/// Client → host: invite `target_id` to a room. The host authorizes by the connection's
+/// canonical id and notifies the invited user.
+#[tauri::command]
+pub async fn client_add_member(
+    state: State<'_, Arc<AppState>>,
+    room_id: u64,
+    target_id: i64,
+) -> Result<(), String> {
+    let msg = Message {
+        version: PROTOCOL_VERSION,
+        message_type: MessageType::AddMember,
+        username: String::new(),
+        user_id: 0,
+        message: target_id.to_string(),
+        message_id: Uuid::new_v4().to_string(),
+        room: String::new(),
+        room_id,
+        created_at: now_secs(),
+        is_emoji: false,
+        email: None,
+    };
+    send_secure_client(state.inner(), &msg)
+        .await
+        .map_err(|e| format!("Failed to add member: {}", e))
+}
+
+/// Host participant invites a user directly against its own DB, then notifies the invitee.
+#[tauri::command]
+pub async fn server_add_member(
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    room_id: u64,
+    target_id: i64,
+    actor_id: i64,
+) -> Result<(), String> {
+    add_room_member_internal(db.inner(), room_id as i64, target_id, actor_id).await?;
+    send_rooms_changed(state.inner(), target_id as u64).await;
+    Ok(())
 }
 
 /// Host participant typing: relay straight to the room's clients (and the local UI

@@ -3,6 +3,7 @@ import { Hash, RefreshCw, WifiOff, X } from "lucide-react";
 import {
   ChatRoom,
   Department,
+  DirectoryUser,
   Message,
   Reaction,
   SearchResult,
@@ -43,6 +44,8 @@ interface WorkspaceProps {
   reactions: Record<string, Reaction[]>;
   onToggleReaction: (targetId: string, emoji: string) => Promise<void>;
   onLoadOlder: () => Promise<void>;
+  directory: DirectoryUser[];
+  onAddMember: (roomId: number, userId: number) => void;
   onLeaveRoom: () => void;
   onLogout: () => void;
   onDismissError: () => void;
@@ -74,6 +77,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   reactions,
   onToggleReaction,
   onLoadOlder,
+  directory,
+  onAddMember,
   onLeaveRoom,
   onLogout,
   onDismissError,
@@ -139,6 +144,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             reactions={reactions}
             onToggleReaction={onToggleReaction}
             onLoadOlder={onLoadOlder}
+            directory={directory}
+            onAddMember={onAddMember}
             onLeave={onLeaveRoom}
           />
         ) : (

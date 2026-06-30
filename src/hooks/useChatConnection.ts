@@ -5,6 +5,7 @@ import {
   ChatRoom,
   ConnectionMode,
   Department,
+  DirectoryUser,
   Message,
   Reaction,
   ReactionAggregate,
@@ -101,6 +102,8 @@ export const useChatConnection = () => {
   >({});
   // Unread message counts per room id (host computes them; client gets pushes).
   const [unreadByRoom, setUnreadByRoom] = useState<Record<number, number>>({});
+  // User directory (host pushes it) for the invite + DM pickers.
+  const [directory, setDirectory] = useState<DirectoryUser[]>([]);
 
   // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
@@ -174,6 +177,22 @@ export const useChatConnection = () => {
       } catch (err) {
         console.error("Bad unread payload:", err);
       }
+      return;
+    }
+
+    // Host-pushed user directory (for invite/DM pickers). No room.
+    if (nm.message_type === "UserDirectory") {
+      try {
+        setDirectory(JSON.parse(nm.message) as DirectoryUser[]);
+      } catch (err) {
+        console.error("Bad directory payload:", err);
+      }
+      return;
+    }
+
+    // Our room membership changed (e.g. we were invited) → reload the channel list.
+    if (nm.message_type === "RoomsChanged") {
+      void loadChatRooms();
       return;
     }
 
@@ -691,7 +710,7 @@ export const useChatConnection = () => {
       await loadChatRooms(user.id);
       setConnectionStatus("connected");
       setView("workspace");
-      // Host owns the DB → seed its unread badges now; a client gets a push on Connect.
+      // Host owns the DB → seed its unread badges + user directory now; clients get pushes.
       if (mode === "server") {
         try {
           const arr = (await invoke("get_unread_counts", {
@@ -700,6 +719,11 @@ export const useChatConnection = () => {
           const next: Record<number, number> = {};
           for (const u of arr) next[u.room_id] = u.count;
           setUnreadByRoom(next);
+        } catch {
+          /* best-effort */
+        }
+        try {
+          setDirectory((await invoke("list_users")) as DirectoryUser[]);
         } catch {
           /* best-effort */
         }
@@ -792,6 +816,24 @@ export const useChatConnection = () => {
     })) as ChatRoom;
     await loadChatRooms(currentUser.id);
     await joinRoom(room);
+  };
+
+  // Invite a directory user to a room (host runs it on its DB; client asks the host).
+  const addMember = async (roomId: number, targetId: number) => {
+    if (!currentUser) return;
+    try {
+      if (mode === "server") {
+        await invoke("server_add_member", {
+          roomId,
+          targetId,
+          actorId: currentUser.id,
+        });
+      } else {
+        await invoke("client_add_member", { roomId, targetId });
+      }
+    } catch (err) {
+      setError(`Couldn't add member: ${err}`);
+    }
   };
 
   const searchMessages = useCallback(
@@ -963,6 +1005,7 @@ export const useChatConnection = () => {
     setMembersByRoom({});
     setReactionsByMessage({});
     setUnreadByRoom({});
+    setDirectory([]);
     setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
@@ -992,6 +1035,8 @@ export const useChatConnection = () => {
       : [],
     sendTyping,
     unreadByRoom,
+    directory,
+    addMember,
     currentUser,
     currentRoom,
     setMode,

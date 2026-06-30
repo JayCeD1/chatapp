@@ -11,6 +11,13 @@ export interface User {
   department_name: string;
 }
 
+// A connectable user from the host directory, for invite + DM pickers.
+export interface DirectoryUser {
+  id: number;
+  name: string;
+  is_online: boolean;
+}
+
 export interface ChatRoom {
   id: number;
   name: string;

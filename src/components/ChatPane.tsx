@@ -4,6 +4,8 @@ import {
   Smile,
   SmilePlus,
   Hash,
+  Lock,
+  UserPlus,
   LogOut,
   ChevronDown,
   Loader2,
@@ -12,7 +14,8 @@ import {
   Check,
   X,
 } from "lucide-react";
-import { ChatRoom, Message, Reaction, User } from "../types";
+import { ChatRoom, DirectoryUser, Message, Reaction, User } from "../types";
+import { InviteModal } from "./InviteModal";
 import {
   initials,
   avatarColor,
@@ -42,6 +45,8 @@ interface ChatPaneProps {
   onToggleReaction: (targetId: string, emoji: string) => Promise<void>;
   onLoadOlder: () => Promise<void>;
   onLeave: () => void;
+  directory: DirectoryUser[];
+  onAddMember: (roomId: number, userId: number) => void;
 }
 
 const EMOJIS = [
@@ -77,9 +82,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onToggleReaction,
   onLoadOlder,
   onLeave,
+  directory,
+  onAddMember,
 }) => {
   const [inputText, setInputText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
+  const [showInvite, setShowInvite] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
@@ -239,7 +247,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       {/* Header */}
       <header className="flex items-center justify-between px-5 h-14 border-b border-[var(--border)] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
-          <Hash className="w-5 h-5 text-[var(--text-faint)] shrink-0" />
+          {room.is_private ? (
+            <Lock className="w-4 h-4 text-[var(--text-faint)] shrink-0" />
+          ) : (
+            <Hash className="w-5 h-5 text-[var(--text-faint)] shrink-0" />
+          )}
           <h2 className="font-semibold text-[var(--text)] truncate">
             {room.name}
           </h2>
@@ -253,16 +265,40 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             )}
           </span>
         </div>
-        <button
-          onClick={onLeave}
-          title="Leave channel"
-          aria-label="Leave channel"
-          className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-sm text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
-        >
-          <LogOut className="w-4 h-4" />
-          <span className="hidden sm:inline">Leave</span>
-        </button>
+        <div className="flex items-center gap-1 shrink-0">
+          {room.is_private && (
+            <button
+              onClick={() => setShowInvite(true)}
+              title="Add people"
+              aria-label="Add people"
+              className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-sm text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+            >
+              <UserPlus className="w-4 h-4" />
+              <span className="hidden sm:inline">Add</span>
+            </button>
+          )}
+          <button
+            onClick={onLeave}
+            title="Leave channel"
+            aria-label="Leave channel"
+            className="flex items-center gap-1.5 px-2.5 py-1.5 rounded-md text-sm text-[var(--text-dim)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+          >
+            <LogOut className="w-4 h-4" />
+            <span className="hidden sm:inline">Leave</span>
+          </button>
+        </div>
       </header>
+
+      {showInvite && (
+        <InviteModal
+          roomName={room.name}
+          users={directory}
+          selfId={currentUserId}
+          selfName={currentUser.name}
+          onAdd={(userId) => onAddMember(room.id, userId)}
+          onClose={() => setShowInvite(false)}
+        />
+      )}
 
       {/* Messages */}
       <div className="relative flex-1 min-h-0">

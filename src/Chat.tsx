@@ -50,6 +50,8 @@ const Chat = () => {
       reactions={c.reactionsByMessage}
       onToggleReaction={c.toggleReaction}
       onLoadOlder={c.loadOlderMessages}
+      directory={c.directory}
+      onAddMember={c.addMember}
       onLeaveRoom={c.leaveRoom}
       onLogout={c.logout}
       onDismissError={c.dismissError}

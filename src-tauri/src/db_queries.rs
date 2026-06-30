@@ -495,7 +495,17 @@ pub async fn add_room_member(
     user_id: i64,
     actor_id: i64,
 ) -> Result<(), String> {
-    if !room_join_allowed_internal(&db, actor_id, room_id).await? {
+    add_room_member_internal(&db, room_id, user_id, actor_id).await
+}
+
+/// Pool-based variant so the socket layer can run client invites against the host DB.
+pub async fn add_room_member_internal(
+    pool: &SqlitePool,
+    room_id: i64,
+    user_id: i64,
+    actor_id: i64,
+) -> Result<(), String> {
+    if !room_join_allowed_internal(pool, actor_id, room_id).await? {
         return Err("Only members can add people to this channel".to_string());
     }
     sqlx::query(
@@ -504,10 +514,39 @@ pub async fn add_room_member(
     )
     .bind(user_id)
     .bind(room_id)
-    .execute(&*db)
+    .execute(pool)
     .await
     .map_err(|e| format!("Failed to add member: {}", e))?;
     Ok(())
+}
+
+/// A connectable user, for the client-side directory (invite + DM pickers). Clients keep no
+/// local copy of the host's users, so the host pushes this list to them.
+#[derive(Serialize)]
+pub struct DirectoryUser {
+    pub id: i64,
+    pub name: String,
+    pub is_online: bool,
+}
+
+pub async fn list_users_internal(pool: &SqlitePool) -> Result<Vec<DirectoryUser>, String> {
+    let rows = sqlx::query("SELECT id, name, is_online FROM users ORDER BY name")
+        .fetch_all(pool)
+        .await
+        .map_err(|e| format!("Failed to list users: {}", e))?;
+    Ok(rows
+        .into_iter()
+        .map(|row| DirectoryUser {
+            id: row.get::<i64, _>("id"),
+            name: row.get::<String, _>("name"),
+            is_online: row.get::<bool, _>("is_online"),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn list_users(db: State<'_, SqlitePool>) -> Result<Vec<DirectoryUser>, String> {
+    list_users_internal(&db).await
 }
 
 // Message management

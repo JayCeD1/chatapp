@@ -384,6 +384,27 @@ pub async fn create_room(
     is_private: Option<bool>,
     created_by: Option<i64>,
 ) -> Result<ChatRoom, String> {
+    create_room_internal(
+        &db,
+        name,
+        description,
+        department_id,
+        is_private,
+        created_by,
+    )
+    .await
+}
+
+/// Pool-based channel creation so the socket layer can create a room on the HOST DB on behalf
+/// of a connecting client (clients have no usable local copy of host rooms).
+pub async fn create_room_internal(
+    pool: &SqlitePool,
+    name: String,
+    description: Option<String>,
+    department_id: Option<i64>,
+    is_private: Option<bool>,
+    created_by: Option<i64>,
+) -> Result<ChatRoom, String> {
     let name = name.trim().to_string();
     if name.is_empty() || name.chars().count() > 64 {
         return Err("Channel name must be between 1 and 64 characters".to_string());
@@ -399,7 +420,7 @@ pub async fn create_room(
     .bind(department_id)
     .bind(is_private)
     .bind(created_by)
-    .execute(&*db)
+    .execute(pool)
     .await
     .map_err(|e| {
         if e.to_string().contains("UNIQUE") {
@@ -420,7 +441,7 @@ pub async fn create_room(
         )
         .bind(creator)
         .bind(id)
-        .execute(&*db)
+        .execute(pool)
         .await
         .map_err(|e| format!("Failed to add creator to channel: {}", e))?;
     }
@@ -432,7 +453,7 @@ pub async fn create_room(
          WHERE cr.id = $1",
     )
     .bind(id)
-    .fetch_one(&*db)
+    .fetch_one(pool)
     .await
     .map_err(|e| e.to_string())?;
 

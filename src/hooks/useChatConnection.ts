@@ -898,6 +898,8 @@ export const useChatConnection = () => {
   };
 
   // Create a new channel, refresh the list, and open it.
+  // Create a channel. The host owns the room DB, so a client asks the host to create it (and
+  // opens it on the DmReady reply); the host creates it locally and opens it directly.
   const createRoom = async (
     name: string,
     description: string,
@@ -905,15 +907,28 @@ export const useChatConnection = () => {
     isPrivate: boolean,
   ) => {
     if (!currentUser) return;
-    const room = (await invoke("create_room", {
-      name,
-      description: description || null,
-      departmentId: departmentId ?? null,
-      isPrivate,
-      createdBy: currentUser.id,
-    })) as ChatRoom;
-    await loadChatRooms(currentUser.id);
-    await joinRoom(room);
+    try {
+      if (mode === "server") {
+        const room = (await invoke("server_create_room", {
+          name,
+          description: description || null,
+          departmentId: departmentId ?? null,
+          isPrivate,
+          actorId: currentUser.id,
+        })) as ChatRoom;
+        await loadChatRooms(currentUser.id);
+        await joinRoom(room);
+      } else {
+        await invoke("client_create_room", {
+          name,
+          description: description || null,
+          departmentId: departmentId ?? null,
+          isPrivate,
+        });
+      }
+    } catch (err) {
+      setError(`Couldn't create channel: ${err}`);
+    }
   };
 
   // Invite a directory user to a room (host runs it on its DB; client asks the host).

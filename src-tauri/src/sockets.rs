@@ -1,9 +1,9 @@
 use crate::db_queries::{
-    add_room_member_internal, delete_message_db, edit_message_db, get_chat_rooms_internal,
-    get_or_create_dm_internal, get_room_messages_internal, get_room_reactions_internal,
-    get_unread_counts_internal, list_users_internal, room_join_allowed_internal,
-    save_message_internal, toggle_reaction_db, touch_last_read_internal, upsert_user_internal,
-    ChatRoom,
+    add_room_member_internal, create_room_internal, delete_message_db, edit_message_db,
+    get_chat_rooms_internal, get_or_create_dm_internal, get_room_messages_internal,
+    get_room_reactions_internal, get_unread_counts_internal, list_users_internal,
+    room_join_allowed_internal, save_message_internal, toggle_reaction_db,
+    touch_last_read_internal, upsert_user_internal, ChatRoom,
 };
 use crate::secure;
 use serde::{Deserialize, Serialize};
@@ -240,8 +240,12 @@ pub enum MessageType {
     // Client → host: open/create a direct message. `message` carries a JSON array of target
     // user ids. The host authorizes the creator by the connection's canonical id.
     DmRequest,
-    // Host → the requesting client: the freshly opened DM room (JSON ChatRoom) to switch to.
+    // Host → the requesting client: a room (JSON ChatRoom) to switch straight to — a freshly
+    // opened DM or a channel the client just created.
     DmReady,
+    // Client → host: create a channel. `message` carries JSON {name, description,
+    // department_id, is_private}. Created on the host DB under the connection's canonical id.
+    RoomCreate,
     // Host → a single client on connect: their canonical user id (in `user_id`). A client's
     // local id differs from the host-assigned canonical id, so the client needs this to tell
     // which messages are its own (history carries the canonical author id).
@@ -1041,6 +1045,22 @@ async fn push_rooms_update(
     }
 }
 
+/// Push every connected client (and the host's own UI) a fresh room list — used when a PUBLIC
+/// channel is created, since it becomes visible to everyone. Each recipient gets the list
+/// computed for their own id, so private rooms stay scoped.
+async fn broadcast_room_list(app: &tauri::AppHandle, state: &Arc<AppState>, pool: &SqlitePool) {
+    let uids: Vec<u64> = {
+        let streams = state.server_streams.lock().await;
+        streams.keys().copied().collect()
+    };
+    for uid in uids {
+        push_rooms_update(app, state, pool, uid).await;
+    }
+    if let Some(host) = *state.user_id.read().await {
+        push_rooms_update(app, state, pool, host).await;
+    }
+}
+
 /// Tell a freshly-connected client its canonical user id (carried in `user_id`), so it can
 /// recognise its own messages — its local id differs from the host-assigned canonical one, and
 /// persisted history is authored under the canonical id.
@@ -1500,6 +1520,50 @@ async fn handle_server_message(
                         send_dm_ready(&state, actor, &room).await;
                     }
                     Err(e) => tracing::warn!("DM request from {} failed: {}", actor, e),
+                }
+            }
+        }
+        // Client creates a channel (`message` = JSON {name, description, department_id,
+        // is_private}). Created on the host DB under the connection's canonical id; a public
+        // channel is pushed to everyone, a private one only to the creator, who is handed the
+        // room to switch to.
+        MessageType::RoomCreate => {
+            if let Some(actor) = auth_user_id {
+                let v: serde_json::Value =
+                    serde_json::from_str(&message.message).unwrap_or_default();
+                let name = v
+                    .get("name")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let description = v
+                    .get("description")
+                    .and_then(|x| x.as_str())
+                    .map(|s| s.to_string());
+                let department_id = v.get("department_id").and_then(|x| x.as_i64());
+                let is_private = v
+                    .get("is_private")
+                    .and_then(|x| x.as_bool())
+                    .unwrap_or(false);
+                match create_room_internal(
+                    &pool,
+                    name,
+                    description,
+                    department_id,
+                    Some(is_private),
+                    Some(actor as i64),
+                )
+                .await
+                {
+                    Ok(room) => {
+                        if is_private {
+                            push_rooms_update(&app, &state, &pool, actor).await;
+                        } else {
+                            broadcast_room_list(&app, &state, &pool).await;
+                        }
+                        send_dm_ready(&state, actor, &room).await;
+                    }
+                    Err(e) => tracing::warn!("Room create from {} failed: {}", actor, e),
                 }
             }
         }
@@ -2298,6 +2362,70 @@ pub async fn client_create_dm(
     send_secure_client(state.inner(), &msg)
         .await
         .map_err(|e| format!("Failed to start direct message: {}", e))
+}
+
+/// Client → host: create a channel. The host creates it under the connection's canonical id and
+/// replies with a DmReady the client switches to (plus a RoomList so it appears in the sidebar).
+#[tauri::command]
+pub async fn client_create_room(
+    state: State<'_, Arc<AppState>>,
+    name: String,
+    description: Option<String>,
+    department_id: Option<i64>,
+    is_private: bool,
+) -> Result<(), String> {
+    let payload = serde_json::json!({
+        "name": name,
+        "description": description,
+        "department_id": department_id,
+        "is_private": is_private,
+    })
+    .to_string();
+    let msg = Message {
+        version: PROTOCOL_VERSION,
+        message_type: MessageType::RoomCreate,
+        username: String::new(),
+        user_id: 0,
+        message: payload,
+        message_id: Uuid::new_v4().to_string(),
+        room: String::new(),
+        room_id: 0,
+        created_at: now_secs(),
+        is_emoji: false,
+        email: None,
+    };
+    send_secure_client(state.inner(), &msg)
+        .await
+        .map_err(|e| format!("Failed to create channel: {}", e))
+}
+
+/// Host participant creates a channel against its own DB; a public channel is pushed to every
+/// connected client so it appears in their sidebar. Returns the room for the host to open.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)] // Tauri command: params map 1:1 to JS invoke args.
+pub async fn server_create_room(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    name: String,
+    description: Option<String>,
+    department_id: Option<i64>,
+    is_private: bool,
+    actor_id: i64,
+) -> Result<ChatRoom, String> {
+    let room = create_room_internal(
+        db.inner(),
+        name,
+        description,
+        department_id,
+        Some(is_private),
+        Some(actor_id),
+    )
+    .await?;
+    if !is_private {
+        broadcast_room_list(&app, state.inner(), db.inner()).await;
+    }
+    Ok(room)
 }
 
 /// Host participant invites a user directly against its own DB, then pushes the invitee their

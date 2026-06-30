@@ -1,5 +1,6 @@
 use crate::db_queries::{
-    delete_message_db, edit_message_db, save_message_internal, toggle_reaction_db,
+    delete_message_db, edit_message_db, get_room_messages_internal, get_room_reactions_internal,
+    save_message_internal, toggle_reaction_db,
 };
 use crate::secure;
 use serde::{Deserialize, Serialize};
@@ -183,6 +184,9 @@ pub enum MessageType {
     Edit,
     Delete,
     Reaction,
+    // Host → a single client: a JSON batch of {messages, reactions} for a room, so
+    // clients (which keep no local copy of host data) get scrollback on join.
+    HistoryResponse,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -756,6 +760,56 @@ async fn broadcast_user_list(app: &tauri::AppHandle, state: &Arc<AppState>, room
     distribute_message_to_all(app, state, room, &msg, None).await;
 }
 
+/// Send one client the recent history (messages + reactions) of a room from the host's
+/// DB. Clients keep no local copy, so this is their scrollback on join. The batch is
+/// trimmed to fit a single Noise frame.
+async fn send_room_history(
+    state: &Arc<AppState>,
+    pool: &SqlitePool,
+    user_id: u64,
+    room: &str,
+    room_id: u64,
+) {
+    let conn = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .get(&user_id)
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+    };
+    let Some((writer, transport)) = conn else {
+        return;
+    };
+
+    let mut messages = get_room_messages_internal(pool, room_id as i64, 50, None)
+        .await
+        .unwrap_or_default();
+    let reactions = get_room_reactions_internal(pool, room_id as i64, user_id as i64)
+        .await
+        .unwrap_or_default();
+
+    // Build the JSON batch, dropping oldest messages until it fits a Noise frame (~64KB).
+    let payload = loop {
+        let p = serde_json::json!({ "messages": messages, "reactions": reactions }).to_string();
+        if p.len() <= 55_000 || messages.len() <= 1 {
+            break p;
+        }
+        messages.remove(0);
+    };
+
+    let resp = Message {
+        message_type: MessageType::HistoryResponse,
+        username: String::new(),
+        user_id: 0,
+        message: payload,
+        message_id: Uuid::new_v4().to_string(),
+        room: room.to_string(),
+        room_id,
+        created_at: now_secs(),
+        is_emoji: false,
+    };
+    let _ = send_secure(&writer, &transport, &resp).await;
+}
+
 async fn handle_server_message(
     app: tauri::AppHandle,
     state: Arc<AppState>,
@@ -870,6 +924,9 @@ async fn handle_server_message(
                     broadcast_user_list(&app, &state, &old).await;
                 }
             }
+            // Give the joining client scrollback for the room they just opened.
+            let requester = auth_user_id.unwrap_or(message.user_id);
+            send_room_history(&state, &pool, requester, &message.room, message.room_id).await;
         }
         MessageType::RoomLeave => {
             // Remove the user from the room they are leaving so the host stops relaying

@@ -431,7 +431,7 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 - [x] Message search (`search_messages` LIKE, escaped; debounced SearchModal → jump to channel) (7) (`650c2b8`) — **M**
 - [x] Emoji reactions (migration v11, atomic toggle, host-authoritative; chips + picker) (7) (`5f3f7f6` + `968e333` review fixes) — **M**
 - [ ] Persistent identity + session restore via `get_user_by_id` (7) — **L**
-- [ ] **Client history sync (architectural gap surfaced by review):** clients' local DB has no host data, so history/search/reactions only fully populate on the HOST; clients see live data only. Needs a host→client history/reaction sync over the socket. Underlies unread tracking too. — **L**
+- [x] **Client history sync (architectural gap surfaced by review):** host now PUSHES a room's recent history (≤50 messages + reactions) to a joining client via `MessageType::HistoryResponse` (JSON `{messages, reactions}`, trimmed to fit one Noise frame; sent only to the requester's connection, keyed by connection-bound `auth_user_id`). Client awaits the push on join instead of querying its empty local DB, and merges (not replaces) so a live `Chat` raced into the snapshot gap isn't dropped. _Remaining: client-side load-older over the socket (clients get the recent 50 only); underlies unread tracking._ — **L**
 - [ ] Unread tracking (`last_read_at` + badges) — depends on multi-room delivery + client history sync (7) — **M**
 - [ ] Working discovery in UI (handshake + mDNS/UDP, replace port scan) (7/2.10) — **M**
 - [ ] DMs, typing indicators, settings persistence (7). _Avatars + theme persistence done in Phase 2._ — **S→L each**

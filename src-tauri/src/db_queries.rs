@@ -484,13 +484,19 @@ pub async fn get_room_messages(
     limit: Option<i64>,
     before_id: Option<i64>,
 ) -> Result<Vec<Message>, String> {
-    let limit = limit.unwrap_or(50);
+    get_room_messages_internal(&db, room_id, limit.unwrap_or(50), before_id).await
+}
 
-    // before_id = None → newest `limit`. before_id = Some(id) → the `limit` messages
-    // immediately older than `id`. Order + paginate by `id` (the monotonic insertion
-    // order) so the cursor and the sort key always agree — ordering by the wall-clock
-    // created_at would disagree with the `id < before_id` cursor under clock skew and
-    // silently drop history.
+/// Pool-based variant so the socket layer (host history sync) can reuse it.
+/// before_id = None → newest `limit`. before_id = Some(id) → the `limit` messages
+/// immediately older than `id`. Order + paginate by `id` (monotonic insertion order) so
+/// the cursor and the sort key always agree.
+pub async fn get_room_messages_internal(
+    pool: &SqlitePool,
+    room_id: i64,
+    limit: i64,
+    before_id: Option<i64>,
+) -> Result<Vec<Message>, String> {
     let result = sqlx::query(
         "SELECT m.id, m.message_id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
                 m.edited_at, m.deleted_at, COALESCE(u.name, 'Unknown') as username
@@ -503,7 +509,7 @@ pub async fn get_room_messages(
     .bind(&room_id)
     .bind(&before_id)
     .bind(&limit)
-    .fetch_all(&*db)
+    .fetch_all(pool)
     .await
     .map_err(|e| format!("Failed to get room messages: {}", e))?;
 
@@ -688,6 +694,15 @@ pub async fn get_room_reactions(
     room_id: i64,
     user_id: i64,
 ) -> Result<Vec<ReactionAggregate>, String> {
+    get_room_reactions_internal(&db, room_id, user_id).await
+}
+
+/// Pool-based variant for the socket layer (host history sync).
+pub async fn get_room_reactions_internal(
+    pool: &SqlitePool,
+    room_id: i64,
+    user_id: i64,
+) -> Result<Vec<ReactionAggregate>, String> {
     let rows = sqlx::query(
         "SELECT r.message_id, r.emoji, COUNT(*) AS count,
                 MAX(CASE WHEN r.user_id = $2 THEN 1 ELSE 0 END) AS me
@@ -699,7 +714,7 @@ pub async fn get_room_reactions(
     )
     .bind(&room_id)
     .bind(&user_id)
-    .fetch_all(&*db)
+    .fetch_all(pool)
     .await
     .map_err(|e| format!("Failed to load reactions: {}", e))?;
 

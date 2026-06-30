@@ -111,6 +111,63 @@ export const useChatConnection = () => {
     const nm = normalizeMessage(m);
     if (!nm.room) return;
 
+    // Host → client scrollback: a JSON batch of {messages, reactions} for a room.
+    if (nm.message_type === "HistoryResponse") {
+      try {
+        const batch = JSON.parse(nm.message) as {
+          messages: any[];
+          reactions: any[];
+        };
+        const msgs = (batch.messages || []).map((m) =>
+          normalizeMessage({ ...m, room: nm.room }),
+        );
+        // Merge, not replace: a live Chat can land in the gap between the host
+        // snapshotting history and this push arriving. Keep any existing message
+        // at/after the snapshot's newest so we don't drop it (older extras are
+        // stale and intentionally discarded).
+        setMessagesByRoom((prev) => {
+          const existing = prev[nm.room] || [];
+          const seen = new Set(msgs.map((m) => m.message_id));
+          const newest = msgs.length ? msgs[msgs.length - 1].created_at : "";
+          const extras = existing.filter(
+            (m) =>
+              m.message_id && !seen.has(m.message_id) && m.created_at >= newest,
+          );
+          const merged = [...msgs, ...extras].sort((a, b) =>
+            a.created_at < b.created_at
+              ? -1
+              : a.created_at > b.created_at
+                ? 1
+                : 0,
+          );
+          return { ...prev, [nm.room]: merged };
+        });
+        // Recent batch only (full pagination is host-side for now).
+        setHasMoreByRoom((prev) => ({ ...prev, [nm.room]: false }));
+
+        const byMsg: Record<string, Reaction[]> = {};
+        for (const r of batch.reactions || []) {
+          (byMsg[r.message_id] ||= []).push({
+            emoji: r.emoji,
+            count: r.count,
+            me: r.me,
+          });
+        }
+        setReactionsByMessage((prev) => {
+          const next = { ...prev };
+          for (const m of msgs) {
+            if (m.message_id) next[m.message_id] = byMsg[m.message_id] || [];
+          }
+          return next;
+        });
+        setLoadingMessages(false);
+      } catch (err) {
+        console.error("Bad history payload:", err);
+        setLoadingMessages(false);
+      }
+      return;
+    }
+
     if (nm.message_type === "UserList") {
       try {
         const names = JSON.parse(nm.message) as string[];
@@ -475,7 +532,17 @@ export const useChatConnection = () => {
 
       await invoke("join_room", { userId: currentUser.id, roomId: room.id });
       setCurrentRoom(room);
-      loadRoomMessages(room);
+      if (mode === "server") {
+        // Host owns the data — read it locally.
+        loadRoomMessages(room);
+      } else {
+        // Client's local DB has none of the host's history; show a loading
+        // state and wait for the host's HistoryResponse push (see ingestMessage).
+        setLoadingMessages(true);
+        setMessagesByRoom((prev) =>
+          prev[room.name] ? prev : { ...prev, [room.name]: [] },
+        );
+      }
     } catch (err) {
       console.error("Join room failed:", err);
       setError(`Couldn't open #${room.name}: ${err}`);

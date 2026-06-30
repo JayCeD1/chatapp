@@ -193,9 +193,14 @@ export const useChatConnection = () => {
       return;
     }
 
-    // Our room membership changed (e.g. we were invited) → reload the channel list.
-    if (nm.message_type === "RoomsChanged") {
-      void loadChatRooms();
+    // Host-pushed authoritative room list (client mode): our channels + the private rooms /
+    // DMs we belong to, which aren't in our local DB. Replaces the local list outright.
+    if (nm.message_type === "RoomList") {
+      try {
+        setChatRooms(JSON.parse(nm.message) as ChatRoom[]);
+      } catch (err) {
+        console.error("Bad room list payload:", err);
+      }
       return;
     }
 
@@ -378,7 +383,11 @@ export const useChatConnection = () => {
       const target = nm.message_id;
       const emoji = nm.message;
       const added = !!nm.is_emoji;
-      const byMe = nm.user_id === currentUserRef.current?.id;
+      // In client mode the echo carries the canonical id while ours is local, so also match by
+      // name (the same fallback used for message ownership).
+      const byMe =
+        nm.user_id === currentUserRef.current?.id ||
+        nm.username === currentUserRef.current?.name;
       if (!target || !emoji) return;
       setReactionsByMessage((prev) => {
         const list = (prev[target] || []).slice();
@@ -605,10 +614,15 @@ export const useChatConnection = () => {
   }, []);
 
   // Incoming-message listener — registered ONCE; routes every message to the store.
+  // `active` guards the async gap: if this effect is torn down (e.g. StrictMode's
+  // mount→unmount→remount) before `listen` resolves, the resolved handle unsubscribes itself
+  // instead of leaking a second listener — which would double every event (and so double
+  // reaction counts, since reactions increment per event rather than dedupe by id).
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    let active = true;
     (async () => {
-      unlisten = await listen<string>("message", (e) => {
+      const fn = await listen<string>("message", (e) => {
         if (!e.payload) return; // lifecycle events use their own channels
         try {
           const m = JSON.parse(e.payload);
@@ -617,17 +631,39 @@ export const useChatConnection = () => {
           console.error("Error parsing message:", err);
         }
       });
+      if (!active) fn();
+      else unlisten = fn;
     })();
     return () => {
+      active = false;
       if (unlisten) unlisten();
     };
   }, [ingestMessage]);
+
+  // Host-only: the host owns its DB, so when a client DMs/invites it (a change the host didn't
+  // make itself), the backend nudges it here to reload its authoritative room list.
+  useEffect(() => {
+    let unlisten: (() => void) | undefined;
+    let active = true;
+    (async () => {
+      const fn = await listen("rooms_changed", () => {
+        if (modeRef.current === "server") void loadChatRooms();
+      });
+      if (!active) fn();
+      else unlisten = fn;
+    })();
+    return () => {
+      active = false;
+      if (unlisten) unlisten();
+    };
+  }, []);
 
   // Reconnection — registered once per (mode, user, serverIp); reads room from a ref.
   useEffect(() => {
     if (mode !== "client" || !currentUser) return;
 
     let unlisten: (() => void) | undefined;
+    let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let retryCount = 0;
     let retryDelay = 1000;
@@ -663,15 +699,20 @@ export const useChatConnection = () => {
     };
 
     (async () => {
-      unlisten = await listen("connection_lost", () => {
+      const fn = await listen("connection_lost", () => {
         setConnectionStatus("reconnecting");
         retryCount = 0;
         retryDelay = 1000;
         attempt();
       });
+      // If the effect was torn down before listen resolved, unsubscribe the late handle so a
+      // second listener can't leak and spawn a duplicate reconnect loop.
+      if (!active) fn();
+      else unlisten = fn;
     })();
 
     return () => {
+      active = false;
       if (unlisten) unlisten();
       if (timer) clearTimeout(timer);
     };
@@ -780,7 +821,12 @@ export const useChatConnection = () => {
         });
       }
 
-      await invoke("join_room", { userId: currentUser.id, roomId: room.id });
+      // Only the host records membership in its (authoritative) DB. A client's local DB has no
+      // row for host-created rooms (private channels, DMs), so writing one here would fail the
+      // foreign key — and is unnecessary, since the host tracks the client's membership.
+      if (mode === "server") {
+        await invoke("join_room", { userId: currentUser.id, roomId: room.id });
+      }
       setCurrentRoom(room);
       // Opening a room reads it: clear its badge immediately for snappy UX.
       setUnreadByRoom((prev) =>

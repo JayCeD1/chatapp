@@ -385,7 +385,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                     <div
                       className={`group relative flex gap-3 px-2 ${
                         grouped ? "mt-0.5" : "mt-3"
-                      } py-0.5 rounded-md hover:bg-[var(--surface)]/60`}
+                      } py-0.5 rounded-md hover:bg-[var(--surface)]/60 ${
+                        isMe ? "flex-row-reverse" : ""
+                      }`}
                     >
                       {grouped ? (
                         <div className="w-9 shrink-0 text-[10px] text-[var(--text-faint)] text-right pr-1 pt-1 opacity-0 group-hover:opacity-100">
@@ -399,9 +401,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           {initials(msg.username)}
                         </div>
                       )}
-                      <div className="min-w-0 flex-1">
+                      <div
+                        className={`min-w-0 flex-1 flex flex-col ${
+                          isMe ? "items-end" : "items-start"
+                        }`}
+                      >
                         {!grouped && (
-                          <div className="flex items-baseline gap-2">
+                          <div
+                            className={`flex items-baseline gap-2 ${
+                              isMe ? "flex-row-reverse" : ""
+                            }`}
+                          >
                             <span
                               className={`text-sm font-semibold ${
                                 isMe
@@ -460,9 +470,13 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           </div>
                         ) : (
                           <div
-                            className={`text-[var(--text-dim)] break-words leading-relaxed ${
+                            className={`break-words leading-relaxed max-w-[90%] ${
                               msg.is_emoji ? "text-3xl" : "text-sm"
-                            }`}
+                            } ${
+                              isMe && !msg.is_emoji
+                                ? "bg-[var(--accent-soft)] text-[var(--text)] rounded-2xl px-3 py-1.5"
+                                : "text-[var(--text-dim)]"
+                            } ${isMe ? "text-right" : ""}`}
                           >
                             <MessageText
                               text={msg.message}
@@ -477,7 +491,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                         )}
 
                         {msgReactions.length > 0 && (
-                          <div className="flex flex-wrap gap-1 mt-1">
+                          <div
+                            className={`flex flex-wrap gap-1 mt-1 ${
+                              isMe ? "justify-end" : ""
+                            }`}
+                          >
                             {msgReactions.map((r) => (
                               <button
                                 key={r.emoji}
@@ -503,7 +521,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                       </div>
 
                       {!isEditing && msg.message_id && !isDeleted && (
-                        <div className="absolute top-0 right-2 hidden group-hover:flex items-center gap-0.5 bg-[var(--surface)] border border-[var(--border)] rounded-md shadow-sm">
+                        <div
+                          className={`absolute top-0 hidden group-hover:flex items-center gap-0.5 bg-[var(--surface)] border border-[var(--border)] rounded-md shadow-sm ${
+                            isMe ? "left-2" : "right-2"
+                          }`}
+                        >
                           <button
                             onClick={() =>
                               setReactingId(
@@ -542,7 +564,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                       )}
 
                       {reactingId === msg.message_id && msg.message_id && (
-                        <div className="absolute top-8 right-2 z-50 bg-[var(--surface-2)] border border-[var(--border)] rounded-xl shadow-2xl p-2 grid grid-cols-6 gap-1 animate-scale-in">
+                        <div
+                          className={`absolute top-8 z-50 bg-[var(--surface-2)] border border-[var(--border)] rounded-xl shadow-2xl p-2 grid grid-cols-6 gap-1 animate-scale-in ${
+                            isMe ? "left-2" : "right-2"
+                          }`}
+                        >
                           {EMOJIS.map((e) => (
                             <button
                               key={e}

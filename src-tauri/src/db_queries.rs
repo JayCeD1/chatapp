@@ -423,19 +423,23 @@ pub async fn get_room_messages(
     db: State<'_, SqlitePool>,
     room_id: i64,
     limit: Option<i64>,
+    before_id: Option<i64>,
 ) -> Result<Vec<Message>, String> {
     let limit = limit.unwrap_or(50);
 
+    // before_id = None → newest `limit`. before_id = Some(id) → the `limit` messages
+    // immediately older than `id` (for "load older" pagination).
     let result = sqlx::query(
         "SELECT m.id, m.message_id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
                 COALESCE(u.name, 'Unknown') as username
          FROM messages m
          LEFT JOIN users u ON m.user_id = u.id
-         WHERE m.room_id = $1
+         WHERE m.room_id = $1 AND ($2 IS NULL OR m.id < $2)
          ORDER BY m.created_at DESC, m.id DESC
-         LIMIT $2",
+         LIMIT $3",
     )
     .bind(&room_id)
+    .bind(&before_id)
     .bind(&limit)
     .fetch_all(&*db)
     .await

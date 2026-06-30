@@ -1,5 +1,5 @@
-import React, { useState, useEffect, useRef } from "react";
-import { Send, Smile, Hash, LogOut, ChevronDown } from "lucide-react";
+import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
+import { Send, Smile, Hash, LogOut, ChevronDown, Loader2 } from "lucide-react";
 import { ChatRoom, Message, User } from "../types";
 import {
   initials,
@@ -16,9 +16,11 @@ interface ChatPaneProps {
   currentUser: User;
   messages: Message[];
   loading: boolean;
+  hasMore: boolean;
   onlineCount: number;
   memberCount: number;
   onSendMessage: (text: string, isEmoji?: boolean) => void;
+  onLoadOlder: () => Promise<void>;
   onLeave: () => void;
 }
 
@@ -42,22 +44,40 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   currentUser,
   messages,
   loading,
+  hasMore,
   onlineCount,
   memberCount,
   onSendMessage,
+  onLoadOlder,
   onLeave,
 }) => {
   const [inputText, setInputText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
+  const [loadingOlder, setLoadingOlder] = useState(false);
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
+  // While loading older history, remember the scroll metrics so we can keep the
+  // viewport anchored after the prepended messages change the scroll height.
+  const restoreRef = useRef<{ height: number; top: number } | null>(null);
+  const loadingOlderRef = useRef(false);
 
   // Only auto-scroll when the user is already near the bottom, so reading history
   // isn't yanked away by an incoming message.
   useEffect(() => {
+    if (restoreRef.current) return; // a prepend is being anchored, don't jump
     if (atBottom) endRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, atBottom]);
+
+  // After older messages prepend, restore the viewport so it doesn't jump to the top.
+  useLayoutEffect(() => {
+    const el = scrollRef.current;
+    if (restoreRef.current && el) {
+      el.scrollTop =
+        el.scrollHeight - restoreRef.current.height + restoreRef.current.top;
+      restoreRef.current = null;
+    }
+  }, [messages]);
 
   // Start pinned to the bottom whenever the open channel changes.
   useEffect(() => {
@@ -69,6 +89,17 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     if (!el) return;
     const near = el.scrollHeight - el.scrollTop - el.clientHeight < 120;
     setAtBottom(near);
+
+    // Near the top → pull in older history (once), anchoring the viewport.
+    if (el.scrollTop < 80 && hasMore && !loadingOlderRef.current && !loading) {
+      loadingOlderRef.current = true;
+      restoreRef.current = { height: el.scrollHeight, top: el.scrollTop };
+      setLoadingOlder(true);
+      onLoadOlder().finally(() => {
+        loadingOlderRef.current = false;
+        setLoadingOlder(false);
+      });
+    }
   };
 
   const jumpToLatest = () => {
@@ -147,82 +178,93 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               </p>
             </div>
           ) : (
-            messages.map((msg, idx) => {
-              const prev = messages[idx - 1];
-              const showDate =
-                !prev || !sameDay(prev.created_at, msg.created_at);
+            <>
+              {loadingOlder ? (
+                <div className="flex justify-center py-2">
+                  <Loader2 className="w-4 h-4 animate-spin text-[var(--text-faint)]" />
+                </div>
+              ) : !hasMore ? (
+                <div className="text-center py-3 text-[11px] text-[var(--text-faint)]">
+                  You've reached the beginning of #{room.name}
+                </div>
+              ) : null}
+              {messages.map((msg, idx) => {
+                const prev = messages[idx - 1];
+                const showDate =
+                  !prev || !sameDay(prev.created_at, msg.created_at);
 
-              if (isSystem(msg)) {
+                if (isSystem(msg)) {
+                  return (
+                    <React.Fragment key={msg.message_id ?? msg.id ?? idx}>
+                      {showDate && <DateSeparator iso={msg.created_at} />}
+                      <div className="flex justify-center my-1.5">
+                        <span className="text-[12px] text-[var(--text-faint)] bg-[var(--surface)] px-3 py-1 rounded-full">
+                          {msg.message}
+                        </span>
+                      </div>
+                    </React.Fragment>
+                  );
+                }
+
+                const grouped = !showDate && shouldGroup(prev, msg);
+                const isMe = msg.username === currentUser.name;
+
                 return (
                   <React.Fragment key={msg.message_id ?? msg.id ?? idx}>
                     {showDate && <DateSeparator iso={msg.created_at} />}
-                    <div className="flex justify-center my-1.5">
-                      <span className="text-[12px] text-[var(--text-faint)] bg-[var(--surface)] px-3 py-1 rounded-full">
-                        {msg.message}
-                      </span>
+                    <div
+                      className={`group flex gap-3 px-2 ${
+                        grouped ? "mt-0.5" : "mt-3"
+                      } py-0.5 rounded-md hover:bg-[var(--surface)]/60`}
+                    >
+                      {grouped ? (
+                        <div className="w-9 shrink-0 text-[10px] text-[var(--text-faint)] text-right pr-1 pt-1 opacity-0 group-hover:opacity-100">
+                          {formatTime(msg.created_at)}
+                        </div>
+                      ) : (
+                        <div
+                          className="flex items-center justify-center w-9 h-9 rounded-full text-xs font-semibold text-white shrink-0"
+                          style={{ background: avatarColor(msg.username) }}
+                        >
+                          {initials(msg.username)}
+                        </div>
+                      )}
+                      <div className="min-w-0 flex-1">
+                        {!grouped && (
+                          <div className="flex items-baseline gap-2">
+                            <span
+                              className={`text-sm font-semibold ${
+                                isMe
+                                  ? "text-[var(--accent-strong)]"
+                                  : "text-[var(--text)]"
+                              }`}
+                            >
+                              {msg.username}
+                              {isMe && (
+                                <span className="text-[var(--text-faint)] font-normal">
+                                  {" "}
+                                  (you)
+                                </span>
+                              )}
+                            </span>
+                            <span className="text-[11px] text-[var(--text-faint)]">
+                              {formatTime(msg.created_at)}
+                            </span>
+                          </div>
+                        )}
+                        <div
+                          className={`text-[var(--text-dim)] break-words leading-relaxed ${
+                            msg.is_emoji ? "text-3xl" : "text-sm"
+                          }`}
+                        >
+                          {msg.message}
+                        </div>
+                      </div>
                     </div>
                   </React.Fragment>
                 );
-              }
-
-              const grouped = !showDate && shouldGroup(prev, msg);
-              const isMe = msg.username === currentUser.name;
-
-              return (
-                <React.Fragment key={msg.message_id ?? msg.id ?? idx}>
-                  {showDate && <DateSeparator iso={msg.created_at} />}
-                  <div
-                    className={`group flex gap-3 px-2 ${
-                      grouped ? "mt-0.5" : "mt-3"
-                    } py-0.5 rounded-md hover:bg-[var(--surface)]/60`}
-                  >
-                    {grouped ? (
-                      <div className="w-9 shrink-0 text-[10px] text-[var(--text-faint)] text-right pr-1 pt-1 opacity-0 group-hover:opacity-100">
-                        {formatTime(msg.created_at)}
-                      </div>
-                    ) : (
-                      <div
-                        className="flex items-center justify-center w-9 h-9 rounded-full text-xs font-semibold text-white shrink-0"
-                        style={{ background: avatarColor(msg.username) }}
-                      >
-                        {initials(msg.username)}
-                      </div>
-                    )}
-                    <div className="min-w-0 flex-1">
-                      {!grouped && (
-                        <div className="flex items-baseline gap-2">
-                          <span
-                            className={`text-sm font-semibold ${
-                              isMe
-                                ? "text-[var(--accent-strong)]"
-                                : "text-[var(--text)]"
-                            }`}
-                          >
-                            {msg.username}
-                            {isMe && (
-                              <span className="text-[var(--text-faint)] font-normal">
-                                {" "}
-                                (you)
-                              </span>
-                            )}
-                          </span>
-                          <span className="text-[11px] text-[var(--text-faint)]">
-                            {formatTime(msg.created_at)}
-                          </span>
-                        </div>
-                      )}
-                      <div
-                        className={`text-[var(--text-dim)] break-words leading-relaxed ${
-                          msg.is_emoji ? "text-3xl" : "text-sm"
-                        }`}
-                      >
-                        {msg.message}
-                      </div>
-                    </div>
-                  </div>
-                </React.Fragment>
-              );
-            })
+              })}
+            </>
           )}
           <div ref={endRef} />
         </div>

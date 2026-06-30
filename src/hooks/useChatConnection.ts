@@ -65,6 +65,10 @@ export const useChatConnection = () => {
   const [membersByRoom, setMembersByRoom] = useState<Record<string, string[]>>(
     {},
   );
+  // Whether older history may still exist per room (false once a short page returns).
+  const [hasMoreByRoom, setHasMoreByRoom] = useState<Record<string, boolean>>(
+    {},
+  );
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connected");
   const [error, setError] = useState<string | null>(null);
@@ -76,6 +80,12 @@ export const useChatConnection = () => {
   useEffect(() => {
     currentRoomRef.current = currentRoom;
   }, [currentRoom]);
+  const messagesByRoomRef = useRef(messagesByRoom);
+  useEffect(() => {
+    messagesByRoomRef.current = messagesByRoom;
+  }, [messagesByRoom]);
+
+  const PAGE_SIZE = 50;
 
   // Active room's messages, derived from the store.
   const messages = currentRoom ? messagesByRoom[currentRoom.name] || [] : [];
@@ -146,14 +156,53 @@ export const useChatConnection = () => {
     try {
       const msgs = (await invoke("get_room_messages", {
         roomId: room.id,
-        limit: 50,
+        limit: PAGE_SIZE,
       })) as any[];
       const normalized = msgs.map((m) => normalizeMessage(m, room.id));
       setMessagesByRoom((prev) => ({ ...prev, [room.name]: normalized }));
+      setHasMoreByRoom((prev) => ({
+        ...prev,
+        [room.name]: normalized.length >= PAGE_SIZE,
+      }));
     } catch (err) {
       console.error("Error loading messages:", err);
     } finally {
       setLoadingMessages(false);
+    }
+  }, []);
+
+  // Load the page of messages immediately older than the oldest one currently held
+  // for the active room, and prepend them (deduped).
+  const loadOlderMessages = useCallback(async () => {
+    const room = currentRoomRef.current;
+    if (!room) return;
+    const list = messagesByRoomRef.current[room.name] || [];
+    const oldest = list.find((m) => m.id != null);
+    if (!oldest?.id) return;
+    try {
+      const older = (await invoke("get_room_messages", {
+        roomId: room.id,
+        limit: PAGE_SIZE,
+        beforeId: oldest.id,
+      })) as any[];
+      const normalized = older.map((m) => normalizeMessage(m, room.id));
+      setHasMoreByRoom((prev) => ({
+        ...prev,
+        [room.name]: normalized.length >= PAGE_SIZE,
+      }));
+      if (normalized.length === 0) return;
+      setMessagesByRoom((prev) => {
+        const existing = prev[room.name] || [];
+        const seen = new Set(
+          existing.map((m) => m.message_id).filter(Boolean) as string[],
+        );
+        const fresh = normalized.filter(
+          (m) => !m.message_id || !seen.has(m.message_id),
+        );
+        return { ...prev, [room.name]: [...fresh, ...existing] };
+      });
+    } catch (err) {
+      console.error("Load older failed:", err);
     }
   }, []);
 
@@ -413,6 +462,7 @@ export const useChatConnection = () => {
     connectionStatus,
     error,
     loadingMessages,
+    hasMore: currentRoom ? (hasMoreByRoom[currentRoom.name] ?? true) : false,
     currentUser,
     currentRoom,
     setMode,
@@ -421,6 +471,7 @@ export const useChatConnection = () => {
     joinRoom,
     leaveRoom,
     sendMessage,
+    loadOlderMessages,
     logout,
     dismissError,
   };

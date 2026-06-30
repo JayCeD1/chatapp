@@ -17,8 +17,10 @@ interface WorkspaceProps {
   membersByRoom: Record<string, string[]>;
   connectionStatus: ConnectionStatus;
   error: string | null;
+  hasMore: boolean;
   onSelectRoom: (room: ChatRoom) => void;
   onSendMessage: (text: string, isEmoji?: boolean) => void;
+  onLoadOlder: () => Promise<void>;
   onLeaveRoom: () => void;
   onLogout: () => void;
   onDismissError: () => void;
@@ -36,8 +38,10 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   membersByRoom,
   connectionStatus,
   error,
+  hasMore,
   onSelectRoom,
   onSendMessage,
+  onLoadOlder,
   onLeaveRoom,
   onLogout,
   onDismissError,
@@ -87,9 +91,11 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             currentUser={currentUser}
             messages={messages}
             loading={loadingMessages}
+            hasMore={hasMore}
             onlineCount={onlineCount}
             memberCount={members.length}
             onSendMessage={onSendMessage}
+            onLoadOlder={onLoadOlder}
             onLeave={onLeaveRoom}
           />
         ) : (

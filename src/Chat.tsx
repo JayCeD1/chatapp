@@ -36,8 +36,10 @@ const Chat = () => {
       membersByRoom={c.membersByRoom}
       connectionStatus={c.connectionStatus}
       error={c.error}
+      hasMore={c.hasMore}
       onSelectRoom={c.joinRoom}
       onSendMessage={c.sendMessage}
+      onLoadOlder={c.loadOlderMessages}
       onLeaveRoom={c.leaveRoom}
       onLogout={c.logout}
       onDismissError={c.dismissError}

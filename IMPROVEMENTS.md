@@ -400,12 +400,14 @@ No eslint config/dep; `prettier` present with no `lint`/`format` script. Anti-pa
 - [x] **Auth + encryption (2.1/2.2/2.3)** — **shared room password + Noise (NNpsk0) encryption**, end-to-end. `secure.rs` transport (built + unit-tested) is now wired into both handshake sites: responder on accept, initiator on connect; all transport frames are encrypted; a wrong password fails the handshake and the connection is dropped. Login UI has a password field (host sets it, clients enter it); reconnect re-derives the key from a ref (not persisted). _Live two-instance verification still recommended (can't GUI-test here). Per-user identity remains self-asserted among authenticated peers — that's inherent to the shared-password model chosen over per-user tokens._ — **L**
 - [x] Make `Connect` idempotent on the host (re-register replaces entry + dedupes room membership); cancel old client listener on reconnect via a stored `JoinHandle` (1.7) — **M**
 - [x] `RoomLeave` end-to-end (`client_leave_room`/`server_leave_room` + server match arm + frontend `leaveRoom`); authoritative stale-cleanup (cleanup reads the live `server_streams` room, not the Connect-time snapshot) (1.8/1.9). _Disconnect is handled by the connection EOF/`clean_client` path._ — **M**
-- [~] Broadcast: snapshot targets + drop all locks before fan-out ✅ (3.2); per-connection ordered encrypt+write ✅ (3.3 ordering). _Dead-client eviction + heartbeat still pending._ — **M**
-- [~] Bounded accept loop ✅ (2.5); per-IP cap + rate limit + read-timeout still pending (read-timeout pairs with the heartbeat in 3.3) — **M**
+- [x] Broadcast: snapshot targets + drop all locks before fan-out (3.2); per-connection ordered encrypt+write (3.3 ordering); **heartbeat keepalives + read-timeout** detect half-open/dead connections (3.3). _Throughput rate-limiting (per-message) is the only remaining sub-item, low priority._ — **M**
+- [x] Bounded accept loop + **per-IP connection cap** + read-timeout (2.5). _Per-message rate-limit still pending (low priority)._ — **M**
 - [x] Replace network-path `unwrap`/`expect` with graceful handling; `now_secs()` helper (2.6) — **M**
 - [x] Remove `sql:allow-execute` (+ `sql:default` + unused `dialog`); set strict CSP (2.7) — **S**
 - [x] Input validation/length caps at command + wire boundary (2.8) — **M**
-- [x] DB integrity: `foreign_keys=ON`, WAL, busy_timeout, indexes, `UNIQUE(chat_rooms.name)` (Phase 0), `upsert_user` normalization, `join_room` upsert (4.2-4.6/4.8). _FK `ON DELETE` still pending — needs a table-rebuild migration._ — **M**
+- [x] DB integrity: `foreign_keys=ON`, WAL, busy_timeout, indexes, `UNIQUE(chat_rooms.name)` (Phase 0), `upsert_user` normalization, `join_room` upsert (4.2-4.6/4.8); **FK `ON DELETE CASCADE`** on the child tables via migration v9 (defensive orphan-clean + rebuild, SQLite-replay verified) + `get_room_messages` LEFT JOIN so messages never silently vanish (4.4) — **M**
+
+**Phase 1 is complete.** The only intentionally-skipped sub-item is per-message throughput rate-limiting (low value pre-product). Remaining: a live two-instance GUI smoke test of the encryption (can't run here).
 
 ### Phase 2 — UX/layout overhaul to a persistent sidebar
 - [ ] Persistent 3-pane shell (sidebar + center + members), no full-screen swaps; demote "leave room" (6.1) — **L**

@@ -428,9 +428,9 @@ pub async fn get_room_messages(
 
     let result = sqlx::query(
         "SELECT m.id, m.message_id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
-                u.name as username
+                COALESCE(u.name, 'Unknown') as username
          FROM messages m
-         JOIN users u ON m.user_id = u.id
+         LEFT JOIN users u ON m.user_id = u.id
          WHERE m.room_id = $1
          ORDER BY m.created_at DESC, m.id DESC
          LIMIT $2",

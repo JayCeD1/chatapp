@@ -134,6 +134,57 @@ pub fn get_migrations() -> Vec<Migration> {
                   DROP INDEX IF EXISTS idx_messages_message_id;",
             kind: MigrationKind::Down,
         },
+        // Migration 9: rebuild the child tables (messages, user_rooms) with ON DELETE
+        // CASCADE so deleting a room/user removes its messages + memberships instead of
+        // leaving orphans. Child tables only (nothing references them), so this is safe
+        // with foreign_keys=ON; a defensive orphan-cleanup guarantees the FK-checked
+        // re-insert can't fail. Indexes are recreated afterward.
+        Migration {
+            version: 9,
+            description: "add_on_delete_cascade_to_child_tables",
+            sql: "DELETE FROM messages
+                      WHERE room_id NOT IN (SELECT id FROM chat_rooms)
+                         OR user_id NOT IN (SELECT id FROM users);
+                  CREATE TABLE messages_new (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      room_id INTEGER NOT NULL,
+                      user_id INTEGER NOT NULL,
+                      message TEXT NOT NULL,
+                      message_type TEXT DEFAULT 'chat',
+                      is_emoji BOOLEAN DEFAULT FALSE,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      message_id TEXT,
+                      FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE,
+                      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                  );
+                  INSERT INTO messages_new (id, room_id, user_id, message, message_type, is_emoji, created_at, message_id)
+                      SELECT id, room_id, user_id, message, message_type, is_emoji, created_at, message_id FROM messages;
+                  DROP TABLE messages;
+                  ALTER TABLE messages_new RENAME TO messages;
+                  CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id);
+                  CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at, id);
+                  CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
+
+                  DELETE FROM user_rooms
+                      WHERE user_id NOT IN (SELECT id FROM users)
+                         OR room_id NOT IN (SELECT id FROM chat_rooms);
+                  CREATE TABLE user_rooms_new (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      user_id INTEGER NOT NULL,
+                      room_id INTEGER NOT NULL,
+                      joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      is_active BOOLEAN DEFAULT TRUE,
+                      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+                      FOREIGN KEY (room_id) REFERENCES chat_rooms(id) ON DELETE CASCADE,
+                      UNIQUE(user_id, room_id)
+                  );
+                  INSERT INTO user_rooms_new (id, user_id, room_id, joined_at, is_active)
+                      SELECT id, user_id, room_id, joined_at, is_active FROM user_rooms;
+                  DROP TABLE user_rooms;
+                  ALTER TABLE user_rooms_new RENAME TO user_rooms;
+                  CREATE INDEX IF NOT EXISTS idx_user_rooms_room_active ON user_rooms(room_id, is_active);",
+            kind: MigrationKind::Up,
+        },
         // Down for v7: remove default chat rooms created in v7
         Migration {
             version: 7,

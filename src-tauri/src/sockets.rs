@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use snow::TransportState;
 use sqlx::SqlitePool;
 use std::collections::HashMap;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, State};
@@ -25,6 +25,55 @@ const MAX_CONCURRENT_CLIENTS: usize = 256;
 
 /// Maximum length (in characters) of a single chat message.
 const MAX_MESSAGE_CHARS: usize = 4000;
+
+/// How often each side sends a zero-length keepalive frame.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
+/// If no frame (including a keepalive) arrives within this window, the peer is
+/// treated as dead and the connection is closed. ~3 missed heartbeats.
+const READ_TIMEOUT: Duration = Duration::from_secs(45);
+
+/// Maximum concurrent connections allowed from a single remote IP address.
+const MAX_CONN_PER_IP: usize = 16;
+
+/// Spawn a task that sends a zero-length keepalive frame to `writer` every
+/// HEARTBEAT_INTERVAL. Zero-length frames are read as `Ok(None)` and skipped before
+/// decryption, so they never touch the Noise transport / nonce sequence.
+fn spawn_heartbeat(
+    writer: Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let mut w = writer.lock().await;
+            if w.write_all(&0u32.to_be_bytes()).await.is_err() {
+                break; // peer gone; the read side will handle cleanup
+            }
+        }
+    })
+}
+
+/// Client-side keepalive: same idea, but the client's writer lives behind an Option.
+fn spawn_client_heartbeat(
+    client_stream: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
+) -> tauri::async_runtime::JoinHandle<()> {
+    tauri::async_runtime::spawn(async move {
+        let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
+        loop {
+            ticker.tick().await;
+            let mut guard = client_stream.lock().await;
+            let stop = match guard.as_mut() {
+                Some(w) => w.write_all(&0u32.to_be_bytes()).await.is_err(),
+                None => true, // disconnected
+            };
+            drop(guard);
+            if stop {
+                break;
+            }
+        }
+    })
+}
 
 /// Read one length-prefixed frame: a 4-byte big-endian length header followed by
 /// that many payload bytes. Returns `Ok(None)` for a zero-length keep-alive frame.
@@ -83,11 +132,14 @@ pub struct AppState {
     // Separate client stream management (write half + matching Noise transport)
     pub client_stream: Arc<tokio::sync::Mutex<Option<tokio::net::tcp::OwnedWriteHalf>>>,
     pub client_transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
-    // Handle to the current client read-listener task, so reconnect/disconnect can
-    // cancel a stale listener before starting a new one.
+    // Handles to the current client read-listener + heartbeat tasks, so reconnect/
+    // disconnect can cancel the stale tasks before starting new ones.
     pub client_listener: Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
+    pub client_heartbeat: Arc<tokio::sync::Mutex<Option<tauri::async_runtime::JoinHandle<()>>>>,
     // Track which users are in which rooms for efficient broadcasting
     pub room_clients: Arc<tokio::sync::Mutex<HashMap<String, Vec<u64>>>>,
+    // Live connection count per remote IP, for the per-IP connection cap.
+    pub ip_conn_counts: Arc<tokio::sync::Mutex<HashMap<IpAddr, usize>>>,
 
     // Use RwLock for frequently-read scalar fields
     pub username: tokio::sync::RwLock<String>,
@@ -305,9 +357,28 @@ pub async fn server_listen_as_participant(
                             continue;
                         }
                     };
+                    // Per-IP cap: don't let one host monopolize the connection budget.
+                    let ip = addr.ip();
+                    let over_ip_limit = {
+                        let mut counts = state_clone.ip_conn_counts.lock().await;
+                        let c = counts.entry(ip).or_insert(0);
+                        if *c >= MAX_CONN_PER_IP {
+                            true
+                        } else {
+                            *c += 1;
+                            false
+                        }
+                    };
+                    if over_ip_limit {
+                        eprintln!("⚠️  Per-IP connection limit for {}; rejecting", ip);
+                        drop(stream);
+                        continue;
+                    }
+
                     println!("🔵 New client connecting from: {}", addr);
                     let app_handle = app_clone.clone();
                     let state_handle = state_clone.clone();
+                    let state_dec = state_clone.clone();
                     let pool_handle = pool_clone.clone();
 
                     // Use tokio::spawn for individual client handling (pure network I/O)
@@ -323,6 +394,14 @@ pub async fn server_listen_as_participant(
                         .await
                         {
                             eprintln!("Failed to handle client connection: {}", e);
+                        }
+                        // Release this IP's slot when the connection ends.
+                        let mut counts = state_dec.ip_conn_counts.lock().await;
+                        if let Some(c) = counts.get_mut(&ip) {
+                            *c = c.saturating_sub(1);
+                            if *c == 0 {
+                                counts.remove(&ip);
+                            }
                         }
                     });
                 }
@@ -364,16 +443,27 @@ async fn handle_client_connection(
     let writer_arc = Arc::new(tokio::sync::Mutex::new(writer));
     let transport_arc = Arc::new(tokio::sync::Mutex::new(transport));
 
+    // Keep the connection alive and let the read-timeout below detect a dead peer.
+    let heartbeat = spawn_heartbeat(Arc::clone(&writer_arc));
+
     let mut client_info: Option<ClientConnection> = None;
     loop {
         // Read one encrypted frame (capped at MAX_FRAME_BYTES), then decrypt it.
-        match read_frame(&mut reader).await {
+        // A timeout means we stopped hearing even keepalives → treat the peer as dead.
+        let framed = tokio::time::timeout(READ_TIMEOUT, read_frame(&mut reader)).await;
+        match framed {
+            Err(_elapsed) => {
+                eprintln!(
+                    "⏱️  Read timeout from {} (no heartbeat); closing",
+                    peer_addr
+                );
+                break;
+            }
             // Recoverable: empty keep-alive frame → ignore and wait for next
-            Ok(None) => {
-                println!("Ignoring empty message");
+            Ok(Ok(None)) => {
                 continue;
             }
-            Ok(Some(ciphertext)) => {
+            Ok(Ok(Some(ciphertext))) => {
                 let plaintext = {
                     let mut ts = transport_arc.lock().await;
                     match secure::decrypt(&mut ts, &ciphertext) {
@@ -384,8 +474,20 @@ async fn handle_client_connection(
                         }
                     }
                 };
-                let message_str = std::str::from_utf8(&plaintext)?;
-                let message: Message = serde_json::from_str(message_str)?;
+                let message_str = match std::str::from_utf8(&plaintext) {
+                    Ok(s) => s,
+                    Err(e) => {
+                        eprintln!("Invalid UTF-8 from {}: {}", peer_addr, e);
+                        break;
+                    }
+                };
+                let message: Message = match serde_json::from_str(message_str) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        eprintln!("Malformed message from {}: {}", peer_addr, e);
+                        break;
+                    }
+                };
 
                 //Handle client registration
                 if message.message_type == MessageType::Connect {
@@ -426,19 +528,26 @@ async fn handle_client_connection(
                         message.username, message.user_id, message.room
                     );
                 }
-                handle_server_message(app.clone(), state.clone(), message, pool.clone()).await?;
+                // A single bad message shouldn't kill the connection.
+                if let Err(e) =
+                    handle_server_message(app.clone(), state.clone(), message, pool.clone()).await
+                {
+                    eprintln!("Error handling message from {}: {}", peer_addr, e);
+                }
             }
 
-            Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
+            Ok(Err(e)) if e.kind() == std::io::ErrorKind::UnexpectedEof => {
                 println!("client disconnected: {} - {}", peer_addr, e);
                 break;
             }
-            Err(e) => {
+            Ok(Err(e)) => {
                 eprintln!("Connection closed: {} - {}", peer_addr, e);
                 break;
             }
         }
     }
+    heartbeat.abort();
+
     //Clean up with proper error handling
     if let Some(client) = client_info {
         if let Err(e) = clean_client(&state, &app, client.user_id, &pool).await {
@@ -839,20 +948,25 @@ pub async fn client_connect_to_server(
         .await
         .map_err(|e| format!("Failed to send connect message to server: {}", e))?;
 
-    // Cancel any previous listener (e.g. from a dropped connection) BEFORE starting the
-    // new one, so the stale task can't emit a spurious connection_lost and trigger an
-    // unwanted reconnect loop.
+    // Cancel any previous listener + heartbeat (e.g. from a dropped connection) BEFORE
+    // starting new ones, so a stale task can't emit a spurious connection_lost and
+    // trigger an unwanted reconnect loop.
     {
         let mut guard = state.client_listener.lock().await;
         if let Some(old) = guard.take() {
             old.abort();
         }
     }
-    let handle = start_client_listener(app, reader, Arc::clone(&state.client_transport));
     {
-        let mut guard = state.client_listener.lock().await;
-        *guard = Some(handle);
+        let mut guard = state.client_heartbeat.lock().await;
+        if let Some(old) = guard.take() {
+            old.abort();
+        }
     }
+    let listener = start_client_listener(app, reader, Arc::clone(&state.client_transport));
+    *state.client_listener.lock().await = Some(listener);
+    let heartbeat = spawn_client_heartbeat(Arc::clone(&state.client_stream));
+    *state.client_heartbeat.lock().await = Some(heartbeat);
 
     println!("✅ Client connected successfully");
     Ok(())
@@ -916,44 +1030,51 @@ fn start_client_listener(
         println!("🎧 Client listener started");
 
         loop {
-            // Same capped framing as the server path (read_frame rejects oversized frames);
-            // each frame is then decrypted with the shared client transport.
-            match read_frame(&mut reader).await {
-                Ok(None) => continue, // empty keep-alive frame
-                Ok(Some(ciphertext)) => {
-                    let plaintext = {
-                        let mut guard = transport.lock().await;
-                        match guard.as_mut() {
-                            Some(ts) => match secure::decrypt(ts, &ciphertext) {
-                                Ok(p) => p,
-                                Err(e) => {
-                                    eprintln!("🔒 Client decrypt error: {}", e);
-                                    break;
-                                }
-                            },
-                            None => {
-                                eprintln!("🔒 No client transport; dropping frame");
-                                break;
-                            }
-                        }
-                    };
-                    match String::from_utf8(plaintext) {
-                        Ok(message_str) => {
-                            println!("🎧 Client received: {}", message_str);
-                            if let Err(e) = app.emit("message", message_str) {
-                                eprintln!("Failed to emit received message: {}", e);
-                            }
-                        }
-                        Err(e) => eprintln!("🔒 Invalid UTF-8 after decrypt: {}", e),
-                    }
+            // Same capped framing as the server path; each frame is then decrypted with
+            // the shared client transport. A read-timeout (no frame, not even a keepalive)
+            // means the host is gone → surface connection_lost so reconnect can kick in.
+            let framed = tokio::time::timeout(READ_TIMEOUT, read_frame(&mut reader)).await;
+            let ciphertext = match framed {
+                Err(_elapsed) => {
+                    println!("⏱️  Client read timeout (host gone)");
+                    let _ = app.emit("connection_lost", ());
+                    break;
                 }
-                Err(e) => {
+                Ok(Ok(None)) => continue, // empty keep-alive frame
+                Ok(Ok(Some(ct))) => ct,
+                Ok(Err(e)) => {
                     println!("🔴 Client connection lost: {}", e);
                     if let Err(emit_err) = app.emit("connection_lost", ()) {
                         eprintln!("Failed to emit connection lost: {}", emit_err);
                     }
                     break;
                 }
+            };
+
+            let plaintext = {
+                let mut guard = transport.lock().await;
+                match guard.as_mut() {
+                    Some(ts) => match secure::decrypt(ts, &ciphertext) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            eprintln!("🔒 Client decrypt error: {}", e);
+                            break;
+                        }
+                    },
+                    None => {
+                        eprintln!("🔒 No client transport; dropping frame");
+                        break;
+                    }
+                }
+            };
+            match String::from_utf8(plaintext) {
+                Ok(message_str) => {
+                    println!("🎧 Client received: {}", message_str);
+                    if let Err(e) = app.emit("message", message_str) {
+                        eprintln!("Failed to emit received message: {}", e);
+                    }
+                }
+                Err(e) => eprintln!("🔒 Invalid UTF-8 after decrypt: {}", e),
             }
         }
     })
@@ -1233,9 +1354,16 @@ pub async fn client_disconnect(
         let mut guard = state.client_transport.lock().await;
         guard.take();
     }
-    // Stop the read listener so it doesn't emit connection_lost as we tear down.
+    // Stop the read listener + heartbeat so they don't emit connection_lost / write to a
+    // closed socket as we tear down.
     {
         let mut guard = state.client_listener.lock().await;
+        if let Some(handle) = guard.take() {
+            handle.abort();
+        }
+    }
+    {
+        let mut guard = state.client_heartbeat.lock().await;
         if let Some(handle) = guard.take() {
             handle.abort();
         }

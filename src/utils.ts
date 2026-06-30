@@ -49,6 +49,19 @@ export function formatDateSeparator(iso: string): string {
   });
 }
 
+// Short "Mon 3, 10:42 AM" for search results (handles DB "YYYY-MM-DD HH:MM:SS" UTC).
+export function formatSearchTime(s: string): string {
+  const iso = s.includes("T") ? s : s.replace(" ", "T") + "Z";
+  const d = new Date(iso);
+  if (isNaN(d.getTime())) return "";
+  return d.toLocaleString([], {
+    month: "short",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  });
+}
+
 export function sameDay(a: string, b: string): boolean {
   const da = new Date(a);
   const db = new Date(b);

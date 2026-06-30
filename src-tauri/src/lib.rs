@@ -1,7 +1,7 @@
 use crate::db_queries::{
     create_room, create_user, get_chat_rooms, get_departments, get_room_messages,
     get_rooms_by_department, get_user_by_id, get_users, join_room, leave_room, save_message,
-    update_user_online_status, upsert_user,
+    search_messages, update_user_online_status, upsert_user,
 };
 use crate::sockets::{
     client_connect_to_server, client_delete_message, client_disconnect, client_edit_message,
@@ -97,6 +97,7 @@ pub fn run() {
             // Message management
             save_message,
             get_room_messages,
+            search_messages,
             // Socket management
             get_server_info,
             discover_servers,

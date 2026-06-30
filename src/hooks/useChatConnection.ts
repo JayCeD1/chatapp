@@ -6,6 +6,7 @@ import {
   ConnectionMode,
   Department,
   Message,
+  SearchResult,
   User,
   ViewState,
 } from "../types";
@@ -434,6 +435,27 @@ export const useChatConnection = () => {
     await joinRoom(room);
   };
 
+  const searchMessages = useCallback(
+    async (query: string): Promise<SearchResult[]> => {
+      try {
+        return (await invoke("search_messages", {
+          query,
+          limit: 50,
+        })) as SearchResult[];
+      } catch (err) {
+        console.error("Search failed:", err);
+        return [];
+      }
+    },
+    [],
+  );
+
+  // Open a room by id (e.g. from a search result).
+  const jumpToRoom = (roomId: number) => {
+    const room = chatRooms.find((r) => r.id === roomId);
+    if (room) joinRoom(room);
+  };
+
   // Leave the active room (back to "no channel selected"); stays in the workspace.
   const leaveRoom = async () => {
     if (!currentUser || !currentRoom) return;
@@ -575,6 +597,8 @@ export const useChatConnection = () => {
     editMessage,
     deleteMessage,
     loadOlderMessages,
+    searchMessages,
+    jumpToRoom,
     logout,
     dismissError,
   };

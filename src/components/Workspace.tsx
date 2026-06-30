@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo } from "react";
 import { Hash, RefreshCw, WifiOff, X } from "lucide-react";
-import { ChatRoom, Department, Message, User } from "../types";
+import { ChatRoom, Department, Message, SearchResult, User } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
 import { Theme } from "../hooks/useTheme";
 import { Sidebar } from "./Sidebar";
@@ -25,6 +25,8 @@ interface WorkspaceProps {
     departmentId: number | null,
     isPrivate: boolean,
   ) => Promise<void>;
+  onSearch: (query: string) => Promise<SearchResult[]>;
+  onJumpToRoom: (roomId: number) => void;
   onSendMessage: (text: string, isEmoji?: boolean) => void;
   onEditMessage: (targetId: string, newText: string) => Promise<void>;
   onDeleteMessage: (targetId: string) => Promise<void>;
@@ -49,6 +51,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   hasMore,
   onSelectRoom,
   onCreateRoom,
+  onSearch,
+  onJumpToRoom,
   onSendMessage,
   onEditMessage,
   onDeleteMessage,
@@ -88,6 +92,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         connectionStatus={connectionStatus}
         onSelectRoom={onSelectRoom}
         onCreateRoom={onCreateRoom}
+        onSearch={onSearch}
+        onJumpToRoom={onJumpToRoom}
         onLogout={onLogout}
         theme={theme}
         onToggleTheme={onToggleTheme}

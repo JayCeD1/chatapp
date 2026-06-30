@@ -39,6 +39,8 @@ const Chat = () => {
       hasMore={c.hasMore}
       onSelectRoom={c.joinRoom}
       onCreateRoom={c.createRoom}
+      onSearch={c.searchMessages}
+      onJumpToRoom={c.jumpToRoom}
       onSendMessage={c.sendMessage}
       onEditMessage={c.editMessage}
       onDeleteMessage={c.deleteMessage}

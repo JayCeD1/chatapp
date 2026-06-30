@@ -36,5 +36,14 @@ export interface Message {
   deleted_at?: string | null;
 }
 
+export interface SearchResult {
+  message_id?: string;
+  room_id: number;
+  room_name: string;
+  username: string;
+  message: string;
+  created_at: string;
+}
+
 export type ViewState = "login" | "workspace";
 export type ConnectionMode = "client" | "server";

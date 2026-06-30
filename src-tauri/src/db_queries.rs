@@ -566,3 +566,64 @@ pub async fn delete_message_db(
     .map_err(|e| format!("Failed to delete message: {}", e))?;
     Ok(res.rows_affected())
 }
+
+#[derive(Serialize)]
+pub struct SearchResult {
+    pub message_id: Option<String>,
+    pub room_id: i64,
+    pub room_name: String,
+    pub username: String,
+    pub message: String,
+    pub created_at: String,
+}
+
+/// Full-text-ish search across non-deleted chat messages (case-insensitive LIKE).
+#[tauri::command]
+pub async fn search_messages(
+    db: State<'_, SqlitePool>,
+    query: String,
+    limit: Option<i64>,
+) -> Result<Vec<SearchResult>, String> {
+    let q = query.trim();
+    if q.is_empty() {
+        return Ok(Vec::new());
+    }
+    let limit = limit.unwrap_or(50).clamp(1, 200);
+    // Escape LIKE wildcards in the user query, then wrap with %...% via ESCAPE.
+    let escaped = q
+        .replace('\\', "\\\\")
+        .replace('%', "\\%")
+        .replace('_', "\\_");
+    let pattern = format!("%{}%", escaped);
+
+    let rows = sqlx::query(
+        "SELECT m.message_id, m.room_id, m.message, m.created_at,
+                COALESCE(u.name, 'Unknown') AS username, cr.name AS room_name
+         FROM messages m
+         LEFT JOIN users u ON m.user_id = u.id
+         JOIN chat_rooms cr ON m.room_id = cr.id
+         WHERE m.deleted_at IS NULL
+           AND m.message_type = 'Chat'
+           AND m.message LIKE $1 ESCAPE '\\'
+         ORDER BY m.created_at DESC, m.id DESC
+         LIMIT $2",
+    )
+    .bind(&pattern)
+    .bind(&limit)
+    .fetch_all(&*db)
+    .await
+    .map_err(|e| format!("Search failed: {}", e))?;
+
+    let mut results = Vec::new();
+    for row in rows {
+        results.push(SearchResult {
+            message_id: row.get::<Option<String>, _>("message_id"),
+            room_id: row.get::<i64, _>("room_id"),
+            room_name: row.get::<String, _>("room_name"),
+            username: row.get::<String, _>("username"),
+            message: row.get::<String, _>("message"),
+            created_at: row.get::<String, _>("created_at"),
+        });
+    }
+    Ok(results)
+}

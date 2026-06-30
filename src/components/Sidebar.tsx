@@ -1,10 +1,11 @@
 import React, { useState } from "react";
-import { Hash, LogOut, Users, Sun, Moon, Plus } from "lucide-react";
-import { ChatRoom, Department, User } from "../types";
+import { Hash, LogOut, Users, Sun, Moon, Plus, Search } from "lucide-react";
+import { ChatRoom, Department, SearchResult, User } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
 import { Theme } from "../hooks/useTheme";
 import { initials, avatarColor } from "../utils";
 import { CreateChannelModal } from "./CreateChannelModal";
+import { SearchModal } from "./SearchModal";
 
 interface SidebarProps {
   departments: Department[];
@@ -19,6 +20,8 @@ interface SidebarProps {
     departmentId: number | null,
     isPrivate: boolean,
   ) => Promise<void>;
+  onSearch: (query: string) => Promise<SearchResult[]>;
+  onJumpToRoom: (roomId: number) => void;
   onLogout: () => void;
   theme: Theme;
   onToggleTheme: () => void;
@@ -38,11 +41,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
   connectionStatus,
   onSelectRoom,
   onCreateRoom,
+  onSearch,
+  onJumpToRoom,
   onLogout,
   theme,
   onToggleTheme,
 }) => {
   const [showCreate, setShowCreate] = useState(false);
+  const [showSearch, setShowSearch] = useState(false);
 
   // Group rooms by department; keep any unmatched rooms under "Other".
   const groups = departments
@@ -68,6 +74,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <span className="font-semibold text-[var(--text)] tracking-tight flex-1">
           Nutler
         </span>
+        <button
+          onClick={() => setShowSearch(true)}
+          title="Search messages"
+          aria-label="Search messages"
+          className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+        >
+          <Search className="w-4 h-4" />
+        </button>
         <button
           onClick={() => setShowCreate(true)}
           title="Create a channel"
@@ -189,6 +203,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
           }
           onCreate={onCreateRoom}
           onClose={() => setShowCreate(false)}
+        />
+      )}
+
+      {showSearch && (
+        <SearchModal
+          onSearch={onSearch}
+          onJump={onJumpToRoom}
+          onClose={() => setShowSearch(false)}
         />
       )}
     </aside>

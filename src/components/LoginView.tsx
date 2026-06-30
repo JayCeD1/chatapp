@@ -1,5 +1,5 @@
 import React, { useState } from "react";
-import { User, Server, Globe, Lock } from "lucide-react";
+import { User, Server, Hash, Lock, Mail, AlertCircle } from "lucide-react";
 import { Department, ConnectionMode } from "../types";
 
 interface LoginViewProps {
@@ -16,6 +16,9 @@ interface LoginViewProps {
   ) => Promise<void>;
 }
 
+const inputClass =
+  "w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-xl py-3 pl-10 pr-4 text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent-soft)] transition-colors";
+
 export const LoginView: React.FC<LoginViewProps> = ({
   departments,
   mode,
@@ -29,74 +32,89 @@ export const LoginView: React.FC<LoginViewProps> = ({
   const [departmentId, setDepartmentId] = useState<number | null>(null);
   const [password, setPassword] = useState("");
   const [loading, setLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const handleSubmit = async () => {
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
     if (!username || !email || !departmentId || !password) return;
     setLoading(true);
+    setError(null);
     try {
       await onLogin(username, email, departmentId, password);
-    } catch (e) {
-      console.error(e);
+    } catch (err) {
+      setError(
+        String(err).toLowerCase().includes("handshake")
+          ? "Couldn't connect — check the server address and room password."
+          : "Couldn't connect. Please check your details and try again.",
+      );
     } finally {
       setLoading(false);
     }
   };
 
   return (
-    <div className="w-full max-w-md p-8 rounded-3xl bg-white/10 backdrop-blur-xl border border-white/20 shadow-2xl animate-fade-in relative z-10">
-      <div className="text-center mb-8">
-        <div className="inline-flex items-center justify-center p-4 bg-gradient-to-br from-violet-500 to-fuchsia-500 rounded-2xl shadow-lg mb-4">
-          <Globe className="text-white w-8 h-8" />
+    <div className="w-full max-w-md p-8 rounded-2xl bg-[var(--surface)] border border-[var(--border)] shadow-2xl animate-fade-in relative z-10">
+      <div className="text-center mb-7">
+        <div className="inline-flex items-center justify-center w-12 h-12 bg-gradient-to-br from-[var(--accent)] to-[var(--accent-strong)] rounded-xl shadow-lg mb-4">
+          <Hash className="text-white w-6 h-6" />
         </div>
-        <h1 className="text-3xl font-bold text-white tracking-tight">
-          Welcome Back
+        <h1 className="text-2xl font-bold text-[var(--text)] tracking-tight">
+          Welcome to Nutler
         </h1>
-        <p className="text-white/60 mt-2">Connect with your team workspace</p>
+        <p className="text-[var(--text-dim)] mt-1.5 text-sm">
+          {mode === "server"
+            ? "Host a room for your team"
+            : "Connect to your team workspace"}
+        </p>
       </div>
 
-      <div className="bg-black/20 p-1 rounded-xl flex mb-6 backdrop-blur-md">
+      <div
+        className="bg-[var(--surface-2)] p-1 rounded-xl flex mb-5"
+        role="tablist"
+        aria-label="Connection mode"
+      >
         <button
+          type="button"
+          role="tab"
+          aria-selected={mode === "client"}
           onClick={() => setMode("client")}
-          className={`flex-1 py-2.5 rounded-lg text-sm font-semibold transition-all duration-300 ${
+          className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-colors ${
             mode === "client"
-              ? "bg-white text-violet-900 shadow-md transform scale-105"
-              : "text-white/70 hover:text-white"
+              ? "bg-[var(--surface-3)] text-[var(--text)]"
+              : "text-[var(--text-dim)] hover:text-[var(--text)]"
           }`}
         >
           Join Server
         </button>
         <button
+          type="button"
+          role="tab"
+          aria-selected={mode === "server"}
           onClick={() => setMode("server")}
-          className={`flex-1 py-2.5 rounded-lg text-sm font-semibold transition-all duration-300 ${
+          className={`flex-1 py-2 rounded-lg text-sm font-semibold transition-colors ${
             mode === "server"
-              ? "bg-white text-violet-900 shadow-md transform scale-105"
-              : "text-white/70 hover:text-white"
+              ? "bg-[var(--surface-3)] text-[var(--text)]"
+              : "text-[var(--text-dim)] hover:text-[var(--text)]"
           }`}
         >
           Host Server
         </button>
       </div>
 
-      <div className="space-y-4">
-        <div
-          className={`transition-all duration-300 overflow-hidden ${
-            mode === "client" ? "max-h-20 opacity-100" : "max-h-0 opacity-0"
-          }`}
-        >
-          <div className="relative group">
-            <Server className="absolute left-3 top-3.5 w-5 h-5 text-white/50 group-focus-within:text-white transition-colors" />
+      <form className="space-y-3.5" onSubmit={handleSubmit}>
+        {mode === "client" && (
+          <Field icon={<Server className="w-4 h-4" />} label="Server address">
             <input
               type="text"
               value={serverIp}
               onChange={(e) => setServerIp(e.target.value)}
               placeholder="Server IP (e.g. 127.0.0.1:3625)"
-              className="w-full bg-white/5 border border-white/10 rounded-xl py-3 pl-10 pr-4 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:bg-white/10 transition-all"
+              className={inputClass}
             />
-          </div>
-        </div>
+          </Field>
+        )}
 
-        <div className="relative group">
-          <Lock className="absolute left-3 top-3.5 w-5 h-5 text-white/50 group-focus-within:text-white transition-colors" />
+        <Field icon={<Lock className="w-4 h-4" />} label="Room password">
           <input
             type="password"
             value={password}
@@ -104,84 +122,98 @@ export const LoginView: React.FC<LoginViewProps> = ({
             placeholder={
               mode === "server" ? "Set a room password" : "Room password"
             }
-            className="w-full bg-white/5 border border-white/10 rounded-xl py-3 pl-10 pr-4 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:bg-white/10 transition-all"
+            autoComplete={
+              mode === "server" ? "new-password" : "current-password"
+            }
+            className={inputClass}
           />
-        </div>
+        </Field>
 
-        <div className="relative group">
-          <User className="absolute left-3 top-3.5 w-5 h-5 text-white/50 group-focus-within:text-white transition-colors" />
+        <Field icon={<User className="w-4 h-4" />} label="Username">
           <input
             type="text"
             value={username}
             onChange={(e) => setUsername(e.target.value)}
             placeholder="Username"
-            className="w-full bg-white/5 border border-white/10 rounded-xl py-3 pl-10 pr-4 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:bg-white/10 transition-all"
+            autoFocus
+            className={inputClass}
           />
-        </div>
+        </Field>
 
-        <div className="relative group">
+        <Field icon={<Mail className="w-4 h-4" />} label="Email address">
           <input
             type="email"
             value={email}
             onChange={(e) => setEmail(e.target.value)}
-            placeholder="Email Address"
-            className="w-full bg-white/5 border border-white/10 rounded-xl py-3 px-4 text-white placeholder-white/30 focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:bg-white/10 transition-all"
+            placeholder="Email address"
+            className={inputClass}
           />
-        </div>
+        </Field>
 
-        <div className="relative">
+        <div>
+          <label htmlFor="department" className="sr-only">
+            Department
+          </label>
           <select
+            id="department"
             value={departmentId || ""}
             onChange={(e) => setDepartmentId(Number(e.target.value))}
-            className="w-full bg-white/5 border border-white/10 rounded-xl py-3 px-4 text-white focus:outline-none focus:ring-2 focus:ring-violet-400/50 focus:bg-white/10 transition-all appearance-none cursor-pointer"
+            className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-xl py-3 px-4 text-[var(--text)] focus:outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent-soft)] transition-colors appearance-none cursor-pointer"
           >
-            <option value="" className="bg-gray-800 text-gray-300">
-              Select Department
+            <option value="" disabled>
+              Select department
             </option>
             {departments.map((dep) => (
-              <option
-                key={dep.id}
-                value={dep.id}
-                className="bg-gray-800 text-white"
-              >
+              <option key={dep.id} value={dep.id}>
                 {dep.name}
               </option>
             ))}
           </select>
-          <div className="absolute right-4 top-3.5 pointer-events-none">
-            <svg
-              className="w-5 h-5 text-white/50"
-              fill="none"
-              stroke="currentColor"
-              viewBox="0 0 24 24"
-            >
-              <path
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                strokeWidth="2"
-                d="M19 9l-7 7-7-7"
-              ></path>
-            </svg>
-          </div>
         </div>
 
+        {error && (
+          <div
+            role="alert"
+            className="flex items-start gap-2 text-sm text-[var(--danger)] bg-[var(--danger)]/10 border border-[var(--danger)]/30 rounded-lg px-3 py-2"
+          >
+            <AlertCircle className="w-4 h-4 mt-0.5 shrink-0" />
+            <span>{error}</span>
+          </div>
+        )}
+
         <button
-          onClick={handleSubmit}
+          type="submit"
           disabled={
             loading || !username || !email || !departmentId || !password
           }
-          className="w-full bg-gradient-to-r from-violet-500 to-fuchsia-500 hover:from-violet-400 hover:to-fuchsia-400 text-white font-bold py-3.5 rounded-xl shadow-lg hover:shadow-violet-500/25 transform hover:-translate-y-0.5 transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed disabled:transform-none mt-4"
+          className="w-full bg-[var(--accent)] hover:bg-[var(--accent-strong)] text-white font-semibold py-3 rounded-xl shadow-lg transition-colors disabled:opacity-50 disabled:cursor-not-allowed mt-1"
         >
           {loading ? (
             <span className="flex items-center justify-center gap-2">
               <span className="w-4 h-4 border-2 border-white/30 border-t-white rounded-full animate-spin" />
-              Connecting...
+              Connecting…
             </span>
+          ) : mode === "server" ? (
+            "Start hosting"
           ) : (
-            "Enter Workspace"
+            "Enter workspace"
           )}
         </button>
-      </div>
+      </form>
     </div>
   );
 };
+
+const Field: React.FC<{
+  icon: React.ReactNode;
+  label: string;
+  children: React.ReactNode;
+}> = ({ icon, label, children }) => (
+  <div className="relative">
+    <label className="sr-only">{label}</label>
+    <span className="absolute left-3 top-1/2 -translate-y-1/2 text-[var(--text-faint)]">
+      {icon}
+    </span>
+    {children}
+  </div>
+);

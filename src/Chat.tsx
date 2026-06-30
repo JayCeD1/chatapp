@@ -1,78 +1,45 @@
-
+import "./App.css";
 import { useChatConnection } from "./hooks/useChatConnection";
 import { LoginView } from "./components/LoginView";
-import { RoomList } from "./components/RoomList";
-import { ChatInterface } from "./components/ChatInterface";
-import { Loader2 } from "lucide-react";
-
-// Add some global animation styles inline or verify they exist in Tailwind config.
-// Since we used 'animate-fade-in', 'animate-slide-up' etc, we might need to add them to index.css
-// For now, standard transitions are handled by class names.
+import { Workspace } from "./components/Workspace";
 
 const Chat = () => {
-  const {
-    view,
-    mode,
-    serverIp,
-    departments,
-    chatRooms,
-    messages,
-    currentUser,
-    currentRoom,
-    setMode,
-    setServerIp,
-    login,
-    joinRoom,
-    leaveRoom,
-    sendMessage,
-    logout,
-  } = useChatConnection();
+  const c = useChatConnection();
 
-  // Background wrapper
-  return (
-    <div className="min-h-screen w-full bg-[#0f0c29] bg-gradient-to-br from-[#0f0c29] via-[#302b63] to-[#24243e] flex items-center justify-center relative overflow-hidden font-sans">
-      {/* Abstract Background Shapes */}
-      <div className="absolute top-[-10%] left-[-10%] w-[40%] h-[40%] bg-violet-600/30 rounded-full blur-[120px] animate-pulse" />
-      <div className="absolute bottom-[-10%] right-[-10%] w-[40%] h-[40%] bg-fuchsia-600/30 rounded-full blur-[120px] animate-pulse delay-1000" />
-      
-      {view === "login" && (
+  if (c.view === "login" || !c.currentUser) {
+    return (
+      <div className="min-h-dvh w-full flex items-center justify-center bg-[var(--bg)] relative overflow-hidden p-4">
+        {/* Subtle accent glow — calm, not the old busy gradient. */}
+        <div className="pointer-events-none absolute -top-1/3 left-1/2 -translate-x-1/2 w-[600px] h-[600px] rounded-full bg-[var(--accent)]/10 blur-[140px]" />
         <LoginView
-          departments={departments}
-          mode={mode}
-          setMode={setMode}
-          serverIp={serverIp}
-          setServerIp={setServerIp}
-          onLogin={login}
+          departments={c.departments}
+          mode={c.mode}
+          setMode={c.setMode}
+          serverIp={c.serverIp}
+          setServerIp={c.setServerIp}
+          onLogin={c.login}
         />
-      )}
+      </div>
+    );
+  }
 
-      {view === "rooms" && currentUser && (
-        <RoomList
-          rooms={chatRooms}
-          onJoin={joinRoom}
-          username={currentUser.name}
-        />
-      )}
-
-      {view === "chat" && currentRoom && currentUser && (
-        <ChatInterface
-          currentRoom={currentRoom}
-          currentUser={currentUser}
-          messages={messages}
-          onSendMessage={sendMessage}
-          onLeave={leaveRoom}
-          onLogout={logout}
-        />
-      )}
-
-      {/* Fallback/Loading state if mismatched */}
-      {view !== "login" && !currentUser && (
-        <div className="flex flex-col items-center text-white/50 gap-2">
-            <Loader2 className="animate-spin w-8 h-8" />
-            <p>Loading session...</p>
-        </div>
-      )}
-    </div>
+  return (
+    <Workspace
+      departments={c.departments}
+      chatRooms={c.chatRooms}
+      currentRoom={c.currentRoom}
+      currentUser={c.currentUser}
+      messages={c.messages}
+      loadingMessages={c.loadingMessages}
+      onlineUsers={c.onlineUsers}
+      connectionStatus={c.connectionStatus}
+      error={c.error}
+      onSelectRoom={c.joinRoom}
+      onSendMessage={c.sendMessage}
+      onLeaveRoom={c.leaveRoom}
+      onLogout={c.logout}
+      onDismissError={c.dismissError}
+    />
   );
 };
 

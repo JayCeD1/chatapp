@@ -10,6 +10,8 @@ import {
   ViewState,
 } from "../types";
 
+export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
+
 // Normalize a message from either source into one shape with an ISO-8601 UTC timestamp,
 // so the UI never has to branch on origin:
 //   - live socket: `created_at` is epoch-seconds (number)
@@ -55,13 +57,62 @@ export const useChatConnection = () => {
 
   const [departments, setDepartments] = useState<Department[]>([]);
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
-  const [messages, setMessages] = useState<Message[]>([]);
+  // Per-room message store, keyed by room name (what messages carry on the wire).
+  const [messagesByRoom, setMessagesByRoom] = useState<
+    Record<string, Message[]>
+  >({});
+  const [onlineUsers, setOnlineUsers] = useState<string[]>([]);
+  const [connectionStatus, setConnectionStatus] =
+    useState<ConnectionStatus>("connected");
+  const [error, setError] = useState<string | null>(null);
+  const [loadingMessages, setLoadingMessages] = useState(false);
 
-  // Held in a ref (not state/localStorage) so reconnect can re-derive the Noise key
-  // without persisting the room password to disk.
+  // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
+  const currentRoomRef = useRef<ChatRoom | null>(null);
+  useEffect(() => {
+    currentRoomRef.current = currentRoom;
+  }, [currentRoom]);
 
-  // Load departments on mount
+  // Active room's messages, derived from the store.
+  const messages = currentRoom ? messagesByRoom[currentRoom.name] || [] : [];
+
+  // Route an incoming message into the per-room store (deduped) and update presence.
+  const ingestMessage = useCallback((m: any) => {
+    const nm = normalizeMessage(m);
+    if (!nm.room) return;
+
+    setMessagesByRoom((prev) => {
+      const list = prev[nm.room] || [];
+      if (nm.message_id && list.some((p) => p.message_id === nm.message_id)) {
+        return prev;
+      }
+      const dup = list.some(
+        (p) =>
+          !p.message_id &&
+          p.message === nm.message &&
+          p.username === nm.username &&
+          Math.abs(
+            new Date(p.created_at).getTime() -
+              new Date(nm.created_at).getTime(),
+          ) < 1000,
+      );
+      if (dup) return prev;
+      return { ...prev, [nm.room]: [...list, nm] };
+    });
+
+    // Derive live-ish presence from lifecycle system messages.
+    const t = nm.message_type;
+    if (t === "Connect" || t === "RoomJoin") {
+      setOnlineUsers((prev) =>
+        prev.includes(nm.username) ? prev : [...prev, nm.username],
+      );
+    } else if (t === "Disconnect" || t === "RoomLeave") {
+      setOnlineUsers((prev) => prev.filter((u) => u !== nm.username));
+    }
+  }, []);
+
+  // Load departments on mount.
   useEffect(() => {
     loadDepartments();
   }, []);
@@ -70,8 +121,8 @@ export const useChatConnection = () => {
     try {
       const deps = (await invoke("get_departments")) as Department[];
       setDepartments(deps);
-    } catch (error) {
-      console.error("Error loading departments:", error);
+    } catch (err) {
+      console.error("Error loading departments:", err);
     }
   };
 
@@ -79,122 +130,98 @@ export const useChatConnection = () => {
     try {
       const rooms = (await invoke("get_chat_rooms")) as ChatRoom[];
       setChatRooms(rooms);
-    } catch (error) {
-      console.error("Error loading chat rooms:", error);
+    } catch (err) {
+      console.error("Error loading chat rooms:", err);
     }
   };
 
-  const loadRoomMessages = useCallback(async (roomId: number) => {
+  const loadRoomMessages = useCallback(async (room: ChatRoom) => {
+    setLoadingMessages(true);
     try {
       const msgs = (await invoke("get_room_messages", {
-        roomId,
+        roomId: room.id,
         limit: 50,
       })) as any[];
-      // Normalize so history and live messages share one timestamp format.
-      setMessages(msgs.map((m) => normalizeMessage(m, roomId)));
-    } catch (error) {
-      console.error("Error loading messages:", error);
+      const normalized = msgs.map((m) => normalizeMessage(m, room.id));
+      setMessagesByRoom((prev) => ({ ...prev, [room.name]: normalized }));
+    } catch (err) {
+      console.error("Error loading messages:", err);
+    } finally {
+      setLoadingMessages(false);
     }
   }, []);
 
-  // Listen for incoming messages
+  // Incoming-message listener — registered ONCE; routes every message to the store.
   useEffect(() => {
-    if (!currentRoom) return;
-
-    let unlisten: () => void;
-
-    const setupListener = async () => {
+    let unlisten: (() => void) | undefined;
+    (async () => {
       unlisten = await listen<string>("message", (e) => {
+        if (!e.payload) return; // lifecycle events use their own channels
         try {
-          // Lifecycle events use their own channels; ignore empty/non-chat payloads.
-          if (!e.payload) return;
-          const m = JSON.parse(e.payload) as any;
-          if (!m || m.room !== currentRoom.name) return;
-
-          const newMessage = normalizeMessage(m, currentRoom.id);
-
-          setMessages((prev) => {
-            // Primary dedup: the stable backend message_id (covers reconnect echoes
-            // and identical messages sent in quick succession).
-            if (
-              newMessage.message_id &&
-              prev.some((p) => p.message_id === newMessage.message_id)
-            ) {
-              return prev;
-            }
-            // Fallback for legacy rows that predate message_id.
-            const isDuplicate = prev.some(
-              (msg) =>
-                !msg.message_id &&
-                msg.message === newMessage.message &&
-                msg.username === newMessage.username &&
-                Math.abs(
-                  new Date(msg.created_at).getTime() -
-                    new Date(newMessage.created_at).getTime(),
-                ) < 1000,
-            );
-            if (isDuplicate) return prev;
-            return [...prev, newMessage];
-          });
-        } catch (error) {
-          console.error("Error parsing message:", error);
+          const m = JSON.parse(e.payload);
+          if (m) ingestMessage(m);
+        } catch (err) {
+          console.error("Error parsing message:", err);
         }
       });
-    };
-
-    setupListener();
-
+    })();
     return () => {
       if (unlisten) unlisten();
     };
-  }, [currentRoom]);
+  }, [ingestMessage]);
 
-  // Reconnection logic
+  // Reconnection — registered once per (mode, user, serverIp); reads room from a ref.
   useEffect(() => {
-    // Only attempt reconnect if we have a user and are in client mode
     if (mode !== "client" || !currentUser) return;
 
-    let unlisten: () => void;
+    let unlisten: (() => void) | undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let retryCount = 0;
+    let retryDelay = 1000;
+    const maxRetries = 6;
 
-    const setupReconnect = async () => {
-      unlisten = await listen("connection_lost", () => {
-        console.log("Connection lost, attempting to reconnect...");
-        let retryDelay = 1000;
-        let retryCount = 0;
-        const maxRetries = 5;
-
-        const attemptReconnect = () => {
-          if (retryCount >= maxRetries) return;
-
-          setTimeout(() => {
-            invoke("client_connect_to_server", {
-              host: serverIp,
-              username: currentUser.name,
-              userId: currentUser.id,
-              room: currentRoom?.department_name || currentUser.department_name, // Fallback
-              roomId: currentRoom?.id || currentUser.department_id,
-              password: passwordRef.current,
-            })
-              .then(() => {
-                console.log("Reconnected successfully");
-                retryCount = 0;
-              })
-              .catch(() => {
-                retryCount++;
-                retryDelay *= 2;
-                attemptReconnect();
-              });
-          }, retryDelay);
-        };
-        attemptReconnect();
-      });
+    const attempt = () => {
+      if (retryCount >= maxRetries) {
+        setConnectionStatus("disconnected");
+        return;
+      }
+      timer = setTimeout(() => {
+        const room = currentRoomRef.current;
+        invoke("client_connect_to_server", {
+          host: serverIp,
+          username: currentUser.name,
+          userId: currentUser.id,
+          room: room?.name || currentUser.department_name,
+          roomId: room?.id || currentUser.department_id,
+          password: passwordRef.current,
+        })
+          .then(() => {
+            retryCount = 0;
+            retryDelay = 1000;
+            setConnectionStatus("connected");
+          })
+          .catch(() => {
+            retryCount++;
+            retryDelay = Math.min(retryDelay * 2, 15000);
+            attempt();
+          });
+      }, retryDelay);
     };
 
-    setupReconnect();
+    (async () => {
+      unlisten = await listen("connection_lost", () => {
+        setConnectionStatus("reconnecting");
+        retryCount = 0;
+        retryDelay = 1000;
+        attempt();
+      });
+    })();
+
     return () => {
       if (unlisten) unlisten();
+      if (timer) clearTimeout(timer);
     };
-  }, [mode, currentUser, currentRoom, serverIp]);
+  }, [mode, currentUser, serverIp]);
 
   // Actions
   const login = async (
@@ -203,6 +230,7 @@ export const useChatConnection = () => {
     departmentId: number,
     password: string,
   ) => {
+    setError(null);
     try {
       const user = (await invoke("upsert_user", {
         name: username,
@@ -212,6 +240,7 @@ export const useChatConnection = () => {
 
       passwordRef.current = password;
       setCurrentUser(user);
+      setOnlineUsers([user.name]);
       localStorage.setItem("nutler.userId", String(user.id));
 
       if (mode === "server") {
@@ -235,23 +264,30 @@ export const useChatConnection = () => {
       }
 
       await loadChatRooms();
-      setView("rooms");
-    } catch (error) {
-      console.error("Login failed:", error);
-      throw error;
+      setConnectionStatus("connected");
+      setView("workspace");
+    } catch (err) {
+      console.error("Login failed:", err);
+      const msg = String(err);
+      setError(
+        msg.toLowerCase().includes("handshake")
+          ? "Couldn't connect — check the server address and room password."
+          : `Couldn't connect: ${msg}`,
+      );
+      throw err;
     }
   };
 
   const joinRoom = async (room: ChatRoom) => {
     if (!currentUser) return;
-
+    if (currentRoom?.id === room.id) return; // already open
     try {
       if (mode === "server") {
         await invoke("server_participant_join_room", {
           userId: currentUser.id,
           newRoom: room.name,
           newRoomId: room.id,
-          // Use the actual previous room so the host removes us from the right bucket;
+          // Real previous room so the host removes us from the right bucket;
           // fall back to the department room only on first join.
           oldRoom: currentRoom?.name || currentUser.department_name,
         });
@@ -265,18 +301,18 @@ export const useChatConnection = () => {
 
       await invoke("join_room", { userId: currentUser.id, roomId: room.id });
       setCurrentRoom(room);
-      setView("chat");
-      loadRoomMessages(room.id);
-    } catch (error) {
-      console.error("Join room failed:", error);
+      loadRoomMessages(room);
+    } catch (err) {
+      console.error("Join room failed:", err);
+      setError(`Couldn't open #${room.name}: ${err}`);
     }
   };
 
+  // Leave the active room (back to "no channel selected"); stays in the workspace.
   const leaveRoom = async () => {
     if (!currentUser || !currentRoom) return;
     const room = currentRoom;
     try {
-      // Notify the socket layer so peers see us leave and the host stops relaying.
       if (mode === "server") {
         await invoke("server_leave_room", {
           userId: currentUser.id,
@@ -290,13 +326,10 @@ export const useChatConnection = () => {
           roomId: room.id,
         });
       }
-      // Mark the room inactive in the DB.
       await invoke("leave_room", { userId: currentUser.id, roomId: room.id });
       setCurrentRoom(null);
-      setView("rooms");
-      setMessages([]);
-    } catch (error) {
-      console.error("Leave room failed:", error);
+    } catch (err) {
+      console.error("Leave room failed:", err);
     }
   };
 
@@ -305,48 +338,52 @@ export const useChatConnection = () => {
     try {
       const command =
         mode === "server" ? "send_as_server_participant" : "send_as_client";
+      // The backend echoes the sent message back to our UI, so it lands via the
+      // listener — no separate optimistic insert needed.
       await invoke(command, {
         message: text,
         user_id: currentUser.id,
         is_emoji: isEmoji,
       });
-    } catch (error) {
-      console.error("Send message failed:", error);
+    } catch (err) {
+      console.error("Send message failed:", err);
+      setError(`Message not sent: ${err}`);
     }
   };
 
   const logout = async () => {
-    // Tear down the live TCP connection (client) or stop hosting (server) so the
-    // socket and bound port are actually released — otherwise re-login fails with
-    // "address already in use" and the host keeps ghost clients.
+    // Tear down the live TCP connection / stop hosting so the socket + port free up.
     try {
       if (mode === "server") {
         await invoke("server_participant_disconnect");
       } else {
         await invoke("client_disconnect");
       }
-    } catch (error) {
-      console.error("Disconnect failed:", error);
+    } catch (err) {
+      console.error("Disconnect failed:", err);
     }
 
-    // Mark the room inactive in the DB if we were in one.
     if (currentUser && currentRoom) {
       try {
         await invoke("leave_room", {
           userId: currentUser.id,
           roomId: currentRoom.id,
         });
-      } catch (error) {
-        console.error("Leave room on logout failed:", error);
+      } catch (err) {
+        console.error("Leave room on logout failed:", err);
       }
     }
 
     setCurrentUser(null);
     setCurrentRoom(null);
-    setMessages([]);
+    setMessagesByRoom({});
+    setOnlineUsers([]);
+    setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
   };
+
+  const dismissError = () => setError(null);
 
   return {
     view,
@@ -355,6 +392,11 @@ export const useChatConnection = () => {
     departments,
     chatRooms,
     messages,
+    messagesByRoom,
+    onlineUsers,
+    connectionStatus,
+    error,
+    loadingMessages,
     currentUser,
     currentRoom,
     setMode,
@@ -364,5 +406,6 @@ export const useChatConnection = () => {
     leaveRoom,
     sendMessage,
     logout,
+    dismissError,
   };
 };

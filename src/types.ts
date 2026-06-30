@@ -32,5 +32,5 @@ export interface Message {
   created_at: string; // normalized ISO-8601 UTC string
 }
 
-export type ViewState = "login" | "rooms" | "chat";
+export type ViewState = "login" | "workspace";
 export type ConnectionMode = "client" | "server";

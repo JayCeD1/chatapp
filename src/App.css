@@ -1,5 +1,33 @@
 @import "tailwindcss";
 
+/* Professional, high-contrast dark theme (Phase 2). Semantic tokens so the whole
+   app can be re-themed (incl. a future light mode) from one place. Contrast ratios
+   chosen to meet WCAG AA for body text. */
+:root {
+  --bg: #0e1116; /* app background */
+  --surface: #161a21; /* sidebar / panels */
+  --surface-2: #1c212b; /* raised: composer, hover */
+  --surface-3: #232936; /* active channel, chips */
+  --border: #2a313c;
+  --border-soft: #21262f;
+  --text: #e7eaee; /* primary text  (~13:1 on --bg) */
+  --text-dim: #aab2bf; /* secondary     (~7:1) */
+  --text-faint: #7d8794; /* metadata      (~4.6:1) */
+  --accent: #8b7cff; /* violet accent */
+  --accent-strong: #a78bfa;
+  --accent-soft: rgba(139, 124, 255, 0.16);
+  --online: #3fb950;
+  --danger: #f0556b;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+
 @layer utilities {
   .scrollbar-thin::-webkit-scrollbar {
     width: 6px;

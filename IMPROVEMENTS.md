@@ -418,9 +418,9 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 - [x] Accessibility pass: aria-labels, `<label>`/sr-only, `role="log"`/`aria-live`, autofocus, Enter-to-submit `<form>` (6.2/6.10) — **M**
 - [x] `prefers-reduced-motion` + window min-size (Phase 0); new high-contrast palette (6.5); loading/empty states + near-bottom auto-scroll (6.4/6.5/6.7/6.8/5.10) — **M**
 - [x] Message grouping, initials+color avatars, date separators, system notices (6.6) — **M**
-- [ ] _Polish (optional Part 2):_ split god-hook into `useConnection`/`useMessages`/`useAuth` (5.5); light-mode/settings toggle; skeleton loaders; "jump to latest" button; reset scroll-to-bottom on channel switch.
+- [x] _Polish (Part 2, `9e60327`):_ light/dark theme toggle (persisted + OS-aware, sidebar footer); skeleton loaders; "jump to latest" button; reset scroll on channel switch. _God-hook split (5.5) intentionally deferred — internal refactor, no user-visible benefit, regression risk._
 
-**Phase 2 core is complete** (commit `f6fb132`). Real server-truth presence is Phase 3; current presence is derived from lifecycle events + message authors.
+**Phase 2 is complete** (`f6fb132` + `9e60327`). Real server-truth presence is Phase 3; current presence is derived from lifecycle events + message authors.
 
 ### Phase 3 — Feature expansion
 - [ ] Real presence (`update_user_online_status` on login/logout + presence event) + live member list (7) — **M**

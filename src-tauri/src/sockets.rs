@@ -167,8 +167,20 @@ pub struct AppState {
     pub server_addr: tokio::sync::RwLock<Option<SocketAddr>>,
 }
 
+/// Wire-protocol version of the message envelope. Bump when the envelope/payload format
+/// changes incompatibly (e.g. plaintext → ciphertext payloads) so old and new can coexist
+/// and peers can reject unknown versions. See docs/architecture (ADR-0004).
+pub const PROTOCOL_VERSION: u16 = 1;
+
+fn default_protocol_version() -> u16 {
+    PROTOCOL_VERSION
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Message {
+    // Default keeps frames from older/newer peers (or pre-versioning ones) decodable.
+    #[serde(default = "default_protocol_version")]
+    pub version: u16,
     pub message_type: MessageType,
     pub username: String,
     pub user_id: u64,
@@ -319,6 +331,7 @@ pub async fn server_listen_as_participant(
     }
     // Send server join message to its own UI immediately
     let join_message = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::Connect,
         username: username.clone(),
         user_id,
@@ -625,6 +638,7 @@ async fn clean_client(
 
     //Save the disconnect message to the database
     let disconnect_msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::Disconnect,
         username: client.username.clone(),
         user_id: client.user_id,
@@ -756,6 +770,7 @@ async fn broadcast_user_list(app: &tauri::AppHandle, state: &Arc<AppState>, room
     let names = room_member_names(state, room).await;
     let payload = serde_json::to_string(&names).unwrap_or_else(|_| "[]".to_string());
     let msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::UserList,
         username: String::new(),
         user_id: 0,
@@ -812,6 +827,7 @@ async fn send_room_history(
             .collect();
         let payload = serde_json::json!({ "messages": msgs, "reactions": reactions }).to_string();
         Message {
+            version: PROTOCOL_VERSION,
             message_type: msg_type,
             username: String::new(),
             user_id: 0,
@@ -863,6 +879,7 @@ async fn push_unread(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64) {
         .unwrap_or_default();
     let payload = serde_json::to_string(&counts).unwrap_or_else(|_| "[]".to_string());
     let msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::UnreadCounts,
         username: String::new(),
         user_id: 0,
@@ -914,6 +931,7 @@ async fn notify_unread_for_room(
                 .unwrap_or_default();
             if let Ok(payload) = serde_json::to_string(&counts) {
                 let msg = Message {
+                    version: PROTOCOL_VERSION,
                     message_type: MessageType::UnreadCounts,
                     username: String::new(),
                     user_id: 0,
@@ -1204,6 +1222,7 @@ pub async fn send_as_server_participant(
     let room_id = state.current_room_id.read().await.unwrap_or(1);
 
     let chat_message = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::Chat,
         username: username.clone(),
         user_id,
@@ -1295,6 +1314,7 @@ pub async fn client_connect_to_server(
 
     // Send the (encrypted) connect message now that the transport is stored.
     let connect_message = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::Connect,
         username: username.clone(),
         user_id,
@@ -1356,6 +1376,7 @@ pub async fn send_as_client(
     tracing::info!("🔵 Client sending: '{}'", message);
 
     let chat_message = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::Chat,
         username: username.clone(),
         user_id,
@@ -1459,6 +1480,7 @@ pub async fn server_participant_join_room(
 
     //create room join message
     let room_join_msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::RoomJoin,
         username: username.clone(),
         user_id,
@@ -1538,6 +1560,7 @@ pub async fn client_join_room(
 
     // Send room join to server (server will handle the room tracking update)
     let room_join_msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::RoomJoin,
         username: username.clone(),
         user_id,
@@ -1574,6 +1597,7 @@ pub async fn client_leave_room(
 ) -> Result<(), String> {
     let username = state.username.read().await.clone();
     let leave_msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::RoomLeave,
         username: username.clone(),
         user_id,
@@ -1602,6 +1626,7 @@ pub async fn server_leave_room(
 ) -> Result<(), String> {
     let username = state.username.read().await.clone();
     let leave_msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::RoomLeave,
         username: username.clone(),
         user_id,
@@ -1658,6 +1683,7 @@ fn edit_event(
     kind: MessageType,
 ) -> Message {
     Message {
+        version: PROTOCOL_VERSION,
         message_type: kind,
         username,
         user_id,
@@ -1872,6 +1898,7 @@ pub async fn request_history(
     before_id: i64,
 ) -> Result<(), String> {
     let msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::HistoryRequest,
         username: String::new(),
         user_id: 0,
@@ -1971,6 +1998,7 @@ pub async fn client_disconnect(
 
     // Best-effort: send an (encrypted) Disconnect to the server, then drop the session.
     let disconnect_msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::Disconnect,
         username: username.clone(),
         user_id: user_id_opt.unwrap_or(0),
@@ -2035,6 +2063,7 @@ pub async fn server_participant_disconnect(
 
     // Prepare a disconnect message from the host
     let disconnect_msg = Message {
+        version: PROTOCOL_VERSION,
         message_type: MessageType::Disconnect,
         username: host_username.clone(),
         user_id: host_user_id,

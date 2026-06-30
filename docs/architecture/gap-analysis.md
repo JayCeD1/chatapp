@@ -25,7 +25,7 @@ editing.
 | 4 | Encryption abstracted (`IMessageCrypto`) | 🟠 Partial | `secure.rs` is a clean **transport**-crypto seam (Noise), but there is no **message**-level crypto layer separate from transport. |
 | 5 | Transport security independent | 🟢 Met | Noise (NNpsk0, ChaCha20-Poly1305) protects every frame; it's a distinct module (`secure.rs`). This is our TLS-equivalent. |
 | 6 | No server dependence on plaintext | 🔴 Not met (by design, for now) | Search + history sync + persistence read bodies. Explicitly flagged below. |
-| 7 | Versioned message format | 🔴 Not met | The `Message` struct has no `version` field. **Cheapest fix; do it next time we touch the format.** |
+| 7 | Versioned message format | 🟢 Met | The `Message` envelope carries `version: u16` (`PROTOCOL_VERSION = 1`), serde-defaulted for forward/back compat (ADR-0004). |
 | 8 | Attachments encrypted-ready | ⚪ N/A yet | No attachments feature yet — design it encrypted-blob + metadata-sidecar from day one. |
 | 9 | Auth separate from encryption | 🔴 Not met (by design, for now) | The room password derives the Noise PSK **and** is the sole access control. Revisit before per-user auth / E2EE. |
 | 10 | Out-of-band key verification | ⚪ N/A yet | No keys to verify yet; required before any E2EE rollout (Constraint 10/11). |

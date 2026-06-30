@@ -8,6 +8,7 @@ interface InviteModalProps {
   roomName: string;
   users: DirectoryUser[];
   selfId: number;
+  selfName: string;
   onAdd: (userId: number) => Promise<void> | void;
   onClose: () => void;
 }
@@ -18,6 +19,7 @@ export const InviteModal: React.FC<InviteModalProps> = ({
   roomName,
   users,
   selfId,
+  selfName,
   onAdd,
   onClose,
 }) => {
@@ -25,8 +27,10 @@ export const InviteModal: React.FC<InviteModalProps> = ({
   const [query, setQuery] = useState("");
   const [added, setAdded] = useState<Set<number>>(new Set());
 
+  // Exclude self. In client mode currentUserId is the client's LOCAL id while the directory
+  // carries the host's CANONICAL ids, so also match by name (the reliable cross-mode key).
   const candidates = users
-    .filter((u) => u.id !== selfId)
+    .filter((u) => u.id !== selfId && u.name !== selfName)
     .filter((u) => u.name.toLowerCase().includes(query.trim().toLowerCase()));
 
   const add = async (u: DirectoryUser) => {

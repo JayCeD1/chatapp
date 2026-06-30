@@ -294,6 +294,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           roomName={room.name}
           users={directory}
           selfId={currentUserId}
+          selfName={currentUser.name}
           onAdd={(userId) => onAddMember(room.id, userId)}
           onClose={() => setShowInvite(false)}
         />

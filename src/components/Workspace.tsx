@@ -21,6 +21,8 @@ interface WorkspaceProps {
   currentUser: User;
   messages: Message[];
   loadingMessages: boolean;
+  typingUsers: string[];
+  onTyping: (typing: boolean) => void;
   membersByRoom: Record<string, string[]>;
   connectionStatus: ConnectionStatus;
   error: string | null;
@@ -54,6 +56,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   currentUser,
   messages,
   loadingMessages,
+  typingUsers,
+  onTyping,
   membersByRoom,
   connectionStatus,
   error,
@@ -120,6 +124,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             currentUser={currentUser}
             messages={messages}
             loading={loadingMessages}
+            typingUsers={typingUsers}
+            onTyping={onTyping}
             hasMore={hasMore}
             onlineCount={onlineCount}
             memberCount={members.length}

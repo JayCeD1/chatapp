@@ -187,6 +187,9 @@ pub enum MessageType {
     // Host → a single client: a JSON batch of {messages, reactions} for a room, so
     // clients (which keep no local copy of host data) get scrollback on join.
     HistoryResponse,
+    // Ephemeral "user is typing" signal, relayed to the room and never persisted.
+    // `is_emoji` carries start(true)/stop(false).
+    Typing,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1027,6 +1030,12 @@ async fn handle_server_message(
                 distribute_message_to_all(&app, &state, &message.room, &evt, None).await;
             }
         }
+        // Typing is ephemeral: relay to the rest of the room (never persisted), keyed
+        // off the bound user_id so the sender is correctly excluded.
+        MessageType::Typing => {
+            let actor = auth_user_id.unwrap_or(message.user_id);
+            distribute_message_to_all(&app, &state, &message.room, &message, Some(actor)).await;
+        }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
         _ => {}
     }
@@ -1676,6 +1685,57 @@ pub async fn server_toggle_reaction(
     );
     msg.is_emoji = added;
     distribute_message_to_all(&app, state.inner(), &room, &msg, None).await;
+    Ok(())
+}
+
+/// Client → host: "I'm typing (or stopped)" in `room`. Ephemeral, best-effort —
+/// a failed send is ignored so a flaky link never blocks the composer.
+#[tauri::command]
+pub async fn client_typing(
+    state: State<'_, Arc<AppState>>,
+    user_id: u64,
+    room: String,
+    room_id: u64,
+    typing: bool,
+) -> Result<(), String> {
+    let username = state.username.read().await.clone();
+    let mut msg = edit_event(
+        username,
+        user_id,
+        String::new(),
+        String::new(),
+        room,
+        room_id,
+        MessageType::Typing,
+    );
+    msg.is_emoji = typing; // start(true)/stop(false)
+    let _ = send_secure_client(state.inner(), &msg).await;
+    Ok(())
+}
+
+/// Host participant typing: relay straight to the room's clients (and the local UI
+/// ignores its own via the sender's user_id).
+#[tauri::command]
+pub async fn server_typing(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    user_id: u64,
+    room: String,
+    room_id: u64,
+    typing: bool,
+) -> Result<(), String> {
+    let username = state.username.read().await.clone();
+    let mut msg = edit_event(
+        username,
+        user_id,
+        String::new(),
+        String::new(),
+        room.clone(),
+        room_id,
+        MessageType::Typing,
+    );
+    msg.is_emoji = typing;
+    distribute_message_to_all(&app, state.inner(), &room, &msg, Some(user_id)).await;
     Ok(())
 }
 

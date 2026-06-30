@@ -33,6 +33,8 @@ interface ChatPaneProps {
   hasMore: boolean;
   onlineCount: number;
   memberCount: number;
+  typingUsers: string[];
+  onTyping: (typing: boolean) => void;
   onSendMessage: (text: string, isEmoji?: boolean) => void;
   onEditMessage: (targetId: string, newText: string) => Promise<void>;
   onDeleteMessage: (targetId: string) => Promise<void>;
@@ -66,6 +68,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   hasMore,
   onlineCount,
   memberCount,
+  typingUsers,
+  onTyping,
   onSendMessage,
   onEditMessage,
   onDeleteMessage,
@@ -161,12 +165,49 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     endRef.current?.scrollIntoView({ behavior: "smooth" });
   };
 
+  // Typing signal: throttle "start" re-sends to once / 2.5s (refreshes the peer's
+  // 5s expiry while typing) and fire one "stop" after 3s idle. lastStartRef==0 means
+  // "not currently typing".
+  const lastStartRef = useRef(0);
+  const stopTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const stopTyping = () => {
+    if (stopTimerRef.current) {
+      clearTimeout(stopTimerRef.current);
+      stopTimerRef.current = null;
+    }
+    if (lastStartRef.current !== 0) {
+      lastStartRef.current = 0;
+      onTyping(false);
+    }
+  };
+
+  const signalTyping = () => {
+    const now = Date.now();
+    if (now - lastStartRef.current > 2500) {
+      lastStartRef.current = now;
+      onTyping(true);
+    }
+    if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+    stopTimerRef.current = setTimeout(stopTyping, 3000);
+  };
+
+  // Drop any pending stop + reset typing state when the room changes/unmounts; the
+  // old room's indicator self-expires on the peer's 5s ticker.
+  useEffect(() => {
+    return () => {
+      if (stopTimerRef.current) clearTimeout(stopTimerRef.current);
+      lastStartRef.current = 0;
+    };
+  }, [room.id]);
+
   const handleSend = () => {
     const text = inputText.trim();
     if (!text) return;
     onSendMessage(text);
     setInputText("");
     setShowEmoji(false);
+    stopTyping();
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
@@ -175,6 +216,23 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
       handleSend();
     }
   };
+
+  const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    setInputText(e.target.value);
+    if (e.target.value.trim()) signalTyping();
+    else stopTyping();
+  };
+
+  // "Alice is typing…" / "Alice and Bob…" / "Alice, Bob and 2 others…"
+  const typingLabel = (() => {
+    const n = typingUsers.length;
+    if (n === 0) return "";
+    if (n === 1) return `${typingUsers[0]} is typing…`;
+    if (n === 2) return `${typingUsers[0]} and ${typingUsers[1]} are typing…`;
+    return `${typingUsers[0]}, ${typingUsers[1]} and ${n - 2} other${
+      n - 2 > 1 ? "s" : ""
+    } are typing…`;
+  })();
 
   return (
     <section className="flex flex-col h-full min-w-0 bg-[var(--bg)]">
@@ -473,6 +531,21 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
       {/* Composer */}
       <div className="px-4 pb-4 pt-2 shrink-0">
+        <div
+          className="h-4 px-1 mb-0.5 text-xs text-[var(--text-faint)] truncate"
+          aria-live="polite"
+        >
+          {typingLabel && (
+            <span className="inline-flex items-center gap-1.5 animate-fade-in">
+              <span className="flex gap-0.5">
+                <span className="w-1 h-1 rounded-full bg-[var(--text-faint)] animate-typing-dot" />
+                <span className="w-1 h-1 rounded-full bg-[var(--text-faint)] animate-typing-dot [animation-delay:150ms]" />
+                <span className="w-1 h-1 rounded-full bg-[var(--text-faint)] animate-typing-dot [animation-delay:300ms]" />
+              </span>
+              {typingLabel}
+            </span>
+          )}
+        </div>
         <div className="relative flex items-end gap-2">
           {showEmoji && (
             <div className="absolute bottom-14 left-0 bg-[var(--surface-2)] border border-[var(--border)] p-2 rounded-xl shadow-2xl grid grid-cols-6 gap-1 z-50 animate-scale-in">
@@ -509,7 +582,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               id="composer"
               type="text"
               value={inputText}
-              onChange={(e) => setInputText(e.target.value)}
+              onChange={handleInputChange}
               onKeyDown={handleKeyDown}
               placeholder={`Message #${room.name}`}
               autoComplete="off"

@@ -33,6 +33,8 @@ const Chat = () => {
       currentUser={c.currentUser}
       messages={c.messages}
       loadingMessages={c.loadingMessages}
+      typingUsers={c.typingUsers}
+      onTyping={c.sendTyping}
       membersByRoom={c.membersByRoom}
       connectionStatus={c.connectionStatus}
       error={c.error}

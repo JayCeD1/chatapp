@@ -88,9 +88,17 @@ export const useChatConnection = () => {
   const [loadingByRoom, setLoadingByRoom] = useState<Record<string, boolean>>(
     {},
   );
+  // Ephemeral "who is typing" per room: userId → { username, last-seen ms }.
+  const [typingByRoom, setTypingByRoom] = useState<
+    Record<string, Record<number, { username: string; at: number }>>
+  >({});
 
   // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
+  const modeRef = useRef(mode);
+  useEffect(() => {
+    modeRef.current = mode;
+  }, [mode]);
   const currentRoomRef = useRef<ChatRoom | null>(null);
   useEffect(() => {
     currentRoomRef.current = currentRoom;
@@ -103,6 +111,30 @@ export const useChatConnection = () => {
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
+
+  // Expire stale typing entries (>5s) so a dropped "stop" can't pin an indicator on.
+  // Returns the same reference when nothing changed, so idle rooms don't re-render.
+  useEffect(() => {
+    const id = setInterval(() => {
+      setTypingByRoom((prev) => {
+        const now = Date.now();
+        let changed = false;
+        const next: typeof prev = {};
+        for (const room in prev) {
+          const keep: Record<number, { username: string; at: number }> = {};
+          for (const uid in prev[room]) {
+            const e = prev[room][uid as unknown as number];
+            if (now - e.at < 5000) keep[uid as unknown as number] = e;
+            else changed = true;
+          }
+          if (Object.keys(keep).length) next[room] = keep;
+          else if (Object.keys(prev[room]).length) changed = true;
+        }
+        return changed ? next : prev;
+      });
+    }, 2000);
+    return () => clearInterval(id);
+  }, []);
 
   const PAGE_SIZE = 50;
 
@@ -183,6 +215,22 @@ export const useChatConnection = () => {
         console.error("Bad history payload:", err);
         setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
       }
+      return;
+    }
+
+    // Ephemeral typing signal — is_emoji carries start(true)/stop(false). Ignore
+    // our own echo; entries also expire on a ticker in case a "stop" never arrives.
+    if (nm.message_type === "Typing") {
+      if (nm.user_id === currentUserRef.current?.id) return;
+      setTypingByRoom((prev) => {
+        const room = { ...(prev[nm.room] || {}) };
+        if (nm.is_emoji) {
+          room[nm.user_id] = { username: nm.username, at: Date.now() };
+        } else {
+          delete room[nm.user_id];
+        }
+        return { ...prev, [nm.room]: room };
+      });
       return;
     }
 
@@ -650,6 +698,26 @@ export const useChatConnection = () => {
     }
   };
 
+  // Stable (reads refs) so ChatPane's throttle/debounce timers never call a stale
+  // copy. Best-effort: a failed typing ping must never surface or block the composer.
+  const sendTyping = useCallback(async (typing: boolean) => {
+    const room = currentRoomRef.current;
+    const user = currentUserRef.current;
+    if (!room || !user) return;
+    try {
+      const cmd =
+        modeRef.current === "server" ? "server_typing" : "client_typing";
+      await invoke(cmd, {
+        userId: user.id,
+        room: room.name,
+        roomId: room.id,
+        typing,
+      });
+    } catch {
+      /* ignore */
+    }
+  }, []);
+
   const editMessage = async (targetId: string, newText: string) => {
     if (!currentUser || !currentRoom) return;
     const cmd =
@@ -755,6 +823,13 @@ export const useChatConnection = () => {
     // Derived: only the active room's spinner is surfaced to the UI.
     loadingMessages: currentRoom ? !!loadingByRoom[currentRoom.name] : false,
     hasMore: currentRoom ? (hasMoreByRoom[currentRoom.name] ?? true) : false,
+    // Usernames currently typing in the active room (self already excluded).
+    typingUsers: currentRoom
+      ? Object.values(typingByRoom[currentRoom.name] || {}).map(
+          (t) => t.username,
+        )
+      : [],
+    sendTyping,
     currentUser,
     currentRoom,
     setMode,

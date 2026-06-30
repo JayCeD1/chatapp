@@ -1,6 +1,6 @@
 [package]
 name = "nutler"
-version = "0.2.1"
+version = "0.2.2"
 description = "Nutler — a peer-hosted LAN team chat for company networks"
 authors = ["jayced1"]
 license = "MIT"

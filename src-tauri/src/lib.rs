@@ -1,16 +1,16 @@
 use crate::db_queries::{
     add_room_member, create_room, create_user, get_chat_rooms, get_departments, get_room_messages,
     get_room_reactions, get_rooms_by_department, get_unread_counts, get_user_by_id, get_users,
-    join_room, leave_room, save_message, search_messages, touch_last_read,
+    join_room, leave_room, list_users, save_message, search_messages, touch_last_read,
     update_user_online_status, upsert_user,
 };
 use crate::sockets::{
-    client_connect_to_server, client_delete_message, client_disconnect, client_edit_message,
-    client_join_room, client_leave_room, client_toggle_reaction, client_typing, discover_servers,
-    get_server_info, request_history, send_as_client, send_as_server_participant,
-    server_delete_message, server_edit_message, server_leave_room, server_listen_as_participant,
-    server_participant_disconnect, server_participant_join_room, server_toggle_reaction,
-    server_typing, AppState,
+    client_add_member, client_connect_to_server, client_delete_message, client_disconnect,
+    client_edit_message, client_join_room, client_leave_room, client_toggle_reaction,
+    client_typing, discover_servers, get_server_info, request_history, send_as_client,
+    send_as_server_participant, server_add_member, server_delete_message, server_edit_message,
+    server_leave_room, server_listen_as_participant, server_participant_disconnect,
+    server_participant_join_room, server_toggle_reaction, server_typing, AppState,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::SqlitePool;
@@ -126,6 +126,9 @@ pub fn run() {
             get_rooms_by_department,
             create_room,
             add_room_member,
+            client_add_member,
+            server_add_member,
+            list_users,
             join_room,
             leave_room,
             // Message management

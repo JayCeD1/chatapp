@@ -1,7 +1,7 @@
 use crate::db_queries::{
     delete_message_db, edit_message_db, get_room_messages_internal, get_room_reactions_internal,
     get_unread_counts_internal, room_join_allowed_internal, save_message_internal,
-    toggle_reaction_db, touch_last_read_internal,
+    toggle_reaction_db, touch_last_read_internal, upsert_user_internal,
 };
 use crate::secure;
 use serde::{Deserialize, Serialize};
@@ -190,6 +190,10 @@ pub struct Message {
     pub room_id: u64,
     pub created_at: u64,
     pub is_emoji: bool,
+    // Carried only on the Connect frame, so the host can upsert the user into its OWN DB
+    // (the identity authority) and assign a globally-unique id. Defaulted/omitted otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub email: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -341,6 +345,7 @@ pub async fn server_listen_as_participant(
         room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     };
 
     // Save server join to database //Use tauri::async_runtime::spawn for database operations
@@ -526,43 +531,61 @@ async fn handle_client_connection(
 
                 //Handle client registration
                 if message.message_type == MessageType::Connect {
+                    // The host is the identity authority: upsert the connecting user into the
+                    // host's OWN DB by email and use that globally-unique id, because the id
+                    // the client asserts is assigned by its local DB and collides across
+                    // machines. Fall back to the asserted id only if no email was sent.
+                    let canonical = match &message.email {
+                        Some(email) => upsert_user_internal(
+                            &pool,
+                            message.username.clone(),
+                            email.clone(),
+                            Some(message.room_id as i64),
+                        )
+                        .await
+                        .ok()
+                        .and_then(|u| u.id),
+                        None => None,
+                    };
+                    let uid = canonical.map(|id| id as u64).unwrap_or(message.user_id);
+
                     let conn = ClientConnection {
                         writer: Arc::clone(&writer_arc),
                         transport: Arc::clone(&transport_arc),
                         username: message.username.clone(),
                         current_room: message.room.clone(),
                         room_id: message.room_id,
-                        user_id: message.user_id,
+                        user_id: uid,
                         conn_id,
                     };
                     client_info = Some(conn.clone());
 
-                    //Add to the server's stream list using user_id as a key
+                    //Add to the server's stream list using the canonical user_id as the key
                     {
                         let mut streams = state.server_streams.lock().await;
                         let mut rooms = state.room_clients.lock().await;
 
-                        // Idempotent (re)registration: if this user_id is already known
+                        // Idempotent (re)registration: if this user is already known
                         // (reconnect / duplicate Connect), drop it from every room first so
                         // membership can't accumulate duplicates that double-deliver.
-                        if streams.contains_key(&message.user_id) {
+                        if streams.contains_key(&uid) {
                             for users in rooms.values_mut() {
-                                users.retain(|&id| id != message.user_id);
+                                users.retain(|&id| id != uid);
                             }
                         }
 
-                        streams.insert(message.user_id, conn);
+                        streams.insert(uid, conn);
 
                         //Add to room tracking (deduped)
                         let room_vec = rooms.entry(message.room.clone()).or_insert_with(Vec::new);
-                        if !room_vec.contains(&message.user_id) {
-                            room_vec.push(message.user_id);
+                        if !room_vec.contains(&uid) {
+                            room_vec.push(uid);
                         }
                     }
                     tracing::info!(
-                        "Client registered: {} (ID: {}) in room {}",
+                        "Client registered: {} (id {}) in room {}",
                         message.username,
-                        message.user_id,
+                        uid,
                         message.room
                     );
                 }
@@ -648,6 +671,7 @@ async fn clean_client(
         room_id: client.room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     };
 
     //Save the disconnect message to the database
@@ -778,6 +802,7 @@ async fn broadcast_user_list(app: &tauri::AppHandle, state: &Arc<AppState>, room
         room_id: 0,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     };
     distribute_message_to_all(app, state, room, &msg, None).await;
 }
@@ -835,6 +860,7 @@ async fn send_room_history(
             room_id,
             created_at: now_secs(),
             is_emoji: false,
+            email: None,
         }
     };
 
@@ -887,6 +913,7 @@ async fn push_unread(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64) {
         room_id: 0,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     };
     let _ = send_secure(&writer, &transport, &msg).await;
 }
@@ -939,6 +966,7 @@ async fn notify_unread_for_room(
                     room_id: 0,
                     created_at: now_secs(),
                     is_emoji: false,
+                    email: None,
                 };
                 if let Ok(s) = serde_json::to_string(&msg) {
                     let _ = app.emit("message", s);
@@ -953,10 +981,18 @@ async fn handle_server_message(
     state: Arc<AppState>,
     message: Message,
     pool: SqlitePool,
-    // The user_id bound to THIS connection at Connect; used for authorship checks so a
-    // peer can't edit/delete another user's message by spoofing message.user_id.
+    // The canonical user_id bound to THIS connection at Connect; used for authorship
+    // checks so a peer can't act as another user by spoofing message.user_id.
     auth_user_id: Option<u64>,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    // Re-stamp the frame with the connection's canonical id (the client asserts a
+    // per-instance id that collides across machines, and the host's DB is the authority).
+    // After this, persistence/delivery/exclusion by message.user_id are all canonical.
+    let mut message = message;
+    if let Some(uid) = auth_user_id {
+        message.user_id = uid;
+    }
+
     tracing::info!(
         "🟢 Server handling message: {:?} from {}",
         message.message_type,
@@ -1256,6 +1292,7 @@ pub async fn send_as_server_participant(
         room,
         created_at: now_secs(),
         is_emoji,
+        email: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -1299,6 +1336,7 @@ pub async fn client_connect_to_server(
     host: String,
     username: String,
     user_id: u64,
+    email: String,
     room: String,
     room_id: u64,
     password: String,
@@ -1348,6 +1386,7 @@ pub async fn client_connect_to_server(
         room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: Some(email.clone()),
         message_id: Uuid::new_v4().to_string(),
     };
     send_secure_client(state.inner(), &connect_message)
@@ -1410,6 +1449,7 @@ pub async fn send_as_client(
         room,
         created_at: now_secs(),
         is_emoji,
+        email: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -1514,6 +1554,7 @@ pub async fn server_participant_join_room(
         room_id: new_room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -1594,6 +1635,7 @@ pub async fn client_join_room(
         room_id: new_room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -1631,6 +1673,7 @@ pub async fn client_leave_room(
         room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
         message_id: Uuid::new_v4().to_string(),
     };
     send_secure_client(state.inner(), &leave_msg)
@@ -1660,6 +1703,7 @@ pub async fn server_leave_room(
         room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -1718,6 +1762,7 @@ fn edit_event(
         room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     }
 }
 
@@ -1933,6 +1978,7 @@ pub async fn request_history(
         room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2033,6 +2079,7 @@ pub async fn client_disconnect(
         room_id: room_id_opt.unwrap_or(0),
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     };
     let _ = send_secure_client(state.inner(), &disconnect_msg).await;
     {
@@ -2098,6 +2145,7 @@ pub async fn server_participant_disconnect(
         room_id: host_room_id,
         created_at: now_secs(),
         is_emoji: false,
+        email: None,
     };
 
     // Best-effort: send an encrypted disconnect notice to each client, then drop them.

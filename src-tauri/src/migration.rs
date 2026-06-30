@@ -193,6 +193,22 @@ pub fn get_migrations() -> Vec<Migration> {
                   ALTER TABLE messages ADD COLUMN deleted_at TEXT;",
             kind: MigrationKind::Up,
         },
+        // Migration 11: emoji reactions (keyed by the message UUID).
+        Migration {
+            version: 11,
+            description: "create_reactions_table",
+            sql: "CREATE TABLE reactions (
+                      id INTEGER PRIMARY KEY AUTOINCREMENT,
+                      message_id TEXT NOT NULL,
+                      user_id INTEGER NOT NULL,
+                      emoji TEXT NOT NULL,
+                      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                      UNIQUE(message_id, user_id, emoji),
+                      FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+                  );
+                  CREATE INDEX idx_reactions_message ON reactions(message_id);",
+            kind: MigrationKind::Up,
+        },
         // Down for v7: remove default chat rooms created in v7
         Migration {
             version: 7,

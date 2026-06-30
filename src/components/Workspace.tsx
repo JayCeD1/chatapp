@@ -1,6 +1,13 @@
 import React, { useEffect, useMemo } from "react";
 import { Hash, RefreshCw, WifiOff, X } from "lucide-react";
-import { ChatRoom, Department, Message, SearchResult, User } from "../types";
+import {
+  ChatRoom,
+  Department,
+  Message,
+  Reaction,
+  SearchResult,
+  User,
+} from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
 import { Theme } from "../hooks/useTheme";
 import { Sidebar } from "./Sidebar";
@@ -30,6 +37,8 @@ interface WorkspaceProps {
   onSendMessage: (text: string, isEmoji?: boolean) => void;
   onEditMessage: (targetId: string, newText: string) => Promise<void>;
   onDeleteMessage: (targetId: string) => Promise<void>;
+  reactions: Record<string, Reaction[]>;
+  onToggleReaction: (targetId: string, emoji: string) => Promise<void>;
   onLoadOlder: () => Promise<void>;
   onLeaveRoom: () => void;
   onLogout: () => void;
@@ -56,6 +65,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   onSendMessage,
   onEditMessage,
   onDeleteMessage,
+  reactions,
+  onToggleReaction,
   onLoadOlder,
   onLeaveRoom,
   onLogout,
@@ -116,6 +127,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             onSendMessage={onSendMessage}
             onEditMessage={onEditMessage}
             onDeleteMessage={onDeleteMessage}
+            reactions={reactions}
+            onToggleReaction={onToggleReaction}
             onLoadOlder={onLoadOlder}
             onLeave={onLeaveRoom}
           />

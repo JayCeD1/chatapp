@@ -630,3 +630,77 @@ pub async fn search_messages(
     }
     Ok(results)
 }
+
+#[derive(Serialize)]
+pub struct ReactionAggregate {
+    pub message_id: String,
+    pub emoji: String,
+    pub count: i64,
+    pub me: bool,
+}
+
+/// Toggle one (message, user, emoji) reaction. Returns true if it was added, false if
+/// it was removed.
+pub async fn toggle_reaction_db(
+    pool: &SqlitePool,
+    message_id: &str,
+    user_id: i64,
+    emoji: &str,
+) -> Result<bool, String> {
+    let del =
+        sqlx::query("DELETE FROM reactions WHERE message_id = $1 AND user_id = $2 AND emoji = $3")
+            .bind(message_id)
+            .bind(user_id)
+            .bind(emoji)
+            .execute(pool)
+            .await
+            .map_err(|e| format!("Failed to remove reaction: {}", e))?;
+
+    if del.rows_affected() > 0 {
+        return Ok(false); // removed
+    }
+
+    sqlx::query("INSERT INTO reactions (message_id, user_id, emoji) VALUES ($1, $2, $3)")
+        .bind(message_id)
+        .bind(user_id)
+        .bind(emoji)
+        .execute(pool)
+        .await
+        .map_err(|e| format!("Failed to add reaction: {}", e))?;
+    Ok(true) // added
+}
+
+/// Aggregated reactions for every message in a room: per (message_id, emoji), the count
+/// and whether `user_id` is among the reactors.
+#[tauri::command]
+pub async fn get_room_reactions(
+    db: State<'_, SqlitePool>,
+    room_id: i64,
+    user_id: i64,
+) -> Result<Vec<ReactionAggregate>, String> {
+    let rows = sqlx::query(
+        "SELECT r.message_id, r.emoji, COUNT(*) AS count,
+                MAX(CASE WHEN r.user_id = $2 THEN 1 ELSE 0 END) AS me
+         FROM reactions r
+         JOIN messages m ON m.message_id = r.message_id
+         WHERE m.room_id = $1
+         GROUP BY r.message_id, r.emoji
+         ORDER BY r.message_id",
+    )
+    .bind(&room_id)
+    .bind(&user_id)
+    .fetch_all(&*db)
+    .await
+    .map_err(|e| format!("Failed to load reactions: {}", e))?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(ReactionAggregate {
+            message_id: row.get::<String, _>("message_id"),
+            emoji: row.get::<String, _>("emoji"),
+            count: row.get::<i64, _>("count"),
+            me: row.get::<i64, _>("me") != 0,
+        });
+    }
+    Ok(out)
+}

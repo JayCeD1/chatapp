@@ -44,6 +44,8 @@ const Chat = () => {
       onSendMessage={c.sendMessage}
       onEditMessage={c.editMessage}
       onDeleteMessage={c.deleteMessage}
+      reactions={c.reactionsByMessage}
+      onToggleReaction={c.toggleReaction}
       onLoadOlder={c.loadOlderMessages}
       onLeaveRoom={c.leaveRoom}
       onLogout={c.logout}

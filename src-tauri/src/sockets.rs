@@ -1,4 +1,6 @@
-use crate::db_queries::{delete_message_db, edit_message_db, save_message_internal};
+use crate::db_queries::{
+    delete_message_db, edit_message_db, save_message_internal, toggle_reaction_db,
+};
 use crate::secure;
 use serde::{Deserialize, Serialize};
 use snow::TransportState;
@@ -180,6 +182,7 @@ pub enum MessageType {
     ServerAck,
     Edit,
     Delete,
+    Reaction,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -927,6 +930,20 @@ async fn handle_server_message(
                 }
             }
         }
+        // Reaction: message_id = TARGET, message = emoji, reactor = bound user_id. The
+        // host toggles in the DB and broadcasts the result with is_emoji = added.
+        MessageType::Reaction => {
+            let reactor = auth_user_id.unwrap_or(message.user_id);
+            if let Ok(added) =
+                toggle_reaction_db(&pool, &message.message_id, reactor as i64, &message.message)
+                    .await
+            {
+                let mut evt = message.clone();
+                evt.user_id = reactor;
+                evt.is_emoji = added; // carries the added(true)/removed(false) result
+                distribute_message_to_all(&app, &state, &message.room, &evt, None).await;
+            }
+        }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
         _ => {}
     }
@@ -1520,6 +1537,61 @@ pub async fn server_delete_message(
         room_id,
         MessageType::Delete,
     );
+    distribute_message_to_all(&app, state.inner(), &room, &msg, None).await;
+    Ok(())
+}
+
+// ---- Emoji reactions ----
+// A client sends the toggle to the host (which applies + broadcasts the result via
+// handle_server_message); the host participant applies + broadcasts directly.
+
+#[tauri::command]
+pub async fn client_toggle_reaction(
+    state: State<'_, Arc<AppState>>,
+    user_id: u64,
+    target_id: String,
+    emoji: String,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    let username = state.username.read().await.clone();
+    let msg = edit_event(
+        username,
+        user_id,
+        target_id,
+        emoji,
+        room,
+        room_id,
+        MessageType::Reaction,
+    );
+    send_secure_client(state.inner(), &msg)
+        .await
+        .map_err(|e| format!("Failed to react: {}", e))
+}
+
+#[tauri::command]
+pub async fn server_toggle_reaction(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    user_id: u64,
+    target_id: String,
+    emoji: String,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    let added = toggle_reaction_db(db.inner(), &target_id, user_id as i64, &emoji).await?;
+    let username = state.username.read().await.clone();
+    let mut msg = edit_event(
+        username,
+        user_id,
+        target_id,
+        emoji,
+        room.clone(),
+        room_id,
+        MessageType::Reaction,
+    );
+    msg.is_emoji = added;
     distribute_message_to_all(&app, state.inner(), &room, &msg, None).await;
     Ok(())
 }

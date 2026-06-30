@@ -2,6 +2,7 @@ import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
 import {
   Send,
   Smile,
+  SmilePlus,
   Hash,
   LogOut,
   ChevronDown,
@@ -11,7 +12,7 @@ import {
   Check,
   X,
 } from "lucide-react";
-import { ChatRoom, Message, User } from "../types";
+import { ChatRoom, Message, Reaction, User } from "../types";
 import {
   initials,
   avatarColor,
@@ -35,6 +36,8 @@ interface ChatPaneProps {
   onSendMessage: (text: string, isEmoji?: boolean) => void;
   onEditMessage: (targetId: string, newText: string) => Promise<void>;
   onDeleteMessage: (targetId: string) => Promise<void>;
+  reactions: Record<string, Reaction[]>;
+  onToggleReaction: (targetId: string, emoji: string) => Promise<void>;
   onLoadOlder: () => Promise<void>;
   onLeave: () => void;
 }
@@ -66,6 +69,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onSendMessage,
   onEditMessage,
   onDeleteMessage,
+  reactions,
+  onToggleReaction,
   onLoadOlder,
   onLeave,
 }) => {
@@ -74,6 +79,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
+  const [reactingId, setReactingId] = useState<string | null>(null);
 
   const startEdit = (msg: Message) => {
     if (!msg.message_id) return;
@@ -124,6 +130,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setAtBottom(true);
     setEditingId(null);
     setEditText("");
+    setReactingId(null);
     restoreRef.current = null;
     loadingOlderRef.current = false;
   }, [room.id]);
@@ -261,6 +268,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 const canModify = isMe && !isDeleted && !!msg.message_id;
                 const isEditing =
                   editingId != null && editingId === msg.message_id;
+                const msgReactions = msg.message_id
+                  ? reactions[msg.message_id] || []
+                  : [];
 
                 return (
                   <React.Fragment key={msg.message_id ?? msg.id ?? idx}>
@@ -358,26 +368,87 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                             )}
                           </div>
                         )}
+
+                        {msgReactions.length > 0 && (
+                          <div className="flex flex-wrap gap-1 mt-1">
+                            {msgReactions.map((r) => (
+                              <button
+                                key={r.emoji}
+                                onClick={() =>
+                                  msg.message_id &&
+                                  onToggleReaction(msg.message_id, r.emoji)
+                                }
+                                className={`flex items-center gap-1 px-1.5 py-0.5 rounded-full text-xs border transition-colors ${
+                                  r.me
+                                    ? "bg-[var(--accent-soft)] border-[var(--accent)] text-[var(--text)]"
+                                    : "bg-[var(--surface-2)] border-[var(--border)] text-[var(--text-dim)] hover:border-[var(--text-faint)]"
+                                }`}
+                                title={
+                                  r.me ? "Click to remove" : "Click to add"
+                                }
+                              >
+                                <span>{r.emoji}</span>
+                                <span>{r.count}</span>
+                              </button>
+                            ))}
+                          </div>
+                        )}
                       </div>
 
-                      {canModify && !isEditing && (
+                      {!isEditing && msg.message_id && !isDeleted && (
                         <div className="absolute top-0 right-2 hidden group-hover:flex items-center gap-0.5 bg-[var(--surface)] border border-[var(--border)] rounded-md shadow-sm">
                           <button
-                            onClick={() => startEdit(msg)}
-                            title="Edit"
-                            aria-label="Edit message"
+                            onClick={() =>
+                              setReactingId(
+                                reactingId === msg.message_id
+                                  ? null
+                                  : msg.message_id!,
+                              )
+                            }
+                            title="Add reaction"
+                            aria-label="Add reaction"
                             className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]"
                           >
-                            <Pencil className="w-3.5 h-3.5" />
+                            <SmilePlus className="w-3.5 h-3.5" />
                           </button>
-                          <button
-                            onClick={() => confirmDelete(msg)}
-                            title="Delete"
-                            aria-label="Delete message"
-                            className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--surface-2)]"
-                          >
-                            <Trash2 className="w-3.5 h-3.5" />
-                          </button>
+                          {canModify && (
+                            <>
+                              <button
+                                onClick={() => startEdit(msg)}
+                                title="Edit"
+                                aria-label="Edit message"
+                                className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]"
+                              >
+                                <Pencil className="w-3.5 h-3.5" />
+                              </button>
+                              <button
+                                onClick={() => confirmDelete(msg)}
+                                title="Delete"
+                                aria-label="Delete message"
+                                className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--surface-2)]"
+                              >
+                                <Trash2 className="w-3.5 h-3.5" />
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
+
+                      {reactingId === msg.message_id && msg.message_id && (
+                        <div className="absolute top-8 right-2 z-50 bg-[var(--surface-2)] border border-[var(--border)] rounded-xl shadow-2xl p-2 grid grid-cols-6 gap-1 animate-scale-in">
+                          {EMOJIS.map((e) => (
+                            <button
+                              key={e}
+                              onClick={() => {
+                                onToggleReaction(msg.message_id!, e);
+                                setReactingId(null);
+                              }}
+                              className="text-lg hover:bg-[var(--surface-3)] p-1 rounded-lg transition-colors"
+                              aria-label={`React ${e}`}
+                            >
+                              {e}
+                            </button>
+                          ))}
                         </div>
                       )}
                     </div>

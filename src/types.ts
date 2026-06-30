@@ -36,6 +36,19 @@ export interface Message {
   deleted_at?: string | null;
 }
 
+export interface Reaction {
+  emoji: string;
+  count: number;
+  me: boolean;
+}
+
+export interface ReactionAggregate {
+  message_id: string;
+  emoji: string;
+  count: number;
+  me: boolean;
+}
+
 export interface SearchResult {
   message_id?: string;
   room_id: number;

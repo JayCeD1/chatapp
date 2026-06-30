@@ -6,6 +6,8 @@ import {
   ConnectionMode,
   Department,
   Message,
+  Reaction,
+  ReactionAggregate,
   SearchResult,
   User,
   ViewState,
@@ -74,6 +76,10 @@ export const useChatConnection = () => {
   const [hasMoreByRoom, setHasMoreByRoom] = useState<Record<string, boolean>>(
     {},
   );
+  // Reactions keyed by target message_id.
+  const [reactionsByMessage, setReactionsByMessage] = useState<
+    Record<string, Reaction[]>
+  >({});
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connected");
   const [error, setError] = useState<string | null>(null);
@@ -114,6 +120,41 @@ export const useChatConnection = () => {
       } catch {
         // ignore malformed roster
       }
+      return;
+    }
+
+    // Reaction: message_id = target, message = emoji, is_emoji = added(true)/removed.
+    if (nm.message_type === "Reaction") {
+      const target = nm.message_id;
+      const emoji = nm.message;
+      const added = !!nm.is_emoji;
+      const byMe = nm.user_id === currentUserRef.current?.id;
+      if (!target || !emoji) return;
+      setReactionsByMessage((prev) => {
+        const list = (prev[target] || []).slice();
+        const idx = list.findIndex((r) => r.emoji === emoji);
+        if (added) {
+          if (idx >= 0) {
+            list[idx] = {
+              ...list[idx],
+              count: list[idx].count + 1,
+              me: list[idx].me || byMe,
+            };
+          } else {
+            list.push({ emoji, count: 1, me: byMe });
+          }
+        } else if (idx >= 0) {
+          const count = list[idx].count - 1;
+          if (count <= 0) list.splice(idx, 1);
+          else
+            list[idx] = {
+              ...list[idx],
+              count,
+              me: byMe ? false : list[idx].me,
+            };
+        }
+        return { ...prev, [target]: list };
+      });
       return;
     }
 
@@ -211,6 +252,22 @@ export const useChatConnection = () => {
         ...prev,
         [room.name]: normalized.length >= PAGE_SIZE,
       }));
+
+      // Seed reactions for this room.
+      const me = currentUserRef.current?.id ?? 0;
+      const reax = (await invoke("get_room_reactions", {
+        roomId: room.id,
+        userId: me,
+      })) as ReactionAggregate[];
+      const byMsg: Record<string, Reaction[]> = {};
+      for (const r of reax) {
+        (byMsg[r.message_id] ||= []).push({
+          emoji: r.emoji,
+          count: r.count,
+          me: r.me,
+        });
+      }
+      setReactionsByMessage((prev) => ({ ...prev, ...byMsg }));
     } catch (err) {
       console.error("Error loading messages:", err);
     } finally {
@@ -532,6 +589,23 @@ export const useChatConnection = () => {
     }
   };
 
+  const toggleReaction = async (targetId: string, emoji: string) => {
+    if (!currentUser || !currentRoom) return;
+    const cmd =
+      mode === "server" ? "server_toggle_reaction" : "client_toggle_reaction";
+    try {
+      await invoke(cmd, {
+        userId: currentUser.id,
+        targetId,
+        emoji,
+        room: currentRoom.name,
+        roomId: currentRoom.id,
+      });
+    } catch (err) {
+      setError(`Couldn't react: ${err}`);
+    }
+  };
+
   const logout = async () => {
     if (currentUser) {
       invoke("update_user_online_status", {
@@ -565,6 +639,7 @@ export const useChatConnection = () => {
     setCurrentRoom(null);
     setMessagesByRoom({});
     setMembersByRoom({});
+    setReactionsByMessage({});
     setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
@@ -596,6 +671,8 @@ export const useChatConnection = () => {
     sendMessage,
     editMessage,
     deleteMessage,
+    toggleReaction,
+    reactionsByMessage,
     loadOlderMessages,
     searchMessages,
     jumpToRoom,

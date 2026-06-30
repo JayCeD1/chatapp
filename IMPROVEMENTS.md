@@ -409,14 +409,18 @@ No eslint config/dep; `prettier` present with no `lint`/`format` script. Anti-pa
 
 **Phase 1 is complete.** The only intentionally-skipped sub-item is per-message throughput rate-limiting (low value pre-product). Remaining: a live two-instance GUI smoke test of the encryption (can't run here).
 
-### Phase 2 — UX/layout overhaul to a persistent sidebar
-- [ ] Persistent 3-pane shell (sidebar + center + members), no full-screen swaps; demote "leave room" (6.1) — **L**
-- [ ] Register `message` listener once + per-room message store `Map<roomId, Message[]>` (5.1) — **M**
-- [ ] Reconnect state machine via `useReducer`/refs; clear timers; status banner (5.2/6.3) — **M**
-- [ ] Toast/error system + inline login errors; typed `AppError` codes (5.3/6.3/8.7) — **M→L**
-- [ ] Accessibility pass: aria-labels, `<label>`s, `role="log"`/`aria-live`, focus management, Enter-to-submit (6.2/6.10) — **M**
-- [ ] `prefers-reduced-motion`, contrast fixes, window min-size, loading/empty states + scroll-to-bottom (6.4/6.5/6.7/6.8/5.10) — **M**
-- [ ] Split god-hook into `useConnection`/`useMessages`/`useAuth` (5.5) — **L**
+### Phase 2 — UX/layout overhaul to a persistent sidebar _(core done)_
+Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments→channels sidebar · chat · members).
+- [x] Persistent 3-pane shell (Sidebar + ChatPane + MembersPanel) in a responsive grid; full-screen swaps gone; "leave" demoted to a header action (6.1) — **L**
+- [x] Register `message` listener once + per-room store (`messagesByRoom`, keyed by room name) (5.1) — **M**
+- [x] Reconnect uses refs + clears its timer + drives a `connectionStatus` state machine + status banner (5.2/6.3) — **M**
+- [x] Error toast + inline login errors via hook `error` state (5.3/6.3). _Typed `AppError` codes (8.7) deferred — a Rust-side change._ — **M→L**
+- [x] Accessibility pass: aria-labels, `<label>`/sr-only, `role="log"`/`aria-live`, autofocus, Enter-to-submit `<form>` (6.2/6.10) — **M**
+- [x] `prefers-reduced-motion` + window min-size (Phase 0); new high-contrast palette (6.5); loading/empty states + near-bottom auto-scroll (6.4/6.5/6.7/6.8/5.10) — **M**
+- [x] Message grouping, initials+color avatars, date separators, system notices (6.6) — **M**
+- [ ] _Polish (optional Part 2):_ split god-hook into `useConnection`/`useMessages`/`useAuth` (5.5); light-mode/settings toggle; skeleton loaders; "jump to latest" button; reset scroll-to-bottom on channel switch.
+
+**Phase 2 core is complete** (commit `f6fb132`). Real server-truth presence is Phase 3; current presence is derived from lifecycle events + message authors.
 
 ### Phase 3 — Feature expansion
 - [ ] Real presence (`update_user_online_status` on login/logout + presence event) + live member list (7) — **M**

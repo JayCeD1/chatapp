@@ -1,10 +1,12 @@
 import "./App.css";
 import { useChatConnection } from "./hooks/useChatConnection";
+import { useTheme } from "./hooks/useTheme";
 import { LoginView } from "./components/LoginView";
 import { Workspace } from "./components/Workspace";
 
 const Chat = () => {
   const c = useChatConnection();
+  const { theme, toggleTheme } = useTheme();
 
   if (c.view === "login" || !c.currentUser) {
     return (
@@ -39,6 +41,8 @@ const Chat = () => {
       onLeaveRoom={c.leaveRoom}
       onLogout={c.logout}
       onDismissError={c.dismissError}
+      theme={theme}
+      onToggleTheme={toggleTheme}
     />
   );
 };

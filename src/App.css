@@ -3,7 +3,9 @@
 /* Professional, high-contrast dark theme (Phase 2). Semantic tokens so the whole
    app can be re-themed (incl. a future light mode) from one place. Contrast ratios
    chosen to meet WCAG AA for body text. */
-:root {
+:root,
+:root[data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0e1116; /* app background */
   --surface: #161a21; /* sidebar / panels */
   --surface-2: #1c212b; /* raised: composer, hover */
@@ -18,6 +20,29 @@
   --accent-soft: rgba(139, 124, 255, 0.16);
   --online: #3fb950;
   --danger: #f0556b;
+  --scrollbar: rgba(255, 255, 255, 0.12);
+  --scrollbar-hover: rgba(255, 255, 255, 0.24);
+}
+
+/* Light theme — same tokens, AA-contrast values. */
+:root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #f6f7f9;
+  --surface: #ffffff;
+  --surface-2: #eef1f4;
+  --surface-3: #e2e7ee;
+  --border: #d6dbe1;
+  --border-soft: #e5e9ee;
+  --text: #1a1d21; /* ~14:1 on --bg */
+  --text-dim: #454b54; /* ~8:1 */
+  --text-faint: #677082; /* ~4.7:1 */
+  --accent: #6d4aff;
+  --accent-strong: #5a37e0;
+  --accent-soft: rgba(109, 74, 255, 0.12);
+  --online: #2da44e;
+  --danger: #cf222e;
+  --scrollbar: rgba(0, 0, 0, 0.18);
+  --scrollbar-hover: rgba(0, 0, 0, 0.32);
 }
 
 html,
@@ -37,11 +62,33 @@ body,
     background: transparent;
   }
   .scrollbar-thin::-webkit-scrollbar-thumb {
-    background: rgba(255, 255, 255, 0.1);
+    background: var(--scrollbar);
     border-radius: 10px;
   }
   .scrollbar-thin::-webkit-scrollbar-thumb:hover {
-    background: rgba(255, 255, 255, 0.2);
+    background: var(--scrollbar-hover);
+  }
+
+  /* Shimmer placeholder for loading message lists. */
+  .skeleton {
+    background: linear-gradient(
+      90deg,
+      var(--surface-2) 25%,
+      var(--surface-3) 37%,
+      var(--surface-2) 63%
+    );
+    background-size: 400px 100%;
+    animation: shimmer 1.4s ease-in-out infinite;
+    border-radius: 6px;
+  }
+}
+
+@keyframes shimmer {
+  0% {
+    background-position: -300px 0;
+  }
+  100% {
+    background-position: 300px 0;
   }
 }
 

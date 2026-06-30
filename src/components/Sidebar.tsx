@@ -1,7 +1,8 @@
 import React from "react";
-import { Hash, LogOut, Users } from "lucide-react";
+import { Hash, LogOut, Users, Sun, Moon } from "lucide-react";
 import { ChatRoom, Department, User } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
+import { Theme } from "../hooks/useTheme";
 import { initials, avatarColor } from "../utils";
 
 interface SidebarProps {
@@ -12,6 +13,8 @@ interface SidebarProps {
   connectionStatus: ConnectionStatus;
   onSelectRoom: (room: ChatRoom) => void;
   onLogout: () => void;
+  theme: Theme;
+  onToggleTheme: () => void;
 }
 
 const statusMeta: Record<ConnectionStatus, { color: string; label: string }> = {
@@ -28,6 +31,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   connectionStatus,
   onSelectRoom,
   onLogout,
+  theme,
+  onToggleTheme,
 }) => {
   // Group rooms by department; keep any unmatched rooms under "Other".
   const groups = departments
@@ -132,6 +137,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
             {status.label}
           </div>
         </div>
+        <button
+          onClick={onToggleTheme}
+          title={
+            theme === "dark" ? "Switch to light mode" : "Switch to dark mode"
+          }
+          aria-label={
+            theme === "dark" ? "Switch to light mode" : "Switch to dark mode"
+          }
+          className="p-2 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+        >
+          {theme === "dark" ? (
+            <Sun className="w-4 h-4" />
+          ) : (
+            <Moon className="w-4 h-4" />
+          )}
+        </button>
         <button
           onClick={onLogout}
           title="Log out"

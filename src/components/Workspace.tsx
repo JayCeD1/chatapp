@@ -2,6 +2,7 @@ import React, { useEffect, useMemo } from "react";
 import { Hash, RefreshCw, WifiOff, X } from "lucide-react";
 import { ChatRoom, Department, Message, User } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
+import { Theme } from "../hooks/useTheme";
 import { Sidebar } from "./Sidebar";
 import { ChatPane } from "./ChatPane";
 import { MembersPanel, Member } from "./MembersPanel";
@@ -21,6 +22,8 @@ interface WorkspaceProps {
   onLeaveRoom: () => void;
   onLogout: () => void;
   onDismissError: () => void;
+  theme: Theme;
+  onToggleTheme: () => void;
 }
 
 export const Workspace: React.FC<WorkspaceProps> = ({
@@ -38,6 +41,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   onLeaveRoom,
   onLogout,
   onDismissError,
+  theme,
+  onToggleTheme,
 }) => {
   // Build the member list for the active room from who has posted + live presence.
   const members: Member[] = useMemo(() => {
@@ -68,6 +73,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         connectionStatus={connectionStatus}
         onSelectRoom={onSelectRoom}
         onLogout={onLogout}
+        theme={theme}
+        onToggleTheme={onToggleTheme}
       />
 
       <div className="flex flex-col min-w-0 min-h-0">

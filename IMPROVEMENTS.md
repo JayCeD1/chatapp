@@ -396,17 +396,16 @@ No eslint config/dep; `prettier` present with no `lint`/`format` script. Anti-pa
 
 > **Remaining for later phases (deferred from the related findings above):** the full `read_frame`-shares-the-cap is done, but the **broadcast lock/ordering refactor (3.2/3.3)**, **reconnect idempotency (1.7)**, **`RoomLeave` end-to-end (1.8)**, and **stale-cleanup room (1.9)** are Phase 1. The **timestamp wire format is normalized on the frontend**; making the Rust `Message.created_at` a string too (so no normalization is needed at all) is a nice follow-up.
 
-### Phase 1 — Security + reliability foundation
-- [ ] Handshake auth: shared secret/room password; bind connection→identity; ignore client-asserted id/room after handshake (2.1/2.2) — **L**
+### Phase 1 — Security + reliability foundation _(in progress)_
+- [~] **Auth + encryption (2.1/2.2/2.3)** — chose **shared room password + Noise (NNpsk0) encryption**. `secure.rs` transport module built + unit-tested (handshake, encrypted round-trip, wrong-password rejection). **Next:** wire into connect/accept paths + add password fields to the login UI; bind identity to the connection and ignore client-asserted id/room after handshake. — **L**
 - [ ] Make `Connect` idempotent on the host; cancel old client listener on reconnect (1.7) — **M**
 - [ ] Implement `RoomLeave` end-to-end + handle `Disconnect`/`RoomLeave` in server match; fix stale-cleanup room (1.8/1.9) — **M**
 - [ ] Refactor broadcast: collect targets, drop locks before emit/spawn, sequential ordered sends, write timeout + heartbeat (3.2/3.3) — **M**
-- [ ] Bounded accept loop + per-IP cap + rate limit + read timeout (2.5) — **M**
-- [ ] Replace network-path `unwrap`/`expect` with graceful handling; `now_secs()` helper (2.6) — **M**
-- [ ] Remove `sql:allow-execute`; set strict CSP; remove unused `dialog` permission (2.7) — **S**
-- [ ] Input validation/length caps at command + wire boundary (2.8) — **M**
-- [ ] DB integrity: `foreign_keys=ON`, WAL, busy_timeout, indexes, `UNIQUE(chat_rooms.name)`, FK `ON DELETE`, `upsert_user` normalization, `join_room` upsert (4.2-4.6/4.8) — **M**
-- [ ] TLS/Noise transport (2.3) — **L**
+- [~] Bounded accept loop ✅ (2.5); per-IP cap + rate limit + read-timeout still pending (read-timeout pairs with the heartbeat in 3.3) — **M**
+- [x] Replace network-path `unwrap`/`expect` with graceful handling; `now_secs()` helper (2.6) — **M**
+- [x] Remove `sql:allow-execute` (+ `sql:default` + unused `dialog`); set strict CSP (2.7) — **S**
+- [x] Input validation/length caps at command + wire boundary (2.8) — **M**
+- [x] DB integrity: `foreign_keys=ON`, WAL, busy_timeout, indexes, `UNIQUE(chat_rooms.name)` (Phase 0), `upsert_user` normalization, `join_room` upsert (4.2-4.6/4.8). _FK `ON DELETE` still pending — needs a table-rebuild migration._ — **M**
 
 ### Phase 2 — UX/layout overhaul to a persistent sidebar
 - [ ] Persistent 3-pane shell (sidebar + center + members), no full-screen swaps; demote "leave room" (6.1) — **L**

@@ -28,4 +28,6 @@ sqlx = { version = "0.8.6", features = ["sqlite", "runtime-tokio"] }
 uuid = { version = "1.17.0", features = ["v4"] }
 tokio = { version = "1.47.1", features = ["rt", "rt-multi-thread", "macros", "net", "time", "sync", "io-util"] }
 tauri-plugin-dialog = "2"
+snow = "0.9"
+sha2 = "0.10"
 

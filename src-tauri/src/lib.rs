@@ -16,6 +16,7 @@ use tauri::Manager;
 
 mod db_queries;
 mod migration;
+mod secure;
 mod sockets;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]

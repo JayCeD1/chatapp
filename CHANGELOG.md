@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-06-30
+
+### Fixed
+
+- **Direct messages across machines.** Clients keep their own local database, so
+  host-created DMs and private channels were invisible to them: opening a DM hit
+  a foreign-key error and recipients never saw the conversation. Rooms are now
+  host-authoritative for clients — the host pushes each client its real room list
+  on connect and on every membership change, and clients no longer write room
+  membership to their local database.
+- **Own messages mis-attributed.** Testing with the same display name on multiple
+  machines marked every message as your own (all right-aligned). Ownership is now
+  matched by the host-assigned canonical id, so same-named users stay distinct.
+- **Reactions counted twice** per click (a duplicated event listener under React
+  StrictMode); the reconnect listener had the same latent leak.
+
+### Changed
+
+- Your own messages render right-aligned with a tinted bubble to distinguish them.
+
 ## [0.2.0] - 2026-06-30
 
 ### Added

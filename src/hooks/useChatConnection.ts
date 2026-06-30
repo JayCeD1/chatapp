@@ -367,6 +367,25 @@ export const useChatConnection = () => {
     }
   };
 
+  // Create a new channel, refresh the list, and open it.
+  const createRoom = async (
+    name: string,
+    description: string,
+    departmentId: number | null,
+    isPrivate: boolean,
+  ) => {
+    if (!currentUser) return;
+    const room = (await invoke("create_room", {
+      name,
+      description: description || null,
+      departmentId: departmentId ?? null,
+      isPrivate,
+      createdBy: currentUser.id,
+    })) as ChatRoom;
+    await loadChatRooms();
+    await joinRoom(room);
+  };
+
   // Leave the active room (back to "no channel selected"); stays in the workspace.
   const leaveRoom = async () => {
     if (!currentUser || !currentRoom) return;
@@ -469,6 +488,7 @@ export const useChatConnection = () => {
     setServerIp,
     login,
     joinRoom,
+    createRoom,
     leaveRoom,
     sendMessage,
     loadOlderMessages,

@@ -15,7 +15,9 @@ export interface ChatRoom {
   id: number;
   name: string;
   description: string;
+  department_id?: number;
   department_name?: string;
+  is_private?: boolean;
   user_count?: number;
 }
 

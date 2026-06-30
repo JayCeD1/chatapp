@@ -328,6 +328,63 @@ ORDER BY cr.name
 }
 
 #[tauri::command]
+pub async fn create_room(
+    db: State<'_, SqlitePool>,
+    name: String,
+    description: Option<String>,
+    department_id: Option<i64>,
+    is_private: Option<bool>,
+    created_by: Option<i64>,
+) -> Result<ChatRoom, String> {
+    let name = name.trim().to_string();
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err("Channel name must be between 1 and 64 characters".to_string());
+    }
+    let is_private = is_private.unwrap_or(false);
+
+    let result = sqlx::query(
+        "INSERT INTO chat_rooms (name, description, department_id, is_private, created_by)
+         VALUES ($1, $2, $3, $4, $5)",
+    )
+    .bind(&name)
+    .bind(&description)
+    .bind(&department_id)
+    .bind(&is_private)
+    .bind(&created_by)
+    .execute(&*db)
+    .await
+    .map_err(|e| {
+        if e.to_string().contains("UNIQUE") {
+            "A channel with that name already exists".to_string()
+        } else {
+            format!("Failed to create channel: {}", e)
+        }
+    })?;
+
+    let id = result.last_insert_rowid();
+    let row = sqlx::query(
+        "SELECT cr.id, cr.name, cr.description, cr.department_id, cr.is_private,
+                d.name as department_name, 0 as user_count
+         FROM chat_rooms cr LEFT JOIN departments d ON cr.department_id = d.id
+         WHERE cr.id = $1",
+    )
+    .bind(&id)
+    .fetch_one(&*db)
+    .await
+    .map_err(|e| e.to_string())?;
+
+    Ok(ChatRoom {
+        id: row.get::<Option<i64>, _>("id"),
+        name: row.get::<String, _>("name"),
+        description: row.get::<Option<String>, _>("description"),
+        department_id: row.get::<Option<i64>, _>("department_id"),
+        department_name: row.get::<Option<String>, _>("department_name"),
+        is_private: row.get::<bool, _>("is_private"),
+        user_count: row.get::<Option<i64>, _>("user_count"),
+    })
+}
+
+#[tauri::command]
 pub async fn join_room(
     db: State<'_, SqlitePool>,
     user_id: i64,

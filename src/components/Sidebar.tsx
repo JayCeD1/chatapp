@@ -1,9 +1,10 @@
-import React from "react";
-import { Hash, LogOut, Users, Sun, Moon } from "lucide-react";
+import React, { useState } from "react";
+import { Hash, LogOut, Users, Sun, Moon, Plus } from "lucide-react";
 import { ChatRoom, Department, User } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
 import { Theme } from "../hooks/useTheme";
 import { initials, avatarColor } from "../utils";
+import { CreateChannelModal } from "./CreateChannelModal";
 
 interface SidebarProps {
   departments: Department[];
@@ -12,6 +13,12 @@ interface SidebarProps {
   currentUser: User;
   connectionStatus: ConnectionStatus;
   onSelectRoom: (room: ChatRoom) => void;
+  onCreateRoom: (
+    name: string,
+    description: string,
+    departmentId: number | null,
+    isPrivate: boolean,
+  ) => Promise<void>;
   onLogout: () => void;
   theme: Theme;
   onToggleTheme: () => void;
@@ -30,10 +37,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
   currentUser,
   connectionStatus,
   onSelectRoom,
+  onCreateRoom,
   onLogout,
   theme,
   onToggleTheme,
 }) => {
+  const [showCreate, setShowCreate] = useState(false);
+
   // Group rooms by department; keep any unmatched rooms under "Other".
   const groups = departments
     .map((dep) => ({
@@ -55,9 +65,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <div className="flex items-center justify-center w-7 h-7 rounded-lg bg-gradient-to-br from-[var(--accent)] to-[var(--accent-strong)]">
           <Hash className="w-4 h-4 text-white" />
         </div>
-        <span className="font-semibold text-[var(--text)] tracking-tight">
+        <span className="font-semibold text-[var(--text)] tracking-tight flex-1">
           Nutler
         </span>
+        <button
+          onClick={() => setShowCreate(true)}
+          title="Create a channel"
+          aria-label="Create a channel"
+          className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+        >
+          <Plus className="w-4 h-4" />
+        </button>
       </div>
 
       {/* Channel list */}
@@ -162,6 +180,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <LogOut className="w-4 h-4" />
         </button>
       </div>
+
+      {showCreate && (
+        <CreateChannelModal
+          departments={departments}
+          defaultDepartmentId={
+            currentRoom?.department_id ?? currentUser.department_id ?? null
+          }
+          onCreate={onCreateRoom}
+          onClose={() => setShowCreate(false)}
+        />
+      )}
     </aside>
   );
 };

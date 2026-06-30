@@ -38,6 +38,7 @@ const Chat = () => {
       error={c.error}
       hasMore={c.hasMore}
       onSelectRoom={c.joinRoom}
+      onCreateRoom={c.createRoom}
       onSendMessage={c.sendMessage}
       onLoadOlder={c.loadOlderMessages}
       onLeaveRoom={c.leaveRoom}

@@ -663,6 +663,7 @@ export const useChatConnection = () => {
     if (mode !== "client" || !currentUser) return;
 
     let unlisten: (() => void) | undefined;
+    let active = true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     let retryCount = 0;
     let retryDelay = 1000;
@@ -698,15 +699,20 @@ export const useChatConnection = () => {
     };
 
     (async () => {
-      unlisten = await listen("connection_lost", () => {
+      const fn = await listen("connection_lost", () => {
         setConnectionStatus("reconnecting");
         retryCount = 0;
         retryDelay = 1000;
         attempt();
       });
+      // If the effect was torn down before listen resolved, unsubscribe the late handle so a
+      // second listener can't leak and spawn a duplicate reconnect loop.
+      if (!active) fn();
+      else unlisten = fn;
     })();
 
     return () => {
+      active = false;
       if (unlisten) unlisten();
       if (timer) clearTimeout(timer);
     };

@@ -66,6 +66,11 @@ jobs:
       - name: Install Node.js dependencies
         run: npm install
 
+      # Guard against shipping a release with mismatched versions across
+      # package.json / tauri.conf.json / Cargo.toml.
+      - name: Check version sync
+        run: npm run version:check
+
       # Windows signing: import the .pfx into the cert store and inject its thumbprint
       # into tauri.conf.json so the bundler signs with it. Skipped when no cert secret.
       - name: Import Windows signing certificate

@@ -7,8 +7,10 @@ don't see "unidentified developer" / SmartScreen warnings.
 ## Release flow
 
 1. Merge work into `main` via PR (CI must be green — see `.github/workflows/ci.yml`).
-2. Bump the version in **both** `package.json` and `src-tauri/tauri.conf.json` (and
-   `src-tauri/Cargo.toml` if you track it there), and update `CHANGELOG.md`.
+2. Bump `version` in `package.json` (the source of truth), then run
+   `npm run version:sync` to propagate it to `src-tauri/tauri.conf.json` and
+   `src-tauri/Cargo.toml`, and update `CHANGELOG.md`. CI runs `npm run version:check`
+   and the release build re-checks it, so a mismatched version can't ship.
 3. Tag and push:
    ```bash
    git tag v0.1.0

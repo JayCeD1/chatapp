@@ -445,6 +445,7 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 - [x] Governance docs: `CONTRIBUTING.md`, `CHANGELOG.md`, `SECURITY.md`, `.github/dependabot.yml` (npm + cargo + actions), **issue/PR templates** (`.github/ISSUE_TEMPLATE/*`, `pull_request_template.md`). _`deploy.sh` review still pending._ — **M**
 - [x] **Code-signing / notarization scaffolding**: `tauri.conf.json` `bundle.macOS`/`bundle.windows` settings + `src-tauri/entitlements.plist` (hardened runtime); release `build.yml` wired for macOS signing+notarization (Apple ID method) and Windows `.pfx` import → thumbprint injection, all **secret-gated so builds stay unsigned (and green) until secrets are added**; full `RELEASING.md` (flow + per-platform secret tables + verification). _Actual certs/secrets are the maintainer's to add._ — **M**
 - [x] **CI efficiency**: `concurrency` (group by workflow + `head_ref`/`ref`, `cancel-in-progress`) so a newer push cancels the older run; `push` limited to `main` so a feature branch + its PR never double-run. — **S**
+- [x] **Version-sync guard**: `scripts/check-versions.mjs` (+ `version:check`/`version:sync` npm scripts) keeps `package.json` (source of truth), `tauri.conf.json`, and `Cargo.toml` aligned; enforced in CI and the release build so a mismatched version can't ship. — **S**
 - [ ] PII at rest: SQLCipher/keychain, file perms (2.11) — **M**
 
 ---

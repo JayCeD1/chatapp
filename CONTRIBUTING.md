@@ -52,6 +52,7 @@ Run the same checks CI runs. All of these must be clean:
 **Frontend**
 
 ```bash
+npm run version:check  # package.json / tauri.conf.json / Cargo.toml agree
 npm run typecheck      # tsc --noEmit
 npm run lint           # eslint
 npm run format:check   # prettier --check

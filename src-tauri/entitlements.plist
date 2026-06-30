@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <!-- Hardened runtime is required for notarization. WKWebView needs JIT. -->
+  <key>com.apple.security.cs.allow-jit</key>
+  <true/>
+  <!-- Outbound (client mode) and listening (host mode) network access. These are
+       App Sandbox keys and are no-ops for a non-sandboxed Developer ID build, but
+       harmless and correct should sandboxing ever be enabled. -->
+  <key>com.apple.security.network.client</key>
+  <true/>
+  <key>com.apple.security.network.server</key>
+  <true/>
+</dict>
+</plist>

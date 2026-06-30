@@ -98,6 +98,11 @@ narrowly as possible with a comment explaining why.
 - Reference any related issue. Update `CHANGELOG.md` under `[Unreleased]` for
   user-facing changes.
 
+## Releasing (maintainers)
+
+Cutting a release (tagging, the per-platform build matrix, and code
+signing/notarization setup) is documented in [RELEASING.md](./RELEASING.md).
+
 ## Reporting bugs & security issues
 
 - **Bugs / features:** open a GitHub issue with steps to reproduce, expected vs.

@@ -10,6 +10,9 @@ on:
 jobs:
   build:
     strategy:
+      # Don't cancel the other platforms if one fails — a release should still ship the
+      # bundles that built successfully.
+      fail-fast: false
       matrix:
         include:
           - os: windows-latest
@@ -88,7 +91,9 @@ jobs:
           Write-Host "Signing with thumbprint $($cert.Thumbprint)"
 
       - name: Build Tauri app
-        run: npm run tauri build -- --target ${{ matrix.target }}
+        # `npx tauri` runs the CLI directly — `npm run tauri build -- --target X` forwards a
+        # stray `--` that the CLI rejects ("unexpected argument '<target>'").
+        run: npx tauri build --target ${{ matrix.target }}
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4

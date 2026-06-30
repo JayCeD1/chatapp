@@ -1,6 +1,7 @@
 import React, { useState } from "react";
 import { X, Hash, AlertCircle } from "lucide-react";
 import { Department } from "../types";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 
 interface CreateChannelModalProps {
   departments: Department[];
@@ -28,6 +29,7 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
   const [isPrivate, setIsPrivate] = useState(false);
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const trapRef = useFocusTrap<HTMLDivElement>(onClose);
 
   const submit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -55,6 +57,7 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
       aria-label="Create a channel"
     >
       <div
+        ref={trapRef}
         className="w-full max-w-md bg-[var(--surface)] border border-[var(--border)] rounded-2xl shadow-2xl animate-scale-in"
         onMouseDown={(e) => e.stopPropagation()}
       >
@@ -84,7 +87,6 @@ export const CreateChannelModal: React.FC<CreateChannelModalProps> = ({
                 value={name}
                 onChange={(e) => setName(e.target.value)}
                 placeholder="e.g. design-team"
-                autoFocus
                 maxLength={64}
                 className="w-full bg-[var(--surface-2)] border border-[var(--border)] rounded-xl py-2.5 pl-9 pr-3 text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none focus:border-[var(--accent)] focus:ring-2 focus:ring-[var(--accent-soft)] transition-colors"
               />

@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef } from "react";
 import { Search, X, Hash, Loader2 } from "lucide-react";
 import { SearchResult } from "../types";
 import { initials, avatarColor, formatSearchTime } from "../utils";
+import { useFocusTrap } from "../hooks/useFocusTrap";
 
 interface SearchModalProps {
   onSearch: (query: string) => Promise<SearchResult[]>;
@@ -19,6 +20,7 @@ export const SearchModal: React.FC<SearchModalProps> = ({
   const [loading, setLoading] = useState(false);
   const [searched, setSearched] = useState(false);
   const timer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined);
+  const trapRef = useFocusTrap<HTMLDivElement>(onClose);
 
   // Debounced search; a request token guards against out-of-order responses.
   const reqId = useRef(0);
@@ -59,16 +61,15 @@ export const SearchModal: React.FC<SearchModalProps> = ({
       aria-label="Search messages"
     >
       <div
+        ref={trapRef}
         className="w-full max-w-lg bg-[var(--surface)] border border-[var(--border)] rounded-2xl shadow-2xl animate-scale-in overflow-hidden"
         onMouseDown={(e) => e.stopPropagation()}
       >
         <div className="flex items-center gap-2 px-4 h-14 border-b border-[var(--border)]">
           <Search className="w-4 h-4 text-[var(--text-faint)] shrink-0" />
           <input
-            autoFocus
             value={query}
             onChange={(e) => setQuery(e.target.value)}
-            onKeyDown={(e) => e.key === "Escape" && onClose()}
             placeholder="Search messages…"
             className="flex-1 bg-transparent text-[var(--text)] placeholder-[var(--text-faint)] focus:outline-none"
           />

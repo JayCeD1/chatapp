@@ -83,7 +83,11 @@ export const useChatConnection = () => {
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connected");
   const [error, setError] = useState<string | null>(null);
-  const [loadingMessages, setLoadingMessages] = useState(false);
+  // Per-room loading state — a single global flag would let one room's history
+  // arrival clear another room's spinner (or get stuck if its push never comes).
+  const [loadingByRoom, setLoadingByRoom] = useState<Record<string, boolean>>(
+    {},
+  );
 
   // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
@@ -121,25 +125,39 @@ export const useChatConnection = () => {
         const msgs = (batch.messages || []).map((m) =>
           normalizeMessage({ ...m, room: nm.room }),
         );
-        // Merge, not replace: a live Chat can land in the gap between the host
-        // snapshotting history and this push arriving. Keep any existing message
-        // at/after the snapshot's newest so we don't drop it (older extras are
-        // stale and intentionally discarded).
+        // Merge, not replace. A live Chat/Edit/Delete can land in the gap between
+        // the host snapshotting history and this push arriving:
+        //  - a brand-new live message at/after the snapshot's newest is kept;
+        //  - a live edit/delete to a snapshotted message wins over the stale
+        //    snapshot copy (so the gap mutation isn't reverted);
+        //  - older live extras are stale and intentionally discarded.
+        // Sort by id (the host's authoritative order) and fall back to created_at
+        // only for live, id-less rows.
         setMessagesByRoom((prev) => {
           const existing = prev[nm.room] || [];
-          const seen = new Set(msgs.map((m) => m.message_id));
           const newest = msgs.length ? msgs[msgs.length - 1].created_at : "";
-          const extras = existing.filter(
-            (m) =>
-              m.message_id && !seen.has(m.message_id) && m.created_at >= newest,
-          );
-          const merged = [...msgs, ...extras].sort((a, b) =>
-            a.created_at < b.created_at
+          const byId = new Map<string, Message>();
+          for (const m of msgs) if (m.message_id) byId.set(m.message_id, m);
+          for (const m of existing) {
+            if (!m.message_id) continue;
+            const snap = byId.get(m.message_id);
+            if (!snap) {
+              if (m.created_at >= newest) byId.set(m.message_id, m); // raced-in live msg
+            } else {
+              const liveAdvanced =
+                (m.deleted_at && !snap.deleted_at) ||
+                (m.edited_at && (!snap.edited_at || m.edited_at > snap.edited_at));
+              if (liveAdvanced) byId.set(m.message_id, { ...m, id: m.id ?? snap.id });
+            }
+          }
+          const merged = [...byId.values()].sort((a, b) => {
+            if (a.id != null && b.id != null) return a.id - b.id;
+            return a.created_at < b.created_at
               ? -1
               : a.created_at > b.created_at
                 ? 1
-                : 0,
-          );
+                : 0;
+          });
           return { ...prev, [nm.room]: merged };
         });
         // Recent batch only (full pagination is host-side for now).
@@ -160,10 +178,10 @@ export const useChatConnection = () => {
           }
           return next;
         });
-        setLoadingMessages(false);
+        setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
       } catch (err) {
         console.error("Bad history payload:", err);
-        setLoadingMessages(false);
+        setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
       }
       return;
     }
@@ -297,7 +315,7 @@ export const useChatConnection = () => {
   };
 
   const loadRoomMessages = useCallback(async (room: ChatRoom) => {
-    setLoadingMessages(true);
+    setLoadingByRoom((prev) => ({ ...prev, [room.name]: true }));
     try {
       const msgs = (await invoke("get_room_messages", {
         roomId: room.id,
@@ -337,7 +355,7 @@ export const useChatConnection = () => {
     } catch (err) {
       console.error("Error loading messages:", err);
     } finally {
-      setLoadingMessages(false);
+      setLoadingByRoom((prev) => ({ ...prev, [room.name]: false }));
     }
   }, []);
 
@@ -538,7 +556,7 @@ export const useChatConnection = () => {
       } else {
         // Client's local DB has none of the host's history; show a loading
         // state and wait for the host's HistoryResponse push (see ingestMessage).
-        setLoadingMessages(true);
+        setLoadingByRoom((prev) => ({ ...prev, [room.name]: true }));
         setMessagesByRoom((prev) =>
           prev[room.name] ? prev : { ...prev, [room.name]: [] },
         );
@@ -734,7 +752,8 @@ export const useChatConnection = () => {
     membersByRoom,
     connectionStatus,
     error,
-    loadingMessages,
+    // Derived: only the active room's spinner is surfaced to the UI.
+    loadingMessages: currentRoom ? !!loadingByRoom[currentRoom.name] : false,
     hasMore: currentRoom ? (hasMoreByRoom[currentRoom.name] ?? true) : false,
     currentUser,
     currentRoom,

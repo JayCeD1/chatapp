@@ -783,31 +783,52 @@ async fn send_room_history(
     let mut messages = get_room_messages_internal(pool, room_id as i64, 50, None)
         .await
         .unwrap_or_default();
-    let reactions = get_room_reactions_internal(pool, room_id as i64, user_id as i64)
+    let all_reactions = get_room_reactions_internal(pool, room_id as i64, user_id as i64)
         .await
         .unwrap_or_default();
 
-    // Build the JSON batch, dropping oldest messages until it fits a Noise frame (~64KB).
-    let payload = loop {
-        let p = serde_json::json!({ "messages": messages, "reactions": reactions }).to_string();
-        if p.len() <= 55_000 || messages.len() <= 1 {
-            break p;
+    // Build a HistoryResponse for a given message set, carrying ONLY the reactions
+    // whose target survives the trim (reactions are room-wide, so an untrimmed list
+    // could overflow the frame on its own).
+    let make = |msgs: &[crate::db_queries::Message]| -> Message {
+        let ids: std::collections::HashSet<&str> =
+            msgs.iter().filter_map(|m| m.message_id.as_deref()).collect();
+        let reactions: Vec<_> = all_reactions
+            .iter()
+            .filter(|r| ids.contains(r.message_id.as_str()))
+            .collect();
+        let payload = serde_json::json!({ "messages": msgs, "reactions": reactions }).to_string();
+        Message {
+            message_type: MessageType::HistoryResponse,
+            username: String::new(),
+            user_id: 0,
+            message: payload,
+            message_id: Uuid::new_v4().to_string(),
+            room: room.to_string(),
+            room_id,
+            created_at: now_secs(),
+            is_emoji: false,
+        }
+    };
+
+    // Drop oldest messages (and their reactions) until the SERIALIZED OUTER Message —
+    // what send_secure actually encrypts (the inner payload gets JSON-escaped again) —
+    // fits one Noise frame with headroom for the AEAD tag.
+    let resp = loop {
+        let m = make(&messages);
+        let outer = serde_json::to_string(&m).map(|s| s.len()).unwrap_or(usize::MAX);
+        if outer + 64 <= 60_000 || messages.len() <= 1 {
+            break m;
         }
         messages.remove(0);
     };
 
-    let resp = Message {
-        message_type: MessageType::HistoryResponse,
-        username: String::new(),
-        user_id: 0,
-        message: payload,
-        message_id: Uuid::new_v4().to_string(),
-        room: room.to_string(),
-        room_id,
-        created_at: now_secs(),
-        is_emoji: false,
-    };
-    let _ = send_secure(&writer, &transport, &resp).await;
+    // If even the trimmed frame can't go out (e.g. one oversized message), send an
+    // empty batch so the client clears its loading state instead of spinning forever.
+    if send_secure(&writer, &transport, &resp).await.is_err() {
+        let empty = make(&[]);
+        let _ = send_secure(&writer, &transport, &empty).await;
+    }
 }
 
 async fn handle_server_message(
@@ -872,17 +893,20 @@ async fn handle_server_message(
                 .await;
         }
         MessageType::RoomJoin => {
+            // Use the connection-bound id, never the (spoofable) one in the frame, so a
+            // peer can't relocate another user's room or redirect their delivery.
+            let actor = auth_user_id.unwrap_or(message.user_id);
             //Update client's room and room tracking
             let mut old_room: Option<String> = None;
             {
                 let mut server_streams_guard = state.server_streams.lock().await;
                 let mut room_clients_guard = state.room_clients.lock().await;
 
-                if let Some(client) = server_streams_guard.get_mut(&message.user_id) {
+                if let Some(client) = server_streams_guard.get_mut(&actor) {
                     //Remember + remove from the old room
                     old_room = Some(client.current_room.clone());
                     if let Some(users) = room_clients_guard.get_mut(&client.current_room) {
-                        users.retain(|&id| id != message.user_id);
+                        users.retain(|&id| id != actor);
                     }
 
                     //Update client info
@@ -893,8 +917,8 @@ async fn handle_server_message(
                     let room_vec = room_clients_guard
                         .entry(message.room.clone())
                         .or_insert_with(Vec::new);
-                    if !room_vec.contains(&message.user_id) {
-                        room_vec.push(message.user_id);
+                    if !room_vec.contains(&actor) {
+                        room_vec.push(actor);
                     }
                 }
             }
@@ -925,8 +949,10 @@ async fn handle_server_message(
                 }
             }
             // Give the joining client scrollback for the room they just opened.
-            let requester = auth_user_id.unwrap_or(message.user_id);
-            send_room_history(&state, &pool, requester, &message.room, message.room_id).await;
+            // Only for authenticated connections — never push to a spoofed user_id.
+            if let Some(requester) = auth_user_id {
+                send_room_history(&state, &pool, requester, &message.room, message.room_id).await;
+            }
         }
         MessageType::RoomLeave => {
             // Remove the user from the room they are leaving so the host stops relaying

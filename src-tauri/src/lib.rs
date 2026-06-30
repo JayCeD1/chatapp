@@ -44,6 +44,7 @@ pub fn run() {
             client_transport: Arc::new(tokio::sync::Mutex::new(None)),
             client_listener: Arc::new(tokio::sync::Mutex::new(None)),
             client_heartbeat: Arc::new(tokio::sync::Mutex::new(None)),
+            discovery_responder: Arc::new(tokio::sync::Mutex::new(None)),
             room_clients: Arc::new(tokio::sync::Mutex::new(Default::default())),
             ip_conn_counts: Arc::new(tokio::sync::Mutex::new(Default::default())),
             username: tokio::sync::RwLock::new(String::new()),

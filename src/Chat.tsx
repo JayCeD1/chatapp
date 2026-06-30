@@ -19,6 +19,7 @@ const Chat = () => {
           setMode={c.setMode}
           serverIp={c.serverIp}
           setServerIp={c.setServerIp}
+          onDiscover={c.discoverServers}
           onLogin={c.login}
         />
       </div>

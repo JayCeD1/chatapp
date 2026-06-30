@@ -104,6 +104,10 @@ export const useChatConnection = () => {
   const [unreadByRoom, setUnreadByRoom] = useState<Record<number, number>>({});
   // User directory (host pushes it) for the invite + DM pickers.
   const [directory, setDirectory] = useState<DirectoryUser[]>([]);
+  // The host-assigned canonical id for THIS user (client mode). Our local id differs from it,
+  // so we use this to recognise our own messages by id rather than by (collision-prone) name.
+  const [canonicalUserId, setCanonicalUserId] = useState<number | null>(null);
+  const canonicalUserIdRef = useRef<number | null>(null);
 
   // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
@@ -190,6 +194,13 @@ export const useChatConnection = () => {
       } catch (err) {
         console.error("Bad directory payload:", err);
       }
+      return;
+    }
+
+    // Host tells us our canonical id (client mode) so we can recognise our own messages.
+    if (nm.message_type === "Identity") {
+      canonicalUserIdRef.current = nm.user_id;
+      setCanonicalUserId(nm.user_id);
       return;
     }
 
@@ -383,11 +394,11 @@ export const useChatConnection = () => {
       const target = nm.message_id;
       const emoji = nm.message;
       const added = !!nm.is_emoji;
-      // In client mode the echo carries the canonical id while ours is local, so also match by
-      // name (the same fallback used for message ownership).
+      // In client mode the echo carries the canonical id while our local id differs, so match
+      // either (the host tells us our canonical id via Identity).
       const byMe =
         nm.user_id === currentUserRef.current?.id ||
-        nm.username === currentUserRef.current?.name;
+        nm.user_id === canonicalUserIdRef.current;
       if (!target || !emoji) return;
       setReactionsByMessage((prev) => {
         const list = (prev[target] || []).slice();
@@ -1093,6 +1104,8 @@ export const useChatConnection = () => {
     setReactionsByMessage({});
     setUnreadByRoom({});
     setDirectory([]);
+    setCanonicalUserId(null);
+    canonicalUserIdRef.current = null;
     setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
@@ -1125,6 +1138,7 @@ export const useChatConnection = () => {
     directory,
     addMember,
     createDm,
+    canonicalUserId,
     currentUser,
     currentRoom,
     setMode,

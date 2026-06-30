@@ -32,6 +32,9 @@ interface ChatPaneProps {
   room: ChatRoom;
   currentUser: User;
   currentUserId: number;
+  // Host-assigned canonical id (client mode); our local id differs, so we match own messages
+  // by either. Null in host mode (currentUserId is already canonical there).
+  canonicalUserId: number | null;
   messages: Message[];
   loading: boolean;
   hasMore: boolean;
@@ -69,6 +72,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   room,
   currentUser,
   currentUserId,
+  canonicalUserId,
   messages,
   loading,
   hasMore,
@@ -368,9 +372,12 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 }
 
                 const grouped = !showDate && shouldGroup(prev, msg);
+                // Own messages match our local id (live, optimistic) OR our canonical id
+                // (history / echoes). Matching by id — not name — so same-named users stay
+                // distinct.
                 const isMe =
                   msg.user_id === currentUserId ||
-                  msg.username === currentUser.name;
+                  (canonicalUserId != null && msg.user_id === canonicalUserId);
                 const isDeleted = !!msg.deleted_at;
                 const canModify = isMe && !isDeleted && !!msg.message_id;
                 const isEditing =

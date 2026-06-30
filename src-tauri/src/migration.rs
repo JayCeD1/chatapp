@@ -209,6 +209,15 @@ pub fn get_migrations() -> Vec<Migration> {
                   CREATE INDEX idx_reactions_message ON reactions(message_id);",
             kind: MigrationKind::Up,
         },
+        // Migration 12: per-(user, room) read marker for unread tracking. NULL = never
+        // read (everything counts as unread). Stored in CURRENT_TIMESTAMP format (via
+        // datetime('now')) so it compares directly with messages.created_at.
+        Migration {
+            version: 12,
+            description: "add_user_rooms_last_read_at",
+            sql: "ALTER TABLE user_rooms ADD COLUMN last_read_at TIMESTAMP;",
+            kind: MigrationKind::Up,
+        },
         // Down for v7: remove default chat rooms created in v7
         Migration {
             version: 7,

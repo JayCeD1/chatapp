@@ -730,6 +730,83 @@ pub async fn get_room_reactions_internal(
     Ok(out)
 }
 
+#[derive(Serialize)]
+pub struct UnreadCount {
+    pub room_id: i64,
+    pub count: i64,
+}
+
+/// Mark a room read for a user: set `last_read_at` to now (CURRENT_TIMESTAMP format, so it
+/// compares directly with `messages.created_at`). Upserts the `user_rooms` row so it works
+/// even before an explicit join.
+pub async fn touch_last_read_internal(
+    pool: &SqlitePool,
+    user_id: i64,
+    room_id: i64,
+) -> Result<(), String> {
+    sqlx::query(
+        "INSERT INTO user_rooms (user_id, room_id, last_read_at, is_active)
+         VALUES ($1, $2, datetime('now'), 1)
+         ON CONFLICT(user_id, room_id)
+            DO UPDATE SET last_read_at = datetime('now'), is_active = 1",
+    )
+    .bind(user_id)
+    .bind(room_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to mark room read: {}", e))?;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn touch_last_read(
+    db: State<'_, SqlitePool>,
+    user_id: i64,
+    room_id: i64,
+) -> Result<(), String> {
+    touch_last_read_internal(&db, user_id, room_id).await
+}
+
+/// Per-room unread counts for a user: chat messages (not system events, not deleted, not
+/// the user's own) newer than the room's `last_read_at`. Only rooms the user belongs to
+/// (has a `user_rooms` row for) and that have at least one unread are returned.
+pub async fn get_unread_counts_internal(
+    pool: &SqlitePool,
+    user_id: i64,
+) -> Result<Vec<UnreadCount>, String> {
+    let rows = sqlx::query(
+        "SELECT m.room_id AS room_id, COUNT(*) AS count
+         FROM messages m
+         JOIN user_rooms ur ON ur.room_id = m.room_id AND ur.user_id = $1
+         WHERE m.user_id != $1
+           AND m.message_type = 'Chat'
+           AND m.deleted_at IS NULL
+           AND (ur.last_read_at IS NULL OR m.created_at > ur.last_read_at)
+         GROUP BY m.room_id
+         HAVING COUNT(*) > 0",
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| format!("Failed to get unread counts: {}", e))?;
+
+    Ok(rows
+        .into_iter()
+        .map(|row| UnreadCount {
+            room_id: row.get::<i64, _>("room_id"),
+            count: row.get::<i64, _>("count"),
+        })
+        .collect())
+}
+
+#[tauri::command]
+pub async fn get_unread_counts(
+    db: State<'_, SqlitePool>,
+    user_id: i64,
+) -> Result<Vec<UnreadCount>, String> {
+    get_unread_counts_internal(&db, user_id).await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,6 +848,70 @@ mod tests {
         save_message_internal(pool, 1, user, text.into(), "Chat".into(), false, mid.into())
             .await
             .expect("save message");
+    }
+
+    // Insert a message with an EXPLICIT created_at + type so unread tests don't depend on
+    // wall-clock / same-second timing.
+    async fn insert_at(pool: &SqlitePool, user: i64, mtype: &str, created_at: &str, mid: &str) {
+        sqlx::query(
+            "INSERT INTO messages (room_id, user_id, message, message_type, is_emoji, message_id, created_at)
+             VALUES (1, $1, 'x', $2, 0, $3, $4)",
+        )
+        .bind(user)
+        .bind(mtype)
+        .bind(mid)
+        .bind(created_at)
+        .execute(pool)
+        .await
+        .expect("insert message");
+    }
+
+    #[tokio::test]
+    async fn unread_counts_respect_last_read_excluding_own_and_system() {
+        let pool = setup().await;
+        // Alice (1) is a member of room 1, last read at a fixed past time.
+        touch_last_read_internal(&pool, 1, 1).await.unwrap();
+        sqlx::raw_sql(
+            "UPDATE user_rooms SET last_read_at = '2026-01-01 00:00:00' WHERE user_id=1 AND room_id=1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        insert_at(&pool, 2, "Chat", "2026-02-01 00:00:00", "b1").await; // unread
+        insert_at(&pool, 2, "Chat", "2026-02-01 00:00:01", "b2").await; // unread
+        insert_at(&pool, 2, "RoomJoin", "2026-02-01 00:00:02", "sys").await; // system, ignored
+        insert_at(&pool, 1, "Chat", "2026-02-01 00:00:03", "own").await; // own, ignored
+        insert_at(&pool, 2, "Chat", "2025-12-01 00:00:00", "old").await; // before read, ignored
+
+        let counts = get_unread_counts_internal(&pool, 1).await.unwrap();
+        assert_eq!(counts.len(), 1);
+        assert_eq!(counts[0].room_id, 1);
+        assert_eq!(counts[0].count, 2);
+
+        // Marking the room read clears it.
+        sqlx::raw_sql(
+            "UPDATE user_rooms SET last_read_at = '2026-03-01 00:00:00' WHERE user_id=1 AND room_id=1",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert!(get_unread_counts_internal(&pool, 1)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn touch_last_read_upserts_and_sets_marker() {
+        let pool = setup().await;
+        touch_last_read_internal(&pool, 1, 1).await.unwrap();
+        let read_at: Option<String> =
+            sqlx::query_scalar("SELECT last_read_at FROM user_rooms WHERE user_id=1 AND room_id=1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert!(read_at.is_some(), "last_read_at should be set after touch");
     }
 
     #[tokio::test]

@@ -31,6 +31,7 @@ const Chat = () => {
       chatRooms={c.chatRooms}
       currentRoom={c.currentRoom}
       currentUser={c.currentUser}
+      unreadByRoom={c.unreadByRoom}
       messages={c.messages}
       loadingMessages={c.loadingMessages}
       typingUsers={c.typingUsers}

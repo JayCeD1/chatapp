@@ -19,6 +19,7 @@ interface WorkspaceProps {
   chatRooms: ChatRoom[];
   currentRoom: ChatRoom | null;
   currentUser: User;
+  unreadByRoom: Record<number, number>;
   messages: Message[];
   loadingMessages: boolean;
   typingUsers: string[];
@@ -54,6 +55,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   chatRooms,
   currentRoom,
   currentUser,
+  unreadByRoom,
   messages,
   loadingMessages,
   typingUsers,
@@ -104,6 +106,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         chatRooms={chatRooms}
         currentRoom={currentRoom}
         currentUser={currentUser}
+        unreadByRoom={unreadByRoom}
         connectionStatus={connectionStatus}
         onSelectRoom={onSelectRoom}
         onCreateRoom={onCreateRoom}

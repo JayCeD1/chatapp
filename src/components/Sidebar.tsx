@@ -12,6 +12,7 @@ interface SidebarProps {
   chatRooms: ChatRoom[];
   currentRoom: ChatRoom | null;
   currentUser: User;
+  unreadByRoom: Record<number, number>;
   connectionStatus: ConnectionStatus;
   onSelectRoom: (room: ChatRoom) => void;
   onCreateRoom: (
@@ -38,6 +39,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   chatRooms,
   currentRoom,
   currentUser,
+  unreadByRoom,
   connectionStatus,
   onSelectRoom,
   onCreateRoom,
@@ -110,6 +112,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <ul className="px-2 space-y-0.5">
               {group.rooms.map((room) => {
                 const active = currentRoom?.id === room.id;
+                // The active room is always read; don't badge what you're looking at.
+                const unread = active ? 0 : (unreadByRoom[room.id] ?? 0);
                 return (
                   <li key={room.id}>
                     <button
@@ -118,7 +122,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       className={`group w-full flex items-center gap-2 px-2.5 py-1.5 rounded-md text-sm transition-colors ${
                         active
                           ? "bg-[var(--surface-3)] text-[var(--text)]"
-                          : "text-[var(--text-dim)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
+                          : unread > 0
+                            ? "text-[var(--text)] hover:bg-[var(--surface-2)]"
+                            : "text-[var(--text-dim)] hover:bg-[var(--surface-2)] hover:text-[var(--text)]"
                       }`}
                     >
                       <Hash
@@ -128,14 +134,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
                             : "text-[var(--text-faint)]"
                         }`}
                       />
-                      <span className="truncate flex-1 text-left">
+                      <span
+                        className={`truncate flex-1 text-left ${
+                          unread > 0 ? "font-semibold" : ""
+                        }`}
+                      >
                         {room.name}
                       </span>
-                      {(room.user_count ?? 0) > 0 && (
-                        <span className="flex items-center gap-1 text-[11px] text-[var(--text-faint)]">
-                          <Users className="w-3 h-3" />
-                          {room.user_count}
+                      {unread > 0 ? (
+                        <span
+                          className="min-w-[18px] h-[18px] px-1.5 flex items-center justify-center rounded-full bg-[var(--accent)] text-white text-[10px] font-bold shrink-0"
+                          aria-label={`${unread} unread message${unread === 1 ? "" : "s"}`}
+                        >
+                          {unread > 99 ? "99+" : unread}
                         </span>
+                      ) : (
+                        (room.user_count ?? 0) > 0 && (
+                          <span className="flex items-center gap-1 text-[11px] text-[var(--text-faint)]">
+                            <Users className="w-3 h-3" />
+                            {room.user_count}
+                          </span>
+                        )
                       )}
                     </button>
                   </li>

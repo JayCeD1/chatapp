@@ -185,6 +185,14 @@ pub fn get_migrations() -> Vec<Migration> {
                   CREATE INDEX IF NOT EXISTS idx_user_rooms_room_active ON user_rooms(room_id, is_active);",
             kind: MigrationKind::Up,
         },
+        // Migration 10: message edit/delete metadata.
+        Migration {
+            version: 10,
+            description: "add_message_edit_delete_columns",
+            sql: "ALTER TABLE messages ADD COLUMN edited_at TEXT;
+                  ALTER TABLE messages ADD COLUMN deleted_at TEXT;",
+            kind: MigrationKind::Up,
+        },
         // Down for v7: remove default chat rooms created in v7
         Migration {
             version: 7,

@@ -26,6 +26,8 @@ interface WorkspaceProps {
     isPrivate: boolean,
   ) => Promise<void>;
   onSendMessage: (text: string, isEmoji?: boolean) => void;
+  onEditMessage: (targetId: string, newText: string) => Promise<void>;
+  onDeleteMessage: (targetId: string) => Promise<void>;
   onLoadOlder: () => Promise<void>;
   onLeaveRoom: () => void;
   onLogout: () => void;
@@ -48,6 +50,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   onSelectRoom,
   onCreateRoom,
   onSendMessage,
+  onEditMessage,
+  onDeleteMessage,
   onLoadOlder,
   onLeaveRoom,
   onLogout,
@@ -102,7 +106,10 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             hasMore={hasMore}
             onlineCount={onlineCount}
             memberCount={members.length}
+            currentUserId={currentUser.id}
             onSendMessage={onSendMessage}
+            onEditMessage={onEditMessage}
+            onDeleteMessage={onDeleteMessage}
             onLoadOlder={onLoadOlder}
             onLeave={onLeaveRoom}
           />

@@ -44,6 +44,8 @@ const normalizeMessage = (m: any, fallbackRoomId?: number): Message => {
     message_type: m?.message_type,
     is_emoji: m?.is_emoji ?? false,
     created_at: createdAt,
+    edited_at: m?.edited_at ?? null,
+    deleted_at: m?.deleted_at ?? null,
   };
 };
 
@@ -105,6 +107,30 @@ export const useChatConnection = () => {
       } catch {
         // ignore malformed roster
       }
+      return;
+    }
+
+    // Edit/Delete carry the TARGET message id in message_id; mutate the existing row.
+    if (nm.message_type === "Edit" || nm.message_type === "Delete") {
+      const deleted = nm.message_type === "Delete";
+      setMessagesByRoom((prev) => {
+        const list = prev[nm.room];
+        if (!list) return prev;
+        return {
+          ...prev,
+          [nm.room]: list.map((m) =>
+            m.message_id && m.message_id === nm.message_id
+              ? deleted
+                ? { ...m, message: "", deleted_at: new Date().toISOString() }
+                : {
+                    ...m,
+                    message: nm.message,
+                    edited_at: new Date().toISOString(),
+                  }
+              : m,
+          ),
+        };
+      });
       return;
     }
 
@@ -429,6 +455,39 @@ export const useChatConnection = () => {
     }
   };
 
+  const editMessage = async (targetId: string, newText: string) => {
+    if (!currentUser || !currentRoom) return;
+    const cmd =
+      mode === "server" ? "server_edit_message" : "client_edit_message";
+    try {
+      await invoke(cmd, {
+        userId: currentUser.id,
+        targetId,
+        newText,
+        room: currentRoom.name,
+        roomId: currentRoom.id,
+      });
+    } catch (err) {
+      setError(`Couldn't edit message: ${err}`);
+    }
+  };
+
+  const deleteMessage = async (targetId: string) => {
+    if (!currentUser || !currentRoom) return;
+    const cmd =
+      mode === "server" ? "server_delete_message" : "client_delete_message";
+    try {
+      await invoke(cmd, {
+        userId: currentUser.id,
+        targetId,
+        room: currentRoom.name,
+        roomId: currentRoom.id,
+      });
+    } catch (err) {
+      setError(`Couldn't delete message: ${err}`);
+    }
+  };
+
   const logout = async () => {
     if (currentUser) {
       invoke("update_user_online_status", {
@@ -491,6 +550,8 @@ export const useChatConnection = () => {
     createRoom,
     leaveRoom,
     sendMessage,
+    editMessage,
+    deleteMessage,
     loadOlderMessages,
     logout,
     dismissError,

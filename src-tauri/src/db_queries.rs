@@ -43,6 +43,8 @@ pub struct Message {
     pub message_type: String,
     pub is_emoji: bool,
     pub created_at: String,
+    pub edited_at: Option<String>,
+    pub deleted_at: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -488,7 +490,7 @@ pub async fn get_room_messages(
     // immediately older than `id` (for "load older" pagination).
     let result = sqlx::query(
         "SELECT m.id, m.message_id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
-                COALESCE(u.name, 'Unknown') as username
+                m.edited_at, m.deleted_at, COALESCE(u.name, 'Unknown') as username
          FROM messages m
          LEFT JOIN users u ON m.user_id = u.id
          WHERE m.room_id = $1 AND ($2 IS NULL OR m.id < $2)
@@ -514,10 +516,53 @@ pub async fn get_room_messages(
             message_type: row.get::<String, _>("message_type"),
             is_emoji: row.get::<bool, _>("is_emoji"),
             created_at: row.get::<String, _>("created_at"),
+            edited_at: row.get::<Option<String>, _>("edited_at"),
+            deleted_at: row.get::<Option<String>, _>("deleted_at"),
         });
     }
 
     // Reverse to get chronological order
     messages.reverse();
     Ok(messages)
+}
+
+/// Edit a message's text, but only if `user_id` is the author and it isn't deleted.
+/// Returns the number of rows affected (0 = not found / not authorized).
+pub async fn edit_message_db(
+    pool: &SqlitePool,
+    message_id: &str,
+    new_text: &str,
+    user_id: i64,
+) -> Result<u64, String> {
+    let res = sqlx::query(
+        "UPDATE messages
+            SET message = $1, edited_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE message_id = $2 AND user_id = $3 AND deleted_at IS NULL",
+    )
+    .bind(new_text)
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to edit message: {}", e))?;
+    Ok(res.rows_affected())
+}
+
+/// Soft-delete a message (clears text), only if `user_id` is the author.
+pub async fn delete_message_db(
+    pool: &SqlitePool,
+    message_id: &str,
+    user_id: i64,
+) -> Result<u64, String> {
+    let res = sqlx::query(
+        "UPDATE messages
+            SET message = '', deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ','now')
+          WHERE message_id = $1 AND user_id = $2 AND deleted_at IS NULL",
+    )
+    .bind(message_id)
+    .bind(user_id)
+    .execute(pool)
+    .await
+    .map_err(|e| format!("Failed to delete message: {}", e))?;
+    Ok(res.rows_affected())
 }

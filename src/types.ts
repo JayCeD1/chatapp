@@ -32,6 +32,8 @@ export interface Message {
   message_type?: string;
   is_emoji?: boolean;
   created_at: string; // normalized ISO-8601 UTC string
+  edited_at?: string | null;
+  deleted_at?: string | null;
 }
 
 export type ViewState = "login" | "workspace";

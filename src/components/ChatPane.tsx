@@ -1,5 +1,16 @@
 import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
-import { Send, Smile, Hash, LogOut, ChevronDown, Loader2 } from "lucide-react";
+import {
+  Send,
+  Smile,
+  Hash,
+  LogOut,
+  ChevronDown,
+  Loader2,
+  Pencil,
+  Trash2,
+  Check,
+  X,
+} from "lucide-react";
 import { ChatRoom, Message, User } from "../types";
 import {
   initials,
@@ -14,12 +25,15 @@ import {
 interface ChatPaneProps {
   room: ChatRoom;
   currentUser: User;
+  currentUserId: number;
   messages: Message[];
   loading: boolean;
   hasMore: boolean;
   onlineCount: number;
   memberCount: number;
   onSendMessage: (text: string, isEmoji?: boolean) => void;
+  onEditMessage: (targetId: string, newText: string) => Promise<void>;
+  onDeleteMessage: (targetId: string) => Promise<void>;
   onLoadOlder: () => Promise<void>;
   onLeave: () => void;
 }
@@ -42,18 +56,42 @@ const EMOJIS = [
 export const ChatPane: React.FC<ChatPaneProps> = ({
   room,
   currentUser,
+  currentUserId,
   messages,
   loading,
   hasMore,
   onlineCount,
   memberCount,
   onSendMessage,
+  onEditMessage,
+  onDeleteMessage,
   onLoadOlder,
   onLeave,
 }) => {
   const [inputText, setInputText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
   const [loadingOlder, setLoadingOlder] = useState(false);
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [editText, setEditText] = useState("");
+
+  const startEdit = (msg: Message) => {
+    if (!msg.message_id) return;
+    setEditingId(msg.message_id);
+    setEditText(msg.message);
+  };
+  const cancelEdit = () => {
+    setEditingId(null);
+    setEditText("");
+  };
+  const saveEdit = async (targetId: string) => {
+    const text = editText.trim();
+    cancelEdit();
+    if (text) await onEditMessage(targetId, text);
+  };
+  const confirmDelete = (msg: Message) => {
+    if (!msg.message_id) return;
+    if (window.confirm("Delete this message?")) onDeleteMessage(msg.message_id);
+  };
   const endRef = useRef<HTMLDivElement>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const [atBottom, setAtBottom] = useState(true);
@@ -207,13 +245,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                 }
 
                 const grouped = !showDate && shouldGroup(prev, msg);
-                const isMe = msg.username === currentUser.name;
+                const isMe =
+                  msg.user_id === currentUserId ||
+                  msg.username === currentUser.name;
+                const isDeleted = !!msg.deleted_at;
+                const canModify = isMe && !isDeleted && !!msg.message_id;
+                const isEditing =
+                  editingId != null && editingId === msg.message_id;
 
                 return (
                   <React.Fragment key={msg.message_id ?? msg.id ?? idx}>
                     {showDate && <DateSeparator iso={msg.created_at} />}
                     <div
-                      className={`group flex gap-3 px-2 ${
+                      className={`group relative flex gap-3 px-2 ${
                         grouped ? "mt-0.5" : "mt-3"
                       } py-0.5 rounded-md hover:bg-[var(--surface)]/60`}
                     >
@@ -252,14 +296,78 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                             </span>
                           </div>
                         )}
-                        <div
-                          className={`text-[var(--text-dim)] break-words leading-relaxed ${
-                            msg.is_emoji ? "text-3xl" : "text-sm"
-                          }`}
-                        >
-                          {msg.message}
-                        </div>
+
+                        {isEditing ? (
+                          <div className="flex items-center gap-1.5 mt-0.5">
+                            <input
+                              value={editText}
+                              onChange={(e) => setEditText(e.target.value)}
+                              onKeyDown={(e) => {
+                                if (e.key === "Enter") {
+                                  e.preventDefault();
+                                  saveEdit(msg.message_id!);
+                                } else if (e.key === "Escape") {
+                                  cancelEdit();
+                                }
+                              }}
+                              autoFocus
+                              className="flex-1 bg-[var(--surface-2)] border border-[var(--border)] rounded-lg px-3 py-1.5 text-sm text-[var(--text)] focus:outline-none focus:border-[var(--accent)]"
+                            />
+                            <button
+                              onClick={() => saveEdit(msg.message_id!)}
+                              aria-label="Save edit"
+                              className="p-1.5 rounded-md text-[var(--online)] hover:bg-[var(--surface-2)]"
+                            >
+                              <Check className="w-4 h-4" />
+                            </button>
+                            <button
+                              onClick={cancelEdit}
+                              aria-label="Cancel edit"
+                              className="p-1.5 rounded-md text-[var(--text-faint)] hover:bg-[var(--surface-2)]"
+                            >
+                              <X className="w-4 h-4" />
+                            </button>
+                          </div>
+                        ) : isDeleted ? (
+                          <div className="text-sm italic text-[var(--text-faint)]">
+                            This message was deleted
+                          </div>
+                        ) : (
+                          <div
+                            className={`text-[var(--text-dim)] break-words leading-relaxed ${
+                              msg.is_emoji ? "text-3xl" : "text-sm"
+                            }`}
+                          >
+                            {msg.message}
+                            {msg.edited_at && (
+                              <span className="text-[11px] text-[var(--text-faint)] ml-1">
+                                (edited)
+                              </span>
+                            )}
+                          </div>
+                        )}
                       </div>
+
+                      {canModify && !isEditing && (
+                        <div className="absolute top-0 right-2 hidden group-hover:flex items-center gap-0.5 bg-[var(--surface)] border border-[var(--border)] rounded-md shadow-sm">
+                          <button
+                            onClick={() => startEdit(msg)}
+                            title="Edit"
+                            aria-label="Edit message"
+                            className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)]"
+                          >
+                            <Pencil className="w-3.5 h-3.5" />
+                          </button>
+                          <button
+                            onClick={() => confirmDelete(msg)}
+                            title="Delete"
+                            aria-label="Delete message"
+                            className="p-1.5 rounded-md text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--surface-2)]"
+                          >
+                            <Trash2 className="w-3.5 h-3.5" />
+                          </button>
+                        </div>
+                      )}
                     </div>
                   </React.Fragment>
                 );

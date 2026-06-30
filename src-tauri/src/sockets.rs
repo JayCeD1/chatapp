@@ -1,4 +1,4 @@
-use crate::db_queries::save_message_internal;
+use crate::db_queries::{delete_message_db, edit_message_db, save_message_internal};
 use crate::secure;
 use serde::{Deserialize, Serialize};
 use snow::TransportState;
@@ -172,6 +172,8 @@ pub enum MessageType {
     RoomLeave,
     UserList,
     ServerAck,
+    Edit,
+    Delete,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -873,6 +875,33 @@ async fn handle_server_message(
                 .await;
             broadcast_user_list(&app, &state, &message.room).await;
         }
+        // Edit/Delete events use `message_id` as the TARGET message id. The DB update
+        // is authorship-checked (user_id), so an unauthorized request is a no-op.
+        MessageType::Edit => {
+            if let Ok(rows) = edit_message_db(
+                &pool,
+                &message.message_id,
+                &message.message,
+                message.user_id as i64,
+            )
+            .await
+            {
+                if rows > 0 {
+                    distribute_message_to_all(&app, &state, &message.room, &message, None).await;
+                }
+            }
+        }
+        MessageType::Delete => {
+            if let Ok(rows) =
+                delete_message_db(&pool, &message.message_id, message.user_id as i64).await
+            {
+                if rows > 0 {
+                    let mut del = message.clone();
+                    del.message = String::new();
+                    distribute_message_to_all(&app, &state, &message.room, &del, None).await;
+                }
+            }
+        }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
         _ => {}
     }
@@ -1330,6 +1359,143 @@ pub async fn server_leave_room(
 
     distribute_message_to_all(&app, state.inner(), &room, &leave_msg, Some(user_id)).await;
     broadcast_user_list(&app, state.inner(), &room).await;
+    Ok(())
+}
+
+// ---- Message edit / delete ----
+// Edit/Delete events carry the TARGET message id in `message_id`. Clients send the
+// event to the host (which applies + broadcasts via handle_server_message); the host
+// participant applies + broadcasts directly.
+
+fn edit_event(
+    username: String,
+    user_id: u64,
+    target_id: String,
+    text: String,
+    room: String,
+    room_id: u64,
+    kind: MessageType,
+) -> Message {
+    Message {
+        message_type: kind,
+        username,
+        user_id,
+        message: text,
+        message_id: target_id,
+        room,
+        room_id,
+        created_at: now_secs(),
+        is_emoji: false,
+    }
+}
+
+#[tauri::command]
+pub async fn client_edit_message(
+    state: State<'_, Arc<AppState>>,
+    user_id: u64,
+    target_id: String,
+    new_text: String,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    if new_text.trim().is_empty() {
+        return Err("Message cannot be empty".to_string());
+    }
+    let username = state.username.read().await.clone();
+    let msg = edit_event(
+        username,
+        user_id,
+        target_id,
+        new_text,
+        room,
+        room_id,
+        MessageType::Edit,
+    );
+    send_secure_client(state.inner(), &msg)
+        .await
+        .map_err(|e| format!("Failed to edit message: {}", e))
+}
+
+#[tauri::command]
+pub async fn server_edit_message(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    user_id: u64,
+    target_id: String,
+    new_text: String,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    if new_text.trim().is_empty() {
+        return Err("Message cannot be empty".to_string());
+    }
+    let rows = edit_message_db(db.inner(), &target_id, &new_text, user_id as i64).await?;
+    if rows == 0 {
+        return Err("You can only edit your own messages".to_string());
+    }
+    let username = state.username.read().await.clone();
+    let msg = edit_event(
+        username,
+        user_id,
+        target_id,
+        new_text,
+        room.clone(),
+        room_id,
+        MessageType::Edit,
+    );
+    distribute_message_to_all(&app, state.inner(), &room, &msg, None).await;
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn client_delete_message(
+    state: State<'_, Arc<AppState>>,
+    user_id: u64,
+    target_id: String,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    let username = state.username.read().await.clone();
+    let msg = edit_event(
+        username,
+        user_id,
+        target_id,
+        String::new(),
+        room,
+        room_id,
+        MessageType::Delete,
+    );
+    send_secure_client(state.inner(), &msg)
+        .await
+        .map_err(|e| format!("Failed to delete message: {}", e))
+}
+
+#[tauri::command]
+pub async fn server_delete_message(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    user_id: u64,
+    target_id: String,
+    room: String,
+    room_id: u64,
+) -> Result<(), String> {
+    let rows = delete_message_db(db.inner(), &target_id, user_id as i64).await?;
+    if rows == 0 {
+        return Err("You can only delete your own messages".to_string());
+    }
+    let username = state.username.read().await.clone();
+    let msg = edit_event(
+        username,
+        user_id,
+        target_id,
+        String::new(),
+        room.clone(),
+        room_id,
+        MessageType::Delete,
+    );
+    distribute_message_to_all(&app, state.inner(), &room, &msg, None).await;
     Ok(())
 }
 

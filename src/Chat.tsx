@@ -40,6 +40,8 @@ const Chat = () => {
       onSelectRoom={c.joinRoom}
       onCreateRoom={c.createRoom}
       onSendMessage={c.sendMessage}
+      onEditMessage={c.editMessage}
+      onDeleteMessage={c.deleteMessage}
       onLoadOlder={c.loadOlderMessages}
       onLeaveRoom={c.leaveRoom}
       onLogout={c.logout}

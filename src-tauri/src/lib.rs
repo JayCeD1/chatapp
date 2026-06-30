@@ -4,10 +4,11 @@ use crate::db_queries::{
     update_user_online_status, upsert_user,
 };
 use crate::sockets::{
-    client_connect_to_server, client_disconnect, client_join_room, client_leave_room,
-    discover_servers, get_server_info, send_as_client, send_as_server_participant,
-    server_leave_room, server_listen_as_participant, server_participant_disconnect,
-    server_participant_join_room, AppState,
+    client_connect_to_server, client_delete_message, client_disconnect, client_edit_message,
+    client_join_room, client_leave_room, discover_servers, get_server_info, send_as_client,
+    send_as_server_participant, server_delete_message, server_edit_message, server_leave_room,
+    server_listen_as_participant, server_participant_disconnect, server_participant_join_room,
+    AppState,
 };
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::SqlitePool;
@@ -106,6 +107,11 @@ pub fn run() {
             client_join_room,
             client_leave_room,
             server_leave_room,
+            // Message edit/delete
+            client_edit_message,
+            server_edit_message,
+            client_delete_message,
+            server_delete_message,
             // Logout/teardown
             client_disconnect,
             server_participant_disconnect

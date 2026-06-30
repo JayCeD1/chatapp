@@ -3,21 +3,20 @@ use crate::db_queries::{
     get_user_by_id, get_users, join_room, leave_room, save_message, update_user_online_status,
     upsert_user,
 };
-use crate::sockets::{client_connect_to_server, client_disconnect, client_join_room, discover_servers, get_server_info, send_as_client, send_as_server_participant, server_listen_as_participant, server_participant_disconnect, server_participant_join_room, AppState};
+use crate::sockets::{
+    client_connect_to_server, client_disconnect, client_join_room, discover_servers,
+    get_server_info, send_as_client, send_as_server_participant, server_listen_as_participant,
+    server_participant_disconnect, server_participant_join_room, AppState,
+};
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 use sqlx::SqlitePool;
-use std::env;
 use std::sync::Arc;
+use std::time::Duration;
 use tauri::Manager;
 
 mod db_queries;
 mod migration;
 mod sockets;
-
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -41,31 +40,38 @@ pub fn run() {
         )
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // This works in the setup hook where we have access to the app
-            let app_data_dir = app
+            // Use the SAME directory tauri-plugin-sql resolves "sqlite:nutler.db" against
+            // (app_config_dir). app_data_dir differs from app_config_dir on Linux, which
+            // would point migrations and queries at two different files.
+            let app_config_dir = app
                 .path()
-                .app_data_dir()
-                .expect("Failed to get app data directory");
+                .app_config_dir()
+                .expect("Failed to get app config directory");
 
-            std::fs::create_dir_all(&app_data_dir).expect("Failed to create app data directory");
+            std::fs::create_dir_all(&app_config_dir)
+                .expect("Failed to create app config directory");
 
-            let db_path = app_data_dir.join("nutler.db");
-            let database_url = format!("sqlite:{}", db_path.to_string_lossy());
+            let db_path = app_config_dir.join("nutler.db");
 
-            // Connect to database in async runtime
-            let handle = app.handle().clone();
-            tauri::async_runtime::spawn(async move {
-                let pool = SqlitePool::connect(&database_url)
-                    .await
+            // Build the query pool synchronously so it is managed BEFORE any command can
+            // run (avoids a "state not managed" race), with FK enforcement, WAL journaling,
+            // and a busy timeout so concurrent writers don't hit "database is locked".
+            let options = SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(true)
+                .foreign_keys(true)
+                .journal_mode(SqliteJournalMode::Wal)
+                .busy_timeout(Duration::from_secs(5));
+
+            let pool =
+                tauri::async_runtime::block_on(async { SqlitePool::connect_with(options).await })
                     .expect("Failed to connect to database");
 
-                handle.manage(pool); // <- Add this: makes pool available to commands
-            });
+            app.manage(pool); // makes the pool available to commands
 
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
-            greet,
             // User management
             upsert_user,
             create_user,
@@ -94,7 +100,6 @@ pub fn run() {
             // Logout/teardown
             client_disconnect,
             server_participant_disconnect
-
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application Jesse => ");

@@ -110,6 +110,30 @@ pub fn get_migrations() -> Vec<Migration> {
                           (SELECT id FROM departments WHERE name = 'General'), FALSE);",
             kind: MigrationKind::Up,
         },
+        // Migration 8: message_id for reliable dedup/idempotency, perf indexes,
+        // and a UNIQUE name so name-keyed broadcast routing can't collapse two rooms.
+        Migration {
+            version: 8,
+            description: "add_message_id_and_indexes",
+            sql: "ALTER TABLE messages ADD COLUMN message_id TEXT;
+                  CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_message_id ON messages(message_id);
+                  CREATE INDEX IF NOT EXISTS idx_messages_room_created ON messages(room_id, created_at, id);
+                  CREATE INDEX IF NOT EXISTS idx_messages_user ON messages(user_id);
+                  CREATE INDEX IF NOT EXISTS idx_user_rooms_room_active ON user_rooms(room_id, is_active);
+                  CREATE UNIQUE INDEX IF NOT EXISTS idx_chat_rooms_name ON chat_rooms(name);",
+            kind: MigrationKind::Up,
+        },
+        // Down for v8
+        Migration {
+            version: 8,
+            description: "drop_message_id_and_indexes",
+            sql: "DROP INDEX IF EXISTS idx_chat_rooms_name;
+                  DROP INDEX IF EXISTS idx_user_rooms_room_active;
+                  DROP INDEX IF EXISTS idx_messages_user;
+                  DROP INDEX IF EXISTS idx_messages_room_created;
+                  DROP INDEX IF EXISTS idx_messages_message_id;",
+            kind: MigrationKind::Down,
+        },
         // Down for v7: remove default chat rooms created in v7
         Migration {
             version: 7,

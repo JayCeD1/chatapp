@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use tauri::State;
+use uuid::Uuid;
 
 #[derive(Serialize, Deserialize)]
 pub struct User {
@@ -34,6 +35,7 @@ pub struct ChatRoom {
 #[derive(Serialize, Deserialize)]
 pub struct Message {
     pub id: Option<i64>,
+    pub message_id: Option<String>,
     pub room_id: i64,
     pub user_id: i64,
     pub username: String,
@@ -358,23 +360,18 @@ pub async fn save_message(
     message_type: String,
     is_emoji: bool,
 ) -> Result<InsertResult, String> {
-    let result = sqlx::query(
-        "INSERT INTO messages (room_id, user_id, message, message_type, is_emoji) 
-         VALUES ($1, $2, $3, $4, $5)",
+    // Generate a stable id so callers of this command also get idempotent inserts.
+    let message_id = Uuid::new_v4().to_string();
+    save_message_internal(
+        &db,
+        room_id,
+        user_id,
+        message,
+        message_type,
+        is_emoji,
+        message_id,
     )
-    .bind(&room_id)
-    .bind(&user_id)
-    .bind(&message)
-    .bind(&message_type)
-    .bind(&is_emoji)
-    .execute(&*db)
     .await
-    .map_err(|e| format!("Failed to save message: {}", e))?;
-
-    Ok(InsertResult {
-        rows_affected: result.rows_affected(),
-        last_insert_id: result.last_insert_rowid(),
-    })
 }
 
 pub async fn save_message_internal(
@@ -384,16 +381,20 @@ pub async fn save_message_internal(
     message: String,
     message_type: String,
     is_emoji: bool,
+    message_id: String,
 ) -> Result<InsertResult, String> {
+    // ON CONFLICT(message_id) DO NOTHING makes retried/echoed saves idempotent.
     let result = sqlx::query(
-        "INSERT INTO messages (room_id, user_id, message, message_type, is_emoji)
-         VALUES ($1, $2, $3, $4, $5)",
+        "INSERT INTO messages (room_id, user_id, message, message_type, is_emoji, message_id)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT(message_id) DO NOTHING",
     )
     .bind(&room_id)
     .bind(&user_id)
     .bind(&message)
     .bind(&message_type)
     .bind(&is_emoji)
+    .bind(&message_id)
     .execute(pool)
     .await
     .map_err(|e| format!("Failed to save message: {}", e))?;
@@ -413,12 +414,12 @@ pub async fn get_room_messages(
     let limit = limit.unwrap_or(50);
 
     let result = sqlx::query(
-        "SELECT m.id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
+        "SELECT m.id, m.message_id, m.room_id, m.user_id, m.message, m.message_type, m.is_emoji, m.created_at,
                 u.name as username
          FROM messages m
          JOIN users u ON m.user_id = u.id
          WHERE m.room_id = $1
-         ORDER BY m.created_at DESC
+         ORDER BY m.created_at DESC, m.id DESC
          LIMIT $2",
     )
     .bind(&room_id)
@@ -431,6 +432,7 @@ pub async fn get_room_messages(
     for row in result {
         messages.push(Message {
             id: row.get::<Option<i64>, _>("id"),
+            message_id: row.get::<Option<String>, _>("message_id"),
             room_id: row.get::<i64, _>("room_id"),
             user_id: row.get::<i64, _>("user_id"),
             username: row.get::<String, _>("username"),

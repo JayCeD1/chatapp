@@ -17,9 +17,12 @@
   "app": {
     "windows": [
       {
-        "title": "nutler",
-        "width": 800,
-        "height": 600
+        "title": "Nutler",
+        "width": 1100,
+        "height": 720,
+        "minWidth": 720,
+        "minHeight": 480,
+        "resizable": true
       }
     ],
     "security": {

@@ -20,6 +20,8 @@ export interface ChatRoom {
 }
 
 export interface Message {
+  id?: number; // DB row id (history)
+  message_id?: string; // stable UUID from the backend, used for dedup + React keys
   room_id: number;
   room: string;
   user_id: number;
@@ -27,7 +29,7 @@ export interface Message {
   message: string;
   message_type?: string;
   is_emoji?: boolean;
-  created_at: string; // ISO string
+  created_at: string; // normalized ISO-8601 UTC string
 }
 
 export type ViewState = "login" | "rooms" | "chat";

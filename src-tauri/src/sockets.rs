@@ -14,6 +14,39 @@ use tokio::task::JoinSet;
 use tokio::time::timeout;
 use uuid::Uuid;
 
+/// Maximum size of a single length-prefixed frame payload (10 MiB).
+/// Shared by both the server and client read paths so the cap can never drift.
+const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
+
+/// Read one length-prefixed frame: a 4-byte big-endian length header followed by
+/// that many payload bytes. Returns `Ok(None)` for a zero-length keep-alive frame.
+/// Rejects oversized frames so a malicious peer cannot trigger a huge allocation.
+async fn read_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
+where
+    R: AsyncReadExt + Unpin,
+{
+    let mut len_bytes = [0u8; 4];
+    reader.read_exact(&mut len_bytes).await?;
+    let msg_len = u32::from_be_bytes(len_bytes) as usize;
+
+    if msg_len == 0 {
+        return Ok(None);
+    }
+    if msg_len > MAX_FRAME_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!(
+                "Frame too large: {} bytes (max {})",
+                msg_len, MAX_FRAME_BYTES
+            ),
+        ));
+    }
+
+    let mut buf = vec![0u8; msg_len];
+    reader.read_exact(&mut buf).await?;
+    Ok(Some(buf))
+}
+
 //Better indexing and room management
 #[derive(Debug, Clone)]
 pub struct ClientConnection {
@@ -163,7 +196,8 @@ pub async fn server_listen_as_participant(
     let listener = tokio::net::TcpListener::bind(&bind_addr)
         .await
         .map_err(|e| format!("Failed to bind to {}: {}", bind_addr, e))?;
-    let server_addr = listener.local_addr()
+    let server_addr = listener
+        .local_addr()
         .map_err(|e| format!("Failed to get server address: {}", e))?;
 
     println!("🟢 Server (as participant) listening on: {}", server_addr);
@@ -208,6 +242,7 @@ pub async fn server_listen_as_participant(
             msg_clone.message,
             "Connect".to_string(),
             false,
+            msg_clone.message_id,
         )
         .await
         {
@@ -270,26 +305,14 @@ async fn handle_client_connection(
     let (mut reader, writer) = stream.into_split();
     let writer_arc = Arc::new(tokio::sync::Mutex::new(writer));
     loop {
-        // Step 1: read a 4-byte header (buffer)
-        let mut buffer = [0u8; 4];
-        match reader.read_exact(&mut buffer).await {
-            Ok(_) => {
-                let msg_len = u32::from_be_bytes(buffer) as usize;
-
-                // Recoverable: empty message → ignore and wait for next
-                if msg_len == 0 {
-                    println!("Ignoring empty message");
-                    continue;
-                }
-
-                if msg_len > 10_000_000 {
-                    return Err(format!("Message too large: {} bytes", msg_len).into());
-                }
-
-                // Step 2: read the message payload
-                let mut message_buffer = vec![0u8; msg_len];
-                reader.read_exact(&mut message_buffer).await?;
-
+        // Read one framed message (header + payload), capped at MAX_FRAME_BYTES.
+        match read_frame(&mut reader).await {
+            // Recoverable: empty keep-alive frame → ignore and wait for next
+            Ok(None) => {
+                println!("Ignoring empty message");
+                continue;
+            }
+            Ok(Some(message_buffer)) => {
                 let message_str = std::str::from_utf8(&message_buffer)?;
                 let message: Message = serde_json::from_str(message_str)?;
 
@@ -390,6 +413,7 @@ async fn clean_client(
         disconnect_msg.message.clone(),
         "Disconnect".to_string(),
         false,
+        disconnect_msg.message_id.clone(),
     )
     .await?;
 
@@ -489,6 +513,7 @@ async fn handle_server_message(
                     msg_clone.message,
                     "Connect".to_string(),
                     false,
+                    msg_clone.message_id,
                 )
                 .await
                 {
@@ -510,6 +535,7 @@ async fn handle_server_message(
                     msg_clone.message,
                     "Chat".to_string(),
                     false,
+                    msg_clone.message_id,
                 )
                 .await
                 {
@@ -557,6 +583,7 @@ async fn handle_server_message(
                     msg_clone.message,
                     "RoomJoin".to_string(),
                     false,
+                    msg_clone.message_id,
                 )
                 .await
                 {
@@ -610,6 +637,7 @@ pub async fn send_as_server_participant(
             msg_clone.message,
             "Chat".to_string(),
             false,
+            msg_clone.message_id,
         )
         .await
         {
@@ -738,18 +766,11 @@ fn start_client_listener(app: tauri::AppHandle, mut reader: tokio::net::tcp::Own
         println!("🎧 Client listener started");
 
         loop {
-            let mut len_bytes = [0u8; 4];
-            if let Err(e) = reader.read_exact(&mut len_bytes).await {
-                println!("🔴 Client connection lost: {}", e);
-                if let Err(emit_err) = app.emit("connection_lost", ()) {
-                    eprintln!("Failed to emit connection lost: {}", emit_err);
-                }
-                break;
-            }
-            let msg_len = u32::from_be_bytes(len_bytes) as usize;
-            let mut message_buffer = vec![0u8; msg_len];
-            match reader.read_exact(&mut message_buffer).await {
-                Ok(_n) => {
+            // Same capped framing as the server path (read_frame rejects oversized frames),
+            // so a malicious or buggy host cannot trigger a huge client-side allocation.
+            match read_frame(&mut reader).await {
+                Ok(None) => continue, // empty keep-alive frame
+                Ok(Some(message_buffer)) => {
                     if let Ok(message_str) = std::str::from_utf8(&message_buffer) {
                         println!("🎧 Client received: {}", message_str);
                         if let Err(e) = app.emit("message", message_str) {
@@ -758,7 +779,10 @@ fn start_client_listener(app: tauri::AppHandle, mut reader: tokio::net::tcp::Own
                     }
                 }
                 Err(e) => {
-                    println!("🔴 Client read error: {}", e);
+                    println!("🔴 Client connection lost: {}", e);
+                    if let Err(emit_err) = app.emit("connection_lost", ()) {
+                        eprintln!("Failed to emit connection lost: {}", emit_err);
+                    }
                     break;
                 }
             }
@@ -829,6 +853,7 @@ pub async fn server_participant_join_room(
             msg_clone.message,
             "RoomJoin".to_string(),
             false,
+            msg_clone.message_id,
         )
         .await
         {
@@ -919,19 +944,21 @@ async fn send_message_with_length(
 }
 
 #[tauri::command]
-pub async fn client_disconnect(app: tauri::AppHandle, state: State<'_, Arc<AppState>>) -> Result<(), String>{
-
+pub async fn client_disconnect(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+) -> Result<(), String> {
     //Read current identity from state
-    let user_id_opt = {*state.user_id.read().await};
-    let username = {state.username.read().await.clone()};
-    let room = {state.current_room.read().await.clone()};
-    let room_id_opt = {*state.current_room_id.read().await};
+    let user_id_opt = { *state.user_id.read().await };
+    let username = { state.username.read().await.clone() };
+    let room = { state.current_room.read().await.clone() };
+    let room_id_opt = { *state.current_room_id.read().await };
 
     // Best-effort: send a Disconnect to the server before closing
     if let Some(mut write_half) = {
         let mut guard = state.client_stream.lock().await;
         guard.take()
-    }{
+    } {
         // Build a disconnect message (room context if available)
         let disconnect_msg = Message {
             message_type: MessageType::Disconnect,
@@ -943,7 +970,8 @@ pub async fn client_disconnect(app: tauri::AppHandle, state: State<'_, Arc<AppSt
             room_id: room_id_opt.unwrap_or(0),
             created_at: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs(),
+                .unwrap_or_default()
+                .as_secs(),
             is_emoji: false,
         };
 
@@ -959,11 +987,11 @@ pub async fn client_disconnect(app: tauri::AppHandle, state: State<'_, Arc<AppSt
         *state.current_room_id.write().await = None;
         *state.server_addr.write().await = None;
         *state.is_server.write().await = false;
-
     }
-    
-    // todo confirm if true also check for room leave if necessary || i wonder why not using distribution_message_to_all here instead
-    let _ = app.emit("message", ());
+
+    // Notify the UI on a dedicated lifecycle channel (NOT "message", which carries
+    // chat payloads the frontend JSON-parses).
+    let _ = app.emit("disconnected", ());
 
     Ok(())
 }
@@ -1006,7 +1034,6 @@ pub async fn server_participant_disconnect(
         }
         // After sending, close all connections by dropping their write halves
         guard.clear();
-    
     }
     // Clear room->clients index
     {
@@ -1027,10 +1054,9 @@ pub async fn server_participant_disconnect(
         *state.current_room_id.write().await = None;
         *state.server_addr.write().await = None;
     }
-    // Optional: notify UI that server hosting stopped
-    //todo confirm if true
-    let _ = app.emit("message", ());
+    // Notify the UI that server hosting stopped, on a dedicated lifecycle channel
+    // (NOT "message", which carries chat payloads the frontend JSON-parses).
+    let _ = app.emit("server_stopped", ());
 
     Ok(())
-
 }

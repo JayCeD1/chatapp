@@ -10,14 +10,49 @@ import {
   ViewState,
 } from "../types";
 
+// Normalize a message from either source into one shape with an ISO-8601 UTC timestamp,
+// so the UI never has to branch on origin:
+//   - live socket: `created_at` is epoch-seconds (number)
+//   - DB history:  `created_at` is a UTC "YYYY-MM-DD HH:MM:SS" string
+const normalizeMessage = (m: any, fallbackRoomId?: number): Message => {
+  const raw = m?.created_at;
+  let createdAt: string;
+  if (
+    typeof raw === "number" ||
+    (typeof raw === "string" && /^\d+$/.test(raw))
+  ) {
+    createdAt = new Date(Number(raw) * 1000).toISOString();
+  } else if (typeof raw === "string") {
+    // ISO strings pass through; bare "YYYY-MM-DD HH:MM:SS" is UTC — make it explicit.
+    const iso = raw.includes("T") ? raw : raw.replace(" ", "T") + "Z";
+    const d = new Date(iso);
+    createdAt = isNaN(d.getTime()) ? new Date().toISOString() : d.toISOString();
+  } else {
+    createdAt = new Date().toISOString();
+  }
+
+  return {
+    id: m?.id,
+    message_id: m?.message_id,
+    room_id: m?.room_id ?? fallbackRoomId ?? 0,
+    room: m?.room,
+    user_id: m?.user_id ?? 0,
+    username: m?.username,
+    message: m?.message,
+    message_type: m?.message_type,
+    is_emoji: m?.is_emoji ?? false,
+    created_at: createdAt,
+  };
+};
+
 export const useChatConnection = () => {
   const [view, setView] = useState<ViewState>("login");
   const [mode, setMode] = useState<ConnectionMode>("client");
   const [serverIp, setServerIp] = useState("127.0.0.1:3625");
-  
+
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [currentRoom, setCurrentRoom] = useState<ChatRoom | null>(null);
-  
+
   const [departments, setDepartments] = useState<Department[]>([]);
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
   const [messages, setMessages] = useState<Message[]>([]);
@@ -50,9 +85,9 @@ export const useChatConnection = () => {
       const msgs = (await invoke("get_room_messages", {
         roomId,
         limit: 50,
-      })) as Message[];
-      // Ensure date format is consistent if needed, but backend should send correct structure
-      setMessages(msgs);
+      })) as any[];
+      // Normalize so history and live messages share one timestamp format.
+      setMessages(msgs.map((m) => normalizeMessage(m, roomId)));
     } catch (error) {
       console.error("Error loading messages:", error);
     }
@@ -67,34 +102,36 @@ export const useChatConnection = () => {
     const setupListener = async () => {
       unlisten = await listen<string>("message", (e) => {
         try {
-          const m = JSON.parse(e.payload) as any; // incoming payload structure might differ slightly
-           
-          // The backend sends `created_at` as a timestamp number (seconds) often, based on previous code
-          // We need to normalize it to our Message type
-          const newMessage: Message = {
-            room_id: m.room_id || currentRoom.id, // Fallback if missing
-            room: m.room,
-            user_id: m.user_id || 0,
-            username: m.username,
-            message: m.message,
-            message_type: m.message_type,
-            is_emoji: m.is_emoji || false,
-            created_at: new Date(Number(m.created_at) * 1000).toISOString(),
-          };
+          // Lifecycle events use their own channels; ignore empty/non-chat payloads.
+          if (!e.payload) return;
+          const m = JSON.parse(e.payload) as any;
+          if (!m || m.room !== currentRoom.name) return;
 
-          if (m.room === currentRoom.name) {
-            setMessages((prev) => {
-              // Deduplicate
-              const isDuplicate = prev.some(
-                (msg) =>
-                  msg.message === newMessage.message &&
-                  msg.username === newMessage.username &&
-                  Math.abs(new Date(msg.created_at).getTime() - new Date(newMessage.created_at).getTime()) < 1000
-              );
-              if (isDuplicate) return prev;
-              return [...prev, newMessage];
-            });
-          }
+          const newMessage = normalizeMessage(m, currentRoom.id);
+
+          setMessages((prev) => {
+            // Primary dedup: the stable backend message_id (covers reconnect echoes
+            // and identical messages sent in quick succession).
+            if (
+              newMessage.message_id &&
+              prev.some((p) => p.message_id === newMessage.message_id)
+            ) {
+              return prev;
+            }
+            // Fallback for legacy rows that predate message_id.
+            const isDuplicate = prev.some(
+              (msg) =>
+                !msg.message_id &&
+                msg.message === newMessage.message &&
+                msg.username === newMessage.username &&
+                Math.abs(
+                  new Date(msg.created_at).getTime() -
+                    new Date(newMessage.created_at).getTime(),
+                ) < 1000,
+            );
+            if (isDuplicate) return prev;
+            return [...prev, newMessage];
+          });
         } catch (error) {
           console.error("Error parsing message:", error);
         }
@@ -155,7 +192,11 @@ export const useChatConnection = () => {
   }, [mode, currentUser, currentRoom, serverIp]);
 
   // Actions
-  const login = async (username: string, email: string, departmentId: number) => {
+  const login = async (
+    username: string,
+    email: string,
+    departmentId: number,
+  ) => {
     try {
       const user = (await invoke("upsert_user", {
         name: username,
@@ -201,7 +242,9 @@ export const useChatConnection = () => {
           userId: currentUser.id,
           newRoom: room.name,
           newRoomId: room.id,
-          oldRoom: currentUser.department_name, // Note: Simplification, might need tracking previous room
+          // Use the actual previous room so the host removes us from the right bucket;
+          // fall back to the department room only on first join.
+          oldRoom: currentRoom?.name || currentUser.department_name,
         });
       } else {
         await invoke("client_join_room", {
@@ -223,10 +266,13 @@ export const useChatConnection = () => {
   const leaveRoom = async () => {
     if (!currentUser || !currentRoom) return;
     try {
-       await invoke("leave_room", { userId: currentUser.id, roomId: currentRoom.id });
-       setCurrentRoom(null);
-       setView("rooms");
-       setMessages([]);
+      await invoke("leave_room", {
+        userId: currentUser.id,
+        roomId: currentRoom.id,
+      });
+      setCurrentRoom(null);
+      setView("rooms");
+      setMessages([]);
     } catch (error) {
       console.error("Leave room failed:", error);
     }
@@ -235,7 +281,8 @@ export const useChatConnection = () => {
   const sendMessage = async (text: string, isEmoji = false) => {
     if (!currentUser || !currentRoom) return;
     try {
-      const command = mode === "server" ? "send_as_server_participant" : "send_as_client";
+      const command =
+        mode === "server" ? "send_as_server_participant" : "send_as_client";
       await invoke(command, {
         message: text,
         user_id: currentUser.id,
@@ -247,12 +294,31 @@ export const useChatConnection = () => {
   };
 
   const logout = async () => {
-    if (currentUser && currentRoom) {
-      await leaveRoom();
+    // Tear down the live TCP connection (client) or stop hosting (server) so the
+    // socket and bound port are actually released — otherwise re-login fails with
+    // "address already in use" and the host keeps ghost clients.
+    try {
+      if (mode === "server") {
+        await invoke("server_participant_disconnect");
+      } else {
+        await invoke("client_disconnect");
+      }
+    } catch (error) {
+      console.error("Disconnect failed:", error);
     }
-    // Additional cleanup if needed
-    // Disconnects aren't strictly exposed in the original code, mostly relying on window close or reload
-    // but we can clear state
+
+    // Mark the room inactive in the DB if we were in one.
+    if (currentUser && currentRoom) {
+      try {
+        await invoke("leave_room", {
+          userId: currentUser.id,
+          roomId: currentRoom.id,
+        });
+      } catch (error) {
+        console.error("Leave room on logout failed:", error);
+      }
+    }
+
     setCurrentUser(null);
     setCurrentRoom(null);
     setMessages([]);

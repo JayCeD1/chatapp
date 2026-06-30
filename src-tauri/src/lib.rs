@@ -1,5 +1,5 @@
 use crate::db_queries::{
-    create_room, create_user, get_chat_rooms, get_departments, get_room_messages,
+    add_room_member, create_room, create_user, get_chat_rooms, get_departments, get_room_messages,
     get_room_reactions, get_rooms_by_department, get_unread_counts, get_user_by_id, get_users,
     join_room, leave_room, save_message, search_messages, touch_last_read,
     update_user_online_status, upsert_user,
@@ -125,6 +125,7 @@ pub fn run() {
             get_chat_rooms,
             get_rooms_by_department,
             create_room,
+            add_room_member,
             join_room,
             leave_room,
             // Message management

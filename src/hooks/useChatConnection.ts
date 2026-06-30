@@ -445,9 +445,14 @@ export const useChatConnection = () => {
     }
   };
 
-  const loadChatRooms = async () => {
+  const loadChatRooms = async (userId?: number) => {
+    const uid = userId ?? currentUserRef.current?.id;
+    if (uid == null) return;
     try {
-      const rooms = (await invoke("get_chat_rooms")) as ChatRoom[];
+      // The list is filtered server-side to public rooms + private rooms this user belongs to.
+      const rooms = (await invoke("get_chat_rooms", {
+        userId: uid,
+      })) as ChatRoom[];
       setChatRooms(rooms);
     } catch (err) {
       console.error("Error loading chat rooms:", err);
@@ -681,7 +686,7 @@ export const useChatConnection = () => {
         });
       }
 
-      await loadChatRooms();
+      await loadChatRooms(user.id);
       setConnectionStatus("connected");
       setView("workspace");
       // Host owns the DB → seed its unread badges now; a client gets a push on Connect.
@@ -783,7 +788,7 @@ export const useChatConnection = () => {
       isPrivate,
       createdBy: currentUser.id,
     })) as ChatRoom;
-    await loadChatRooms();
+    await loadChatRooms(currentUser.id);
     await joinRoom(room);
   };
 

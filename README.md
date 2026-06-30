@@ -83,6 +83,12 @@ This creates distributable packages for your platform.
 
 ## 🏗️ Architecture
 
+> **Where this is headed:** Nutler is built to evolve into a secure, transport-agnostic
+> messaging platform (true E2EE + multiple transports) without a subsystem rewrite. The
+> design constraints, a current-state gap analysis, and the decision log live in
+> [`docs/architecture/`](./docs/architecture/README.md). Read them before changing the
+> message format, persistence, transport, routing, or crypto.
+
 ### Database Schema
 
 ```

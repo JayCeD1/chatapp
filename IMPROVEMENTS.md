@@ -424,14 +424,14 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 
 ### Phase 3 — Feature expansion _(in progress)_
 - [x] Real presence + live member list — server-truth roster broadcast via `UserList` on every membership change; `update_user_online_status` wired on login/logout (7) (`34179e0`) — **M**
+- [x] User-created channels (`create_room` + `created_by`/`is_private`, "+ New channel" modal) (7) (`b0e13cf`) — **M**
+- [x] History pagination (cursor-based `before_id`, load-older on scroll-up with viewport anchoring) (7) (`a6f8d0e`) — **M**
+- [x] Message edit/delete (migration v10 `edited_at`/`deleted_at`, authorship-checked, `MessageType::Edit/Delete`, hover actions + inline edit) (7) (`1d138c2`) — **M**
+- [x] @mentions (highlight + me-emphasis) + desktop notifications (`tauri-plugin-notification`, on unfocused/mention) (7) (`158f877`) — **M**
 - [ ] Persistent identity + session restore via `get_user_by_id` (7) — **L**
-- [ ] User-created rooms (`create_room`, `created_by`/`is_private`, "New Channel" UI) (7) — **M**
-- [ ] Unread tracking (`last_read_at` + badges) — depends on multi-room listener (7) — **M**
-- [ ] @mentions + desktop notifications (`tauri-plugin-notification`) (7) — **M**
-- [ ] Message edit/delete (`edited_at`/`is_deleted` + `MessageType::Edit/Delete`) (7) — **M**
-- [ ] History pagination (cursor-based, load-older on scroll-up) (7) — **M**
+- [ ] Unread tracking (`last_read_at` + badges) — depends on multi-room delivery, not just the listener (backend currently delivers only the active room) (7) — **M**
 - [ ] Working discovery in UI (handshake + mDNS/UDP, replace port scan) (7/2.10) — **M**
-- [ ] DMs, reactions, typing indicators, search, avatars, settings persistence (7) — **S→L each**
+- [ ] DMs, reactions, typing indicators, search, settings persistence (7). _Avatars + theme persistence already done in Phase 2._ — **S→L each**
 
 ### Phase 4 — Polish, tests, CI, release
 - [ ] Rust unit + `tokio::test` integration tests; Vitest + RTL frontend tests (8.1) — **L**

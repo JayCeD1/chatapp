@@ -684,12 +684,8 @@ async fn distribute_message_to_all(
     message: &Message,
     exclude_user_id: Option<u64>,
 ) {
-    // Read scalar flags first, then briefly hold the collection locks to snapshot the
-    // target writers, and release ALL locks before any network I/O or emit (avoids
-    // holding mutexes across .await fan-out).
-    let is_server = *state.is_server.read().await;
-    let server_user_id = *state.user_id.read().await;
-
+    // Briefly hold the collection locks to snapshot the target writers, then release ALL
+    // locks before any network I/O or emit (avoids holding mutexes across .await fan-out).
     type Target = (
         Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
         Arc<tokio::sync::Mutex<TransportState>>,
@@ -706,10 +702,12 @@ async fn distribute_message_to_all(
                 if Some(user_id) == exclude_user_id {
                     continue;
                 }
-                // Skip server's own user_id (it talks to its UI directly, not via network)
-                if is_server && Some(user_id) == server_user_id {
-                    continue;
-                }
+                // NOTE: we intentionally do NOT skip "the server's own user_id" here. The
+                // host is never in server_streams, so a host-id lookup below already returns
+                // None (no network send). But user_ids are assigned by each instance's local
+                // DB and so collide across machines — a client can legitimately share the
+                // host's id, and `streams.get` then resolves to that real client. Skipping by
+                // id dropped such a client from delivery (they could send but never receive).
                 if let Some(conn) = streams.get(&user_id) {
                     v.push((
                         Arc::clone(&conn.writer),

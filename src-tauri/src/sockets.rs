@@ -18,6 +18,12 @@ use uuid::Uuid;
 /// Shared by both the server and client read paths so the cap can never drift.
 const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 
+/// Maximum number of client connections a host will handle concurrently.
+const MAX_CONCURRENT_CLIENTS: usize = 256;
+
+/// Maximum length (in characters) of a single chat message.
+const MAX_MESSAGE_CHARS: usize = 4000;
+
 /// Read one length-prefixed frame: a 4-byte big-endian length header followed by
 /// that many payload bytes. Returns `Ok(None)` for a zero-length keep-alive frame.
 /// Rejects oversized frames so a malicious peer cannot trigger a huge allocation.
@@ -45,6 +51,15 @@ where
     let mut buf = vec![0u8; msg_len];
     reader.read_exact(&mut buf).await?;
     Ok(Some(buf))
+}
+
+/// Current UNIX time in seconds. Returns 0 if the system clock is before the epoch
+/// instead of panicking — these run on network-triggered code paths.
+fn now_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 //Better indexing and room management
@@ -149,7 +164,10 @@ pub async fn discover_servers(_app: tauri::AppHandle) -> Vec<ServerInfo> {
     let mut tasks = JoinSet::new();
 
     for (ip, port) in targets {
-        let permit = semaphore.clone().acquire_owned().await.unwrap();
+        let permit = match semaphore.clone().acquire_owned().await {
+            Ok(p) => p,
+            Err(_) => break, // semaphore closed; stop scheduling probes
+        };
         tasks.spawn(async move {
             // Hold the permit for the duration of the probe
             let _p = permit;
@@ -224,10 +242,7 @@ pub async fn server_listen_as_participant(
         message_id: Uuid::new_v4().to_string(),
         room: room.clone(),
         room_id,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji: false,
     };
 
@@ -251,8 +266,10 @@ pub async fn server_listen_as_participant(
     });
 
     // Emit join message to server's own UI
-    if let Err(e) = app.emit("message", serde_json::to_string(&join_message).unwrap()) {
-        eprintln!("Failed to emit server join message: {}", e);
+    if let Ok(payload) = serde_json::to_string(&join_message) {
+        if let Err(e) = app.emit("message", payload) {
+            eprintln!("Failed to emit server join message: {}", e);
+        }
     }
 
     // Start accepting client connections
@@ -260,11 +277,23 @@ pub async fn server_listen_as_participant(
     let app_clone = app.clone();
     let state_clone = Arc::clone(&state.inner());
     let pool_clone = db.inner().clone();
+    // Bound concurrently-handled connections so a flood can't exhaust FDs/memory.
+    let conn_limiter = Arc::new(Semaphore::new(MAX_CONCURRENT_CLIENTS));
 
     tauri::async_runtime::spawn(async move {
         loop {
             match listener.accept().await {
                 Ok((stream, addr)) => {
+                    // Reject (drop) the connection if we're at capacity rather than
+                    // queueing handlers unboundedly.
+                    let permit = match Arc::clone(&conn_limiter).try_acquire_owned() {
+                        Ok(p) => p,
+                        Err(_) => {
+                            eprintln!("⚠️  Connection limit reached; rejecting {}", addr);
+                            drop(stream);
+                            continue;
+                        }
+                    };
                     println!("🔵 New client connecting from: {}", addr);
                     let app_handle = app_clone.clone();
                     let state_handle = state_clone.clone();
@@ -272,6 +301,7 @@ pub async fn server_listen_as_participant(
 
                     // Use tokio::spawn for individual client handling (pure network I/O)
                     tokio::spawn(async move {
+                        let _permit = permit; // released when the connection ends
                         if let Err(e) =
                             handle_client_connection(app_handle, state_handle, stream, pool_handle)
                                 .await
@@ -399,9 +429,7 @@ async fn clean_client(
         message_id: Uuid::new_v4().to_string(),
         room: client.current_room.clone(),
         room_id: client.room_id,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)?
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji: false,
     };
 
@@ -483,9 +511,12 @@ async fn distribute_message_to_all(
         }
     }
     // 2. ALWAYS send it to local UI (this machine's interface)
-    match app.emit("message", serde_json::to_string(message).unwrap()) {
-        Ok(_) => println!("📱 Emitted to local UI successfully"),
-        Err(e) => eprintln!("📱 Failed to emit to local UI: {}", e),
+    match serde_json::to_string(message) {
+        Ok(payload) => match app.emit("message", payload) {
+            Ok(_) => println!("📱 Emitted to local UI successfully"),
+            Err(e) => eprintln!("📱 Failed to emit to local UI: {}", e),
+        },
+        Err(e) => eprintln!("📱 Failed to serialize message for local UI: {}", e),
     }
 }
 
@@ -607,6 +638,13 @@ pub async fn send_as_server_participant(
     user_id: u64,
     is_emoji: bool,
 ) -> Result<(), String> {
+    if message.trim().is_empty() {
+        return Err("Message cannot be empty".to_string());
+    }
+    if message.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(format!("Message exceeds {} characters", MAX_MESSAGE_CHARS));
+    }
+
     let username = state.username.read().await.clone();
     let room = state.current_room.read().await.clone();
     let room_id = state.current_room_id.read().await.unwrap_or(1);
@@ -618,10 +656,7 @@ pub async fn send_as_server_participant(
         message: message.clone(),
         room_id,
         room,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji,
         message_id: Uuid::new_v4().to_string(),
     };
@@ -687,10 +722,7 @@ pub async fn client_connect_to_server(
         message: format!("🔵 {} joined the chat", username),
         room: room.clone(),
         room_id,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji: false,
         message_id: Uuid::new_v4().to_string(),
     };
@@ -720,6 +752,13 @@ pub async fn send_as_client(
     user_id: u64,
     is_emoji: bool,
 ) -> Result<(), String> {
+    if message.trim().is_empty() {
+        return Err("Message cannot be empty".to_string());
+    }
+    if message.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(format!("Message exceeds {} characters", MAX_MESSAGE_CHARS));
+    }
+
     let username = state.username.read().await.clone();
     let room = state.current_room.read().await.clone();
     let room_id = state.current_room_id.read().await.unwrap_or(1);
@@ -733,10 +772,7 @@ pub async fn send_as_client(
         message: message.clone(),
         room_id,
         room,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji,
         message_id: Uuid::new_v4().to_string(),
     };
@@ -754,8 +790,10 @@ pub async fn send_as_client(
     }
 
     // Show in own UI immediately (don't wait for server echo)
-    if let Err(e) = app.emit("message", serde_json::to_string(&chat_message).unwrap()) {
-        eprintln!("Failed to emit own message to UI: {}", e);
+    if let Ok(payload) = serde_json::to_string(&chat_message) {
+        if let Err(e) = app.emit("message", payload) {
+            eprintln!("Failed to emit own message to UI: {}", e);
+        }
     }
 
     Ok(())
@@ -814,10 +852,7 @@ pub async fn server_participant_join_room(
         message: format!("📍 {} moved from {} to {}", username, old_room, new_room),
         room: new_room.clone(),
         room_id: new_room_id,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji: false,
         message_id: Uuid::new_v4().to_string(),
     };
@@ -892,10 +927,7 @@ pub async fn client_join_room(
         message: format!("📍 {} moved from {} to {}", username, old_room, new_room),
         room: new_room.clone(),
         room_id: new_room_id,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji: false,
         message_id: Uuid::new_v4().to_string(),
     };
@@ -968,10 +1000,7 @@ pub async fn client_disconnect(
             message_id: Uuid::new_v4().to_string(),
             room: room.clone(),
             room_id: room_id_opt.unwrap_or(0),
-            created_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs(),
+            created_at: now_secs(),
             is_emoji: false,
         };
 
@@ -1016,10 +1045,7 @@ pub async fn server_participant_disconnect(
         message_id: Uuid::new_v4().to_string(),
         room: host_room.clone(),
         room_id: host_room_id,
-        created_at: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
+        created_at: now_secs(),
         is_emoji: false,
     };
 

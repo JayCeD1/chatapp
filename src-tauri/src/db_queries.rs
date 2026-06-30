@@ -59,6 +59,17 @@ pub async fn upsert_user(
     email: String,
     department_id: Option<i64>,
 ) -> Result<User, String> {
+    // Normalize + validate so identity (the broadcast/attribution key) stays clean:
+    // trim/lowercase email, reject blank/oversized values.
+    let name = name.trim().to_string();
+    let email = email.trim().to_lowercase();
+    if name.is_empty() || name.chars().count() > 64 {
+        return Err("Name must be between 1 and 64 characters".to_string());
+    }
+    if email.is_empty() || email.len() > 254 || !email.contains('@') {
+        return Err("A valid email address is required".to_string());
+    }
+
     //Try find existing
     if let Some(_row) = sqlx::query(
         "SELECT u.id, u.name, u.email, u.department_id, u.is_online, u.last_seen,
@@ -322,8 +333,10 @@ pub async fn join_room(
     user_id: i64,
     room_id: i64,
 ) -> Result<(), String> {
+    // Upsert without churning the PK / joined_at (INSERT OR REPLACE would delete+reinsert).
     sqlx::query(
-        "INSERT OR REPLACE INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)",
+        "INSERT INTO user_rooms (user_id, room_id, is_active) VALUES ($1, $2, 1)
+         ON CONFLICT(user_id, room_id) DO UPDATE SET is_active = 1",
     )
     .bind(&user_id)
     .bind(&room_id)

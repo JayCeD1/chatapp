@@ -422,8 +422,8 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 
 **Phase 2 is complete** (`f6fb132` + `9e60327`). Real server-truth presence is Phase 3; current presence is derived from lifecycle events + message authors.
 
-### Phase 3 — Feature expansion
-- [ ] Real presence (`update_user_online_status` on login/logout + presence event) + live member list (7) — **M**
+### Phase 3 — Feature expansion _(in progress)_
+- [x] Real presence + live member list — server-truth roster broadcast via `UserList` on every membership change; `update_user_online_status` wired on login/logout (7) (`34179e0`) — **M**
 - [ ] Persistent identity + session restore via `get_user_by_id` (7) — **L**
 - [ ] User-created rooms (`create_room`, `created_by`/`is_private`, "New Channel" UI) (7) — **M**
 - [ ] Unread tracking (`last_read_at` + badges) — depends on multi-room listener (7) — **M**

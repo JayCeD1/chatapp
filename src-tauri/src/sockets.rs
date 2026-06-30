@@ -123,6 +123,12 @@ fn now_secs() -> u64 {
 /// (a reconnect may have replaced it).
 static NEXT_CONN_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
+/// Bumped on every client connect attempt. The read listener captures the generation it was
+/// started under and suppresses its `connection_lost` emit once a newer connection exists —
+/// so a listener that fails in the narrow window before it's aborted can't trigger a spurious
+/// reconnect on top of an already-healthy connection.
+static CLIENT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// A peer's write half + its Noise transport — together, enough to send one
 /// encrypted frame. Snapshotted under the streams lock, then used after it drops.
 type ClientLink = (
@@ -1156,6 +1162,22 @@ async fn handle_server_message(
             push_user_directory(&app, &state, &pool).await;
         }
         MessageType::Chat => {
+            // Enforce private-channel membership before persisting OR distributing: without
+            // this, a peer could inject a message into a private room / DM history (or push it
+            // to that room's members) with a crafted Chat frame, never having joined. Authorized
+            // by the connection's canonical id, never the (spoofable) frame user_id.
+            let actor = auth_user_id.unwrap_or(message.user_id);
+            if !room_join_allowed_internal(&pool, actor as i64, message.room_id as i64)
+                .await
+                .unwrap_or(false)
+            {
+                tracing::warn!(
+                    "Dropped chat for room {} from non-member {}",
+                    message.room_id,
+                    actor
+                );
+                return Ok(());
+            }
             // Distribute first (live delivery to in-room clients), then persist and refresh
             // unread badges in a single task so the unread recompute sees the saved row.
             distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
@@ -1564,6 +1586,11 @@ pub async fn client_connect_to_server(
         .await
         .map_err(|e| format!("Failed to send connect message to server: {}", e))?;
 
+    // Mark this as the newest connection: any listener from a prior attempt now belongs to an
+    // older generation and will suppress its connection_lost emit. This closes the window
+    // between a stale listener detecting failure and the abort below landing.
+    let generation = CLIENT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+
     // Cancel any previous listener + heartbeat (e.g. from a dropped connection) BEFORE
     // starting new ones, so a stale task can't emit a spurious connection_lost and
     // trigger an unwanted reconnect loop.
@@ -1579,7 +1606,8 @@ pub async fn client_connect_to_server(
             old.abort();
         }
     }
-    let listener = start_client_listener(app, reader, Arc::clone(&state.client_transport));
+    let listener =
+        start_client_listener(app, reader, Arc::clone(&state.client_transport), generation);
     *state.client_listener.lock().await = Some(listener);
     let heartbeat = spawn_client_heartbeat(Arc::clone(&state.client_stream));
     *state.client_heartbeat.lock().await = Some(heartbeat);
@@ -1643,7 +1671,18 @@ fn start_client_listener(
     app: tauri::AppHandle,
     mut reader: tokio::net::tcp::OwnedReadHalf,
     transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
+    generation: u64,
 ) -> tauri::async_runtime::JoinHandle<()> {
+    // Emit connection_lost only if THIS listener is still the active generation — a newer
+    // connect bumps CLIENT_GENERATION, marking us stale so we don't trigger a reconnect on
+    // top of a healthy connection.
+    let emit_lost = move |app: &tauri::AppHandle| {
+        if generation == CLIENT_GENERATION.load(std::sync::atomic::Ordering::SeqCst) {
+            let _ = app.emit("connection_lost", ());
+        } else {
+            tracing::info!("Suppressed stale connection_lost (gen {})", generation);
+        }
+    };
     tauri::async_runtime::spawn(async move {
         tracing::info!("🎧 Client listener started");
 
@@ -1655,16 +1694,14 @@ fn start_client_listener(
             let ciphertext = match framed {
                 Err(_elapsed) => {
                     tracing::info!("⏱️  Client read timeout (host gone)");
-                    let _ = app.emit("connection_lost", ());
+                    emit_lost(&app);
                     break;
                 }
                 Ok(Ok(None)) => continue, // empty keep-alive frame
                 Ok(Ok(Some(ct))) => ct,
                 Ok(Err(e)) => {
                     tracing::info!("🔴 Client connection lost: {}", e);
-                    if let Err(emit_err) = app.emit("connection_lost", ()) {
-                        tracing::error!("Failed to emit connection lost: {}", emit_err);
-                    }
+                    emit_lost(&app);
                     break;
                 }
             };

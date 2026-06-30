@@ -9,6 +9,8 @@ import {
   User,
   ViewState,
 } from "../types";
+import { mentionsUser } from "../utils";
+import { notify, ensureNotificationPermission } from "../notifications";
 
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
@@ -86,6 +88,10 @@ export const useChatConnection = () => {
   useEffect(() => {
     messagesByRoomRef.current = messagesByRoom;
   }, [messagesByRoom]);
+  const currentUserRef = useRef<User | null>(null);
+  useEffect(() => {
+    currentUserRef.current = currentUser;
+  }, [currentUser]);
 
   const PAGE_SIZE = 50;
 
@@ -152,6 +158,20 @@ export const useChatConnection = () => {
       if (dup) return prev;
       return { ...prev, [nm.room]: [...list, nm] };
     });
+
+    // Desktop notification for chat messages from others, when the window isn't
+    // focused or we've been @-mentioned.
+    const me = currentUserRef.current;
+    if (
+      me &&
+      (nm.message_type === "Chat" || !nm.message_type) &&
+      nm.username !== me.name
+    ) {
+      const mentioned = mentionsUser(nm.message, me.name);
+      if (!document.hasFocus() || mentioned) {
+        notify(`#${nm.room}`, `${nm.username}: ${nm.message}`);
+      }
+    }
   }, []);
 
   // Load departments on mount.
@@ -322,6 +342,8 @@ export const useChatConnection = () => {
       passwordRef.current = password;
       setCurrentUser(user);
       localStorage.setItem("nutler.userId", String(user.id));
+      ensureNotificationPermission(); // ask once, up front
+
       // Best-effort DB presence flag (last-seen / online).
       invoke("update_user_online_status", {
         userId: user.id,

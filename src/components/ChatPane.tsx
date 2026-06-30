@@ -20,6 +20,7 @@ import {
   sameDay,
   shouldGroup,
   isSystem,
+  parseMentions,
 } from "../utils";
 
 interface ChatPaneProps {
@@ -338,7 +339,10 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                               msg.is_emoji ? "text-3xl" : "text-sm"
                             }`}
                           >
-                            {msg.message}
+                            <MessageText
+                              text={msg.message}
+                              meName={currentUser.name}
+                            />
                             {msg.edited_at && (
                               <span className="text-[11px] text-[var(--text-faint)] ml-1">
                                 (edited)
@@ -456,6 +460,31 @@ const DateSeparator: React.FC<{ iso: string }> = ({ iso }) => (
     </span>
     <div className="flex-1 h-px bg-[var(--border)]" />
   </div>
+);
+
+// Render message text with @mentions highlighted (extra emphasis if it's you).
+const MessageText: React.FC<{ text: string; meName: string }> = ({
+  text,
+  meName,
+}) => (
+  <>
+    {parseMentions(text).map((part, i) =>
+      part.mention ? (
+        <span
+          key={i}
+          className={`rounded px-0.5 font-medium ${
+            part.text.slice(1).toLowerCase() === meName.toLowerCase()
+              ? "bg-[var(--accent-soft)] text-[var(--accent-strong)]"
+              : "text-[var(--accent-strong)]"
+          }`}
+        >
+          {part.text}
+        </span>
+      ) : (
+        <React.Fragment key={i}>{part.text}</React.Fragment>
+      ),
+    )}
+  </>
 );
 
 const MessageSkeletons: React.FC = () => (

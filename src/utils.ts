@@ -76,3 +76,28 @@ export function isSystem(msg: Message): boolean {
   const t = msg.message_type || "Chat";
   return t !== "Chat";
 }
+
+// Whether `text` @-mentions the given user (case-insensitive).
+export function mentionsUser(text: string, name: string): boolean {
+  if (!name) return false;
+  return text.toLowerCase().includes("@" + name.toLowerCase());
+}
+
+// Split text into runs, flagging @mention tokens for styled rendering.
+export function parseMentions(
+  text: string,
+): { text: string; mention: boolean }[] {
+  const parts: { text: string; mention: boolean }[] = [];
+  const re = /@[\w.-]+/g;
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    if (m.index > last)
+      parts.push({ text: text.slice(last, m.index), mention: false });
+    parts.push({ text: m[0], mention: true });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length)
+    parts.push({ text: text.slice(last), mention: false });
+  return parts;
+}

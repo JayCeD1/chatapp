@@ -20,6 +20,7 @@ interface WorkspaceProps {
   chatRooms: ChatRoom[];
   currentRoom: ChatRoom | null;
   currentUser: User;
+  canonicalUserId: number | null;
   unreadByRoom: Record<number, number>;
   messages: Message[];
   loadingMessages: boolean;
@@ -59,6 +60,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   chatRooms,
   currentRoom,
   currentUser,
+  canonicalUserId,
   unreadByRoom,
   messages,
   loadingMessages,
@@ -142,6 +144,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             onlineCount={onlineCount}
             memberCount={members.length}
             currentUserId={currentUser.id}
+            canonicalUserId={canonicalUserId}
             onSendMessage={onSendMessage}
             onEditMessage={onEditMessage}
             onDeleteMessage={onDeleteMessage}

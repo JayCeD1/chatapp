@@ -242,6 +242,10 @@ pub enum MessageType {
     DmRequest,
     // Host → the requesting client: the freshly opened DM room (JSON ChatRoom) to switch to.
     DmReady,
+    // Host → a single client on connect: their canonical user id (in `user_id`). A client's
+    // local id differs from the host-assigned canonical id, so the client needs this to tell
+    // which messages are its own (history carries the canonical author id).
+    Identity,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -1037,6 +1041,34 @@ async fn push_rooms_update(
     }
 }
 
+/// Tell a freshly-connected client its canonical user id (carried in `user_id`), so it can
+/// recognise its own messages — its local id differs from the host-assigned canonical one, and
+/// persisted history is authored under the canonical id.
+async fn send_identity(state: &Arc<AppState>, user_id: u64) {
+    let conn = {
+        let streams = state.server_streams.lock().await;
+        streams
+            .get(&user_id)
+            .map(|c| (Arc::clone(&c.writer), Arc::clone(&c.transport)))
+    };
+    if let Some((writer, transport)) = conn {
+        let msg = Message {
+            version: PROTOCOL_VERSION,
+            message_type: MessageType::Identity,
+            username: String::new(),
+            user_id,
+            message: String::new(),
+            message_id: Uuid::new_v4().to_string(),
+            room: String::new(),
+            room_id: 0,
+            created_at: now_secs(),
+            is_emoji: false,
+            email: None,
+        };
+        let _ = send_secure(&writer, &transport, &msg).await;
+    }
+}
+
 /// Send the requesting client the DM room they just opened (as JSON in `message`), so their
 /// client can switch to it immediately rather than hunting for it after a rooms reload.
 async fn send_dm_ready(state: &Arc<AppState>, user_id: u64, room: &ChatRoom) {
@@ -1172,9 +1204,11 @@ async fn handle_server_message(
             // Distribute to all participants
             distribute_message_to_all(&app, &state, &message.room, &message, None).await;
             broadcast_user_list(&app, &state, &message.room).await;
-            // Seed the freshly-connected client's unread badges + authoritative room list
-            // (so they see private channels / DMs they belong to that aren't in their local DB).
+            // Seed the freshly-connected client's identity, unread badges + authoritative room
+            // list (so they see private channels / DMs they belong to that aren't in their local
+            // DB, and can recognise their own messages by the canonical id).
             if let Some(requester) = auth_user_id {
+                send_identity(&state, requester).await;
                 push_unread(&state, &pool, requester).await;
                 push_rooms_update(&app, &state, &pool, requester).await;
             }

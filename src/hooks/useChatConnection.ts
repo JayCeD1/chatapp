@@ -972,13 +972,9 @@ export const useChatConnection = () => {
   );
 
   // Find Nutler hosts on the LAN (UDP broadcast). User-triggered from the login screen.
+  // Failures propagate so the login UI can distinguish "no hosts" from a real error.
   const discoverServers = useCallback(async (): Promise<ServerInfo[]> => {
-    try {
-      return (await invoke("discover_servers")) as ServerInfo[];
-    } catch (err) {
-      console.error("Discovery failed:", err);
-      return [];
-    }
+    return (await invoke("discover_servers")) as ServerInfo[];
   }, []);
 
   // Open a room by id (e.g. from a search result).

@@ -71,6 +71,13 @@ export const LoginView: React.FC<LoginViewProps> = ({
   // If the form is pre-filled, drop the user straight on the password field.
   const [returning] = useState(() => !!loadProfile().username);
 
+  // Drop stale discovery results/notes when switching connection mode (the component stays
+  // mounted across the client/server toggle, so this state would otherwise persist).
+  useEffect(() => {
+    setDiscovered([]);
+    setDiscoverNote(null);
+  }, [mode]);
+
   // A restored department id may no longer exist (department list changed, or a
   // corrupt profile). Once the live list loads, drop a stale id so the form can't
   // submit a blank-but-truthy selection into a wrong/None room.
@@ -169,6 +176,7 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   type="button"
                   onClick={handleDiscover}
                   disabled={discovering}
+                  aria-busy={discovering}
                   className="flex items-center gap-1.5 text-xs font-medium text-[var(--accent-strong)] hover:underline disabled:opacity-60 disabled:no-underline"
                 >
                   {discovering ? (
@@ -178,35 +186,38 @@ export const LoginView: React.FC<LoginViewProps> = ({
                   )}
                   {discovering ? "Searching…" : "Find hosts on your network"}
                 </button>
-                {discovered.length > 0 && (
-                  <ul className="mt-1.5 border border-[var(--border)] rounded-lg divide-y divide-[var(--border)] overflow-hidden">
-                    {discovered.map((s) => (
-                      <li key={`${s.address}:${s.port}`}>
-                        <button
-                          type="button"
-                          onClick={() => {
-                            setServerIp(`${s.address}:${s.port}`);
-                            setDiscovered([]);
-                            setDiscoverNote(null);
-                          }}
-                          className="w-full text-left px-3 py-2 hover:bg-[var(--surface-2)] transition-colors"
-                        >
-                          <div className="text-sm text-[var(--text)] truncate">
-                            {s.name}
-                          </div>
-                          <div className="text-[11px] text-[var(--text-faint)]">
-                            {s.address}:{s.port} · {s.user_count} online
-                          </div>
-                        </button>
-                      </li>
-                    ))}
-                  </ul>
-                )}
-                {discoverNote && (
-                  <p className="mt-1 text-[11px] text-[var(--text-faint)]">
-                    {discoverNote}
-                  </p>
-                )}
+                {/* Live region so screen readers announce results / the note as they appear. */}
+                <div role="status" aria-live="polite">
+                  {discovered.length > 0 && (
+                    <ul className="mt-1.5 border border-[var(--border)] rounded-lg divide-y divide-[var(--border)] overflow-hidden">
+                      {discovered.map((s) => (
+                        <li key={`${s.address}:${s.port}`}>
+                          <button
+                            type="button"
+                            onClick={() => {
+                              setServerIp(`${s.address}:${s.port}`);
+                              setDiscovered([]);
+                              setDiscoverNote(null);
+                            }}
+                            className="w-full text-left px-3 py-2 hover:bg-[var(--surface-2)] transition-colors"
+                          >
+                            <div className="text-sm text-[var(--text)] truncate">
+                              {s.name}
+                            </div>
+                            <div className="text-[11px] text-[var(--text-faint)]">
+                              {s.address}:{s.port} · {s.user_count} online
+                            </div>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  )}
+                  {discoverNote && (
+                    <p className="mt-1 text-[11px] text-[var(--text-faint)]">
+                      {discoverNote}
+                    </p>
+                  )}
+                </div>
               </div>
             )}
           </div>

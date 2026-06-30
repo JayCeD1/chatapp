@@ -111,6 +111,21 @@ describe("LoginView", () => {
     expect(setServerIp).not.toHaveBeenCalled();
   });
 
+  it("shows a distinct error when discovery itself fails", async () => {
+    const user = userEvent.setup();
+    renderLogin({
+      onDiscover: vi
+        .fn()
+        .mockRejectedValue("Couldn't broadcast on the network"),
+    });
+    await user.click(
+      screen.getByRole("button", { name: /find hosts on your network/i }),
+    );
+    // A real failure surfaces as an error, NOT the reassuring "no hosts" note.
+    expect(await screen.findByText(/discovery failed/i)).toBeInTheDocument();
+    expect(screen.queryByText(/no hosts found/i)).not.toBeInTheDocument();
+  });
+
   it("clears a restored department that no longer exists", () => {
     localStorage.setItem(
       "nutler.profile",

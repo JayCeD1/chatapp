@@ -35,6 +35,8 @@ interface ChatPaneProps {
   // Host-assigned canonical id (client mode); our local id differs, so we match own messages
   // by either. Null in host mode (currentUserId is already canonical there).
   canonicalUserId: number | null;
+  // Preference: does plain Enter send? (Cmd/Ctrl+Enter always sends.)
+  sendOnEnter: boolean;
   messages: Message[];
   loading: boolean;
   hasMore: boolean;
@@ -73,6 +75,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   currentUser,
   currentUserId,
   canonicalUserId,
+  sendOnEnter,
   messages,
   loading,
   hasMore,
@@ -228,7 +231,11 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
-    if (e.key === "Enter" && !e.shiftKey) {
+    if (e.key !== "Enter") return;
+    // Cmd/Ctrl+Enter always sends. Plain Enter sends only when the preference is on (and never
+    // with Shift, which stays reserved). When off, Enter does nothing (avoids accidental sends).
+    const send = e.metaKey || e.ctrlKey || (sendOnEnter && !e.shiftKey);
+    if (send) {
       e.preventDefault();
       handleSend();
     }

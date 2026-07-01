@@ -11,6 +11,7 @@ import {
 } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
 import { Theme } from "../hooks/useTheme";
+import { Preferences } from "../preferences";
 import { Sidebar } from "./Sidebar";
 import { ChatPane } from "./ChatPane";
 import { MembersPanel, Member } from "./MembersPanel";
@@ -53,6 +54,8 @@ interface WorkspaceProps {
   onDismissError: () => void;
   theme: Theme;
   onToggleTheme: () => void;
+  preferences: Preferences;
+  onSetPreferences: (patch: Partial<Preferences>) => void;
 }
 
 export const Workspace: React.FC<WorkspaceProps> = ({
@@ -88,6 +91,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   onDismissError,
   theme,
   onToggleTheme,
+  preferences,
+  onSetPreferences,
 }) => {
   // Live roster for the active room (server truth via UserList). Everyone in it is
   // connected; ensure the current user shows even before the first roster arrives.
@@ -126,6 +131,8 @@ export const Workspace: React.FC<WorkspaceProps> = ({
         onLogout={onLogout}
         theme={theme}
         onToggleTheme={onToggleTheme}
+        preferences={preferences}
+        onSetPreferences={onSetPreferences}
       />
 
       <div className="flex flex-col min-w-0 min-h-0">
@@ -145,6 +152,7 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             memberCount={members.length}
             currentUserId={currentUser.id}
             canonicalUserId={canonicalUserId}
+            sendOnEnter={preferences.sendOnEnter}
             onSendMessage={onSendMessage}
             onEditMessage={onEditMessage}
             onDeleteMessage={onDeleteMessage}

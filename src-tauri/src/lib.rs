@@ -19,6 +19,7 @@ use tauri::Manager;
 mod db;
 mod db_queries;
 mod error;
+mod mdns;
 mod migration;
 mod secure;
 mod sockets;
@@ -53,6 +54,7 @@ pub fn run() {
             current_room_id: tokio::sync::RwLock::new(None),
             server_addr: tokio::sync::RwLock::new(None),
             pool: std::sync::OnceLock::new(),
+            mdns: std::sync::Mutex::new(None),
         }))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {

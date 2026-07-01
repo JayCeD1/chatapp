@@ -210,6 +210,8 @@ pub struct AppState {
     // The query pool, set once at startup — lets broadcast-time eviction reach clean_client
     // without threading the pool through every distribute_message_to_all call site.
     pub pool: std::sync::OnceLock<SqlitePool>,
+    // The host's mDNS service daemon while hosting (best-effort), shut down on teardown.
+    pub mdns: std::sync::Mutex<Option<mdns_sd::ServiceDaemon>>,
 }
 
 /// Wire-protocol version of the message envelope. Bump when the envelope/payload format
@@ -449,6 +451,13 @@ pub async fn discover_servers(_app: tauri::AppHandle) -> Result<Vec<ServerInfo>,
         }
     }
     // Stable order so the UI list doesn't reshuffle between scans.
+    // Also fold in any mDNS-advertised hosts (best-effort), deduped by source IP.
+    for s in crate::mdns::browse(Duration::from_millis(DISCOVERY_WINDOW_MS)).await {
+        if let Ok(ip) = s.address.parse::<IpAddr>() {
+            found.entry(ip).or_insert(s);
+        }
+    }
+
     let mut servers: Vec<ServerInfo> = found.into_values().collect();
     servers.sort_by(|a, b| a.address.cmp(&b.address));
     Ok(servers)
@@ -573,6 +582,14 @@ pub async fn server_listen_as_participant(
         if let Some(old) = state.discovery_responder.lock().await.replace(responder) {
             old.abort();
         }
+    }
+    // Also advertise via mDNS (best-effort; the UDP responder is the reliable path). The host
+    // is the sole participant at start, so user_count = 1.
+    if let Ok(mut guard) = state.mdns.lock() {
+        if let Some(old) = guard.take() {
+            let _ = old.shutdown();
+        }
+        *guard = crate::mdns::register(&username, port, 1);
     }
     // Send server join message to its own UI immediately
     let join_message = Message {
@@ -2939,6 +2956,12 @@ pub async fn server_participant_disconnect(
     // Stop the LAN discovery responder so udp/3626 frees for a future host session.
     if let Some(handle) = state.discovery_responder.lock().await.take() {
         handle.abort();
+    }
+    // Stop advertising over mDNS.
+    if let Ok(mut guard) = state.mdns.lock() {
+        if let Some(daemon) = guard.take() {
+            let _ = daemon.shutdown();
+        }
     }
     // Clear room->clients index
     {

@@ -38,6 +38,8 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 snow = "0.10"
 sha2 = "0.11"
+# Optional mDNS / DNS-SD discovery, alongside the UDP-broadcast path (pure Rust, no native deps).
+mdns-sd = "0.13"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

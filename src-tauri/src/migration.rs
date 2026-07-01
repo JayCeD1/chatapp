@@ -1,4 +1,18 @@
-use tauri_plugin_sql::{Migration, MigrationKind};
+// Local migration types (formerly tauri_plugin_sql's) — the DB is now SQLCipher-encrypted and
+// opened by our own keyed pool, so we run migrations ourselves (see db::run_migrations) instead
+// of the plugin. Shape kept identical so the migration list below is unchanged.
+pub struct Migration {
+    pub version: i64,
+    pub description: &'static str,
+    pub sql: &'static str,
+    pub kind: MigrationKind,
+}
+
+#[derive(PartialEq)]
+pub enum MigrationKind {
+    Up,
+    Down,
+}
 
 pub fn get_migrations() -> Vec<Migration> {
     vec![

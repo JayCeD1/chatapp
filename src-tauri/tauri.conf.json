@@ -9,13 +9,7 @@
     "beforeBuildCommand": "npm run build",
     "frontendDist": "../dist"
   },
-  "plugins": {
-    "sql": {
-      "preload": [
-        "sqlite:nutler.db"
-      ]
-    }
-  },
+  "plugins": {},
   "app": {
     "windows": [
       {

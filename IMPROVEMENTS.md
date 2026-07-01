@@ -148,9 +148,9 @@ The host registers a client purely from the `Connect` message: `username/user_id
 Connects to `:3625` across ~600 hardcoded IPs, labels **any** open port a "Chat Server" with fabricated `user_count:0`/name (`sockets.rs:96-146`). Can trip IDS/IPS and false-positive any service; a fake `:3625` can lure clients into the no-cap read DoS (2.4).
 **Resolved:** replaced the scan with a **versioned UDP announce/respond** on udp/3626. Only well-formed Nutler announces (magic + `DISCOVERY_VERSION`) are listed — no false positives; discovery is **consent-gated** (user-clicked, no auto-scan), derives nothing (limited broadcast, no hardcoded ranges), and carries **no PSK**. The responder is LAN-source-gated, name-capped, and per-source rate-limited (anti reflection/amplification). The Noise PSK handshake on connect remains the trust boundary, so a forged announce only yields an address whose handshake fails (no read-DoS lure that bypasses auth). _Note: the client read-cap (2.4) is independently already addressed in Phase 0/1._
 
-### 2.11 Emails (PII) stored + transmitted in plaintext *(medium)*
+### 2.11 Emails (PII) stored + transmitted in plaintext *(medium)* — ✅ RESOLVED
 `email TEXT UNIQUE` plaintext (`migration.rs:24`); unencrypted `nutler.db` + cleartext TCP.
-**Fix:** Encrypt at rest (SQLCipher / OS-keychain key), restrict file perms, minimize PII in network payloads, combine with TLS (2.3).
+**Resolved:** the DB is now **SQLCipher-encrypted at rest** (whole DB — messages + emails), keyed by an OS-keychain-stored random key (0600 key-file fallback); file perms already 0600/0700 (Phase 0). Transport is already Noise-encrypted (2.3), and email is stripped from redistributed frames (canonical identity). Migrations run on our keyed pool (`tauri-plugin-sql` removed).
 
 ---
 
@@ -453,7 +453,7 @@ Chosen direction: **Teams-style, high-contrast accessible 3-pane** (departments�
 - [x] **Code-signing / notarization scaffolding**: `tauri.conf.json` `bundle.macOS`/`bundle.windows` settings + `src-tauri/entitlements.plist` (hardened runtime); release `build.yml` wired for macOS signing+notarization (Apple ID method) and Windows `.pfx` import → thumbprint injection, all **secret-gated so builds stay unsigned (and green) until secrets are added**; full `RELEASING.md` (flow + per-platform secret tables + verification). _Actual certs/secrets are the maintainer's to add._ — **M**
 - [x] **CI efficiency**: `concurrency` (group by workflow + `head_ref`/`ref`, `cancel-in-progress`) so a newer push cancels the older run; `push` limited to `main` so a feature branch + its PR never double-run. — **S**
 - [x] **Version-sync guard**: `scripts/check-versions.mjs` (+ `version:check`/`version:sync` npm scripts) keeps `package.json` (source of truth), `tauri.conf.json`, and `Cargo.toml` aligned; enforced in CI and the release build so a mismatched version can't ship. — **S**
-- [ ] PII at rest: SQLCipher/keychain, file perms (2.11) — **M**
+- [x] **PII at rest: SQLCipher + OS keychain (2.11)** — the DB (messages + emails) is encrypted at rest with SQLCipher, keyed by a random 32-byte key in the OS keychain (`keyring`) with a 0600 key-file fallback. Migrations moved off `tauri-plugin-sql` (removed) onto our keyed pool (`db::run_migrations`); an undecryptable DB resets (chosen over migrate). File perms (0600/0700) from Phase 0 retained. Fail-safe key handling (a locked keychain aborts rather than regenerating + wiping). Adversarially reviewed — found + fixed a HIGH data-loss bug in key handling. — **M**
 
 ---
 

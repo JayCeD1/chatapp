@@ -235,9 +235,10 @@ Every catch logs and swallows (`useChatConnection.ts:34,43,57,99,189,219,230,244
 `types.ts:22-31` has `created_at: string`, no `id`/`message_id`; socket struct has `message_id` + u64 `created_at`; bridged via `as any` + `|| 0`/`|| false` fallbacks (`useChatConnection.ts:70-82`). The TS type is decorative; a backend rename won't fail the build.
 **Fix:** Define one wire `Message` mirroring the socket struct and a separate normalized `UiMessage`; generate types from Rust (`ts-rs`/`specta`); remove `as any`.
 
-### 5.5 Single 280-line god-hook *(medium)*
-`useChatConnection` owns view routing, connection mode, auth, room/message state, three effects, and seven actions; components are pure props sinks. This shared closure scope is *why* the stale-closure/listener-churn bugs exist, and there's no seam to unit-test connection logic.
+### 5.5 Single 280-line god-hook *(medium)* — ✅ split (PR #58)
+`useChatConnection` owned view routing, connection mode, auth, room/message state, three effects, and seven actions; components are pure props sinks. This shared closure scope is *why* the stale-closure/listener-churn bugs exist, and there's no seam to unit-test connection logic.
 **Fix:** Split into `useConnection` (lifecycle + reconnect), `useMessages` (per-room store + listener), `useAuth/useSession`, and a small router. Consider a reducer or Zustand for the message map.
+**Done:** Extracted the two cleanly-separable state slices into focused, unit-testable hooks — `usePreferences` (persisted prefs + live `preferencesRef`) and `useMessageStore` (per-room messages/roster/reactions/unread/typing/loading + pagination, the `messagesByRoomRef`, typing-expiry ticker, derived `messages`, and `reset()`). The ingest/connection/reconnect core is deliberately kept cohesive: it's coupled to the once-registered socket listener and reconnect loop, and with no integration-test net a big-bang rewrite is high-risk for no structural payoff. Behaviour-preserving; store setters are stable and listed in dep arrays only so exhaustive-deps sees through the hook boundary.
 
 ### 5.6 No optimistic / failed-send state *(medium)*
 `sendMessage` awaits and only `console.error`s; the optimistic echo happens in **Rust** (`app.emit` of the sent message), so the UI message only appears via round-trip; on reject nothing renders and the text is already cleared.

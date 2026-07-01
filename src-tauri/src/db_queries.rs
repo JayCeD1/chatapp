@@ -1091,12 +1091,10 @@ pub async fn get_unread_counts(
 mod tests {
     use super::*;
     use sqlx::sqlite::SqlitePoolOptions;
-    use tauri_plugin_sql::MigrationKind;
 
-    // A single-connection in-memory DB with the REAL migrations applied. raw_sql is used
-    // so multi-statement migrations (e.g. the index/rebuild ones) run in full. Migrations
-    // 6/7 already seed departments and a room with id 1, so we only add the two users
-    // (Alice=1, Bob=2) the tests act as; messages go into the pre-seeded room 1.
+    // A single-connection in-memory DB with the REAL migrations applied via the production
+    // runner (crate::db::run_migrations). Migrations 6/7 already seed departments and a room
+    // with id 1, so we only add the two users (Alice=1, Bob=2) the tests act as.
     async fn setup() -> SqlitePool {
         let pool = SqlitePoolOptions::new()
             .max_connections(1)
@@ -1104,14 +1102,9 @@ mod tests {
             .await
             .expect("open in-memory db");
 
-        for m in crate::migration::get_migrations() {
-            if matches!(m.kind, MigrationKind::Up) {
-                sqlx::raw_sql(m.sql)
-                    .execute(&pool)
-                    .await
-                    .unwrap_or_else(|e| panic!("migration {} failed: {e}", m.version));
-            }
-        }
+        crate::db::run_migrations(&pool)
+            .await
+            .expect("run migrations");
 
         sqlx::raw_sql(
             "INSERT INTO users (id, name, email, department_id)

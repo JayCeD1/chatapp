@@ -13,12 +13,10 @@ use crate::sockets::{
     server_leave_room, server_listen_as_participant, server_participant_disconnect,
     server_participant_join_room, server_toggle_reaction, server_typing, AppState,
 };
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
-use sqlx::SqlitePool;
 use std::sync::Arc;
-use std::time::Duration;
 use tauri::Manager;
 
+mod db;
 mod db_queries;
 mod migration;
 mod secure;
@@ -54,16 +52,8 @@ pub fn run() {
             current_room_id: tokio::sync::RwLock::new(None),
             server_addr: tokio::sync::RwLock::new(None),
         }))
-        .plugin(
-            tauri_plugin_sql::Builder::default()
-                .add_migrations("sqlite:nutler.db", migration::get_migrations())
-                .build(),
-        )
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
-            // Use the SAME directory tauri-plugin-sql resolves "sqlite:nutler.db" against
-            // (app_config_dir). app_data_dir differs from app_config_dir on Linux, which
-            // would point migrations and queries at two different files.
             let app_config_dir = app
                 .path()
                 .app_config_dir()
@@ -74,23 +64,13 @@ pub fn run() {
 
             let db_path = app_config_dir.join("nutler.db");
 
-            // Build the query pool synchronously so it is managed BEFORE any command can
-            // run (avoids a "state not managed" race), with FK enforcement, WAL journaling,
-            // and a busy timeout so concurrent writers don't hit "database is locked".
-            let options = SqliteConnectOptions::new()
-                .filename(&db_path)
-                .create_if_missing(true)
-                .foreign_keys(true)
-                .journal_mode(SqliteJournalMode::Wal)
-                .busy_timeout(Duration::from_secs(5));
+            // Open the SQLCipher-encrypted DB (key from the OS keychain) and run migrations,
+            // synchronously so the pool is managed BEFORE any command can run.
+            let pool = tauri::async_runtime::block_on(db::init_encrypted_db(&app_config_dir))
+                .expect("Failed to open the encrypted database");
 
-            let pool =
-                tauri::async_runtime::block_on(async { SqlitePool::connect_with(options).await })
-                    .expect("Failed to connect to database");
-
-            // The DB holds message history and is not encrypted at rest, so restrict it to
-            // the owner on Unix (other local accounts shouldn't be able to read it). The
-            // WAL/SHM sidecars carry data too; lock them and the parent dir down as well.
+            // The DB is encrypted, but lock the files down on Unix anyway (defense in depth):
+            // owner-only DB + sidecars + key file, and a 0700 parent dir.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::PermissionsExt;
@@ -102,6 +82,7 @@ pub fn run() {
                     db_path.clone(),
                     db_path.with_extension("db-wal"),
                     db_path.with_extension("db-shm"),
+                    app_config_dir.join("nutler.key"),
                 ] {
                     if p.exists() {
                         let _ =

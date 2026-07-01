@@ -32,37 +32,74 @@ fn key_pragma_value(hex: &str) -> String {
     format!("\"x'{}'\"", hex)
 }
 
-/// The 32-byte at-rest DB key as hex. Prefers the OS keychain; falls back to a 0600 key file
-/// beside the DB where no keychain is available (still keeps the key out of the DB file itself).
-fn db_key_hex(app_dir: &Path) -> String {
-    if let Ok(entry) = keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
-        if let Ok(k) = entry.get_password() {
-            if is_hex64(&k) {
-                return k;
-            }
-        }
-        let k = random_hex_key();
-        if entry.set_password(&k).is_ok() {
-            tracing::info!("Database key stored in the OS keychain");
-            return k;
-        }
-        tracing::warn!("OS keychain unavailable; falling back to a 0600 key file");
+/// Write the key to a 0600 file, created owner-only from the start (no world-readable window).
+fn write_key_file(path: &Path, k: &str) -> Result<(), String> {
+    #[cfg(unix)]
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| format!("couldn't create the key file: {e}"))?;
+        f.write_all(k.as_bytes())
+            .map_err(|e| format!("couldn't write the key file: {e}"))?;
     }
+    #[cfg(not(unix))]
+    {
+        std::fs::write(path, k).map_err(|e| format!("couldn't write the key file: {e}"))?;
+    }
+    Ok(())
+}
 
+/// Load the existing 32-byte at-rest DB key (hex), or create one on genuine first use.
+///
+/// DATA-SAFETY: the key must NEVER be silently regenerated when a real key might already exist,
+/// because the DB encrypted with the old key would then fail to decrypt and get reset (wiped).
+/// So we only generate a new key on a *definitive* "no key yet" (keychain `NoEntry`, or no key
+/// file and no keychain backend). A *transient* keychain failure (locked / access denied / DBus
+/// down) returns an error and aborts startup — the DB is preserved; the user unlocks and retries.
+/// A key file, once present, takes precedence (a machine that fell back to a file stays on it).
+fn load_or_create_key(app_dir: &Path) -> Result<String, String> {
     let key_path = app_dir.join("nutler.key");
     if let Ok(k) = std::fs::read_to_string(&key_path) {
         if is_hex64(k.trim()) {
-            return k.trim().to_string();
+            return Ok(k.trim().to_string());
         }
     }
-    let k = random_hex_key();
-    let _ = std::fs::write(&key_path, &k);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600));
+
+    match keyring::Entry::new(KEYRING_SERVICE, KEYRING_USER) {
+        Ok(entry) => match entry.get_password() {
+            Ok(k) if is_hex64(&k) => Ok(k),
+            // Stored value is corrupt — the original is unrecoverable regardless, so regenerate.
+            Ok(_) | Err(keyring::Error::NoEntry) => {
+                let k = random_hex_key();
+                if entry.set_password(&k).is_ok() {
+                    tracing::info!("Database key created in the OS keychain");
+                    return Ok(k);
+                }
+                // Keychain present but unwritable → persist to a 0600 file instead.
+                tracing::warn!("OS keychain not writable; using a 0600 key file");
+                write_key_file(&key_path, &k)?;
+                Ok(k)
+            }
+            // Transient/locked/denied: do NOT regenerate (that would orphan + wipe a valid DB).
+            Err(e) => Err(format!(
+                "Couldn't access the OS keychain to unlock the database ({e}). \
+                 Make sure your login keychain is unlocked, then reopen Nutler."
+            )),
+        },
+        // No keychain backend at all → file-based key.
+        Err(_) => {
+            let k = random_hex_key();
+            tracing::warn!("No OS keychain available; using a 0600 key file for the DB key");
+            write_key_file(&key_path, &k)?;
+            Ok(k)
+        }
     }
-    k
 }
 
 fn base_opts(db_path: &Path, key_pragma: &str) -> SqliteConnectOptions {
@@ -140,9 +177,9 @@ pub async fn run_migrations(pool: &SqlitePool) -> Result<(), sqlx::Error> {
 
 /// Open the SQLCipher-encrypted DB (resetting an undecryptable one), run migrations, and return
 /// the FK-enforcing query pool the commands use.
-pub async fn init_encrypted_db(app_dir: &Path) -> Result<SqlitePool, sqlx::Error> {
+pub async fn init_encrypted_db(app_dir: &Path) -> Result<SqlitePool, String> {
     let db_path = app_dir.join("nutler.db");
-    let key_pragma = key_pragma_value(&db_key_hex(app_dir));
+    let key_pragma = key_pragma_value(&load_or_create_key(app_dir)?);
 
     if db_path.exists() && !can_decrypt(&db_path, &key_pragma).await {
         tracing::warn!("Existing database can't be decrypted — resetting to a fresh encrypted DB");
@@ -155,12 +192,17 @@ pub async fn init_encrypted_db(app_dir: &Path) -> Result<SqlitePool, sqlx::Error
         let mig_pool = SqlitePoolOptions::new()
             .max_connections(1)
             .connect_with(base_opts(&db_path, &key_pragma).foreign_keys(false))
-            .await?;
-        run_migrations(&mig_pool).await?;
+            .await
+            .map_err(|e| format!("open DB for migrations: {e}"))?;
+        run_migrations(&mig_pool)
+            .await
+            .map_err(|e| format!("run migrations: {e}"))?;
         mig_pool.close().await;
     }
 
-    SqlitePool::connect_with(base_opts(&db_path, &key_pragma).foreign_keys(true)).await
+    SqlitePool::connect_with(base_opts(&db_path, &key_pragma).foreign_keys(true))
+        .await
+        .map_err(|e| format!("open query pool: {e}"))
 }
 
 #[cfg(test)]
@@ -197,6 +239,28 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(after as usize, count);
+    }
+
+    #[test]
+    fn existing_key_file_is_reused_never_regenerated() {
+        // Data-safety: when a key already exists (here, the file — which takes precedence over
+        // the keychain), load_or_create_key must return it verbatim and NEVER mint a new one.
+        let mut sfx = [0u8; 8];
+        getrandom::getrandom(&mut sfx).unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "nutler-keytest-{}",
+            sfx.iter().map(|b| format!("{:02x}", b)).collect::<String>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let existing = "ab".repeat(32);
+        std::fs::write(dir.join("nutler.key"), &existing).unwrap();
+
+        let k1 = load_or_create_key(&dir).unwrap();
+        let k2 = load_or_create_key(&dir).unwrap();
+        assert_eq!(k1, existing);
+        assert_eq!(k2, existing); // stable across calls — no regeneration
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

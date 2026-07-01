@@ -65,9 +65,13 @@ pub fn run() {
             let db_path = app_config_dir.join("nutler.db");
 
             // Open the SQLCipher-encrypted DB (key from the OS keychain) and run migrations,
-            // synchronously so the pool is managed BEFORE any command can run.
-            let pool = tauri::async_runtime::block_on(db::init_encrypted_db(&app_config_dir))
-                .expect("Failed to open the encrypted database");
+            // synchronously so the pool is managed BEFORE any command can run. A locked/denied
+            // keychain aborts here rather than regenerating the key (which would wipe the DB).
+            let pool = match tauri::async_runtime::block_on(db::init_encrypted_db(&app_config_dir))
+            {
+                Ok(pool) => pool,
+                Err(e) => panic!("Database initialization failed: {e}"),
+            };
 
             // The DB is encrypted, but lock the files down on Unix anyway (defense in depth):
             // owner-only DB + sidecars + key file, and a 0700 parent dir.

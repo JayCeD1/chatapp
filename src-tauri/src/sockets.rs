@@ -27,6 +27,39 @@ const MAX_FRAME_BYTES: usize = 10 * 1024 * 1024;
 /// Maximum number of client connections a host will handle concurrently.
 const MAX_CONCURRENT_CLIENTS: usize = 256;
 
+/// Per-connection inbound message rate limit: sustained messages/sec, with a burst allowance.
+/// Generous for a human sender; a flood is dropped.
+const RATE_LIMIT_PER_SEC: f64 = 10.0;
+const RATE_LIMIT_BURST: f64 = 20.0;
+
+/// Token-bucket rate limiter. `allow(now)` refills by elapsed time and consumes a token,
+/// returning false when the bucket is empty (caller drops the message).
+struct RateLimiter {
+    tokens: f64,
+    last: tokio::time::Instant,
+}
+
+impl RateLimiter {
+    fn new(now: tokio::time::Instant) -> Self {
+        Self {
+            tokens: RATE_LIMIT_BURST,
+            last: now,
+        }
+    }
+
+    fn allow(&mut self, now: tokio::time::Instant) -> bool {
+        self.tokens = (self.tokens
+            + now.duration_since(self.last).as_secs_f64() * RATE_LIMIT_PER_SEC)
+            .min(RATE_LIMIT_BURST);
+        self.last = now;
+        if self.tokens < 1.0 {
+            return false;
+        }
+        self.tokens -= 1.0;
+        true
+    }
+}
+
 /// Maximum length (in characters) of a single chat message.
 const MAX_MESSAGE_CHARS: usize = 4000;
 
@@ -693,6 +726,10 @@ async fn handle_client_connection(
     // Keep the connection alive and let the read-timeout below detect a dead peer.
     let heartbeat = spawn_heartbeat(Arc::clone(&writer_arc));
 
+    // Per-connection inbound rate limit (token bucket): a burst allowance that refills at a
+    // sustained rate, so one peer can't flood the host with messages.
+    let mut rate_limiter = RateLimiter::new(tokio::time::Instant::now());
+
     let mut client_info: Option<ClientConnection> = None;
     loop {
         // Read one encrypted frame (capped at MAX_FRAME_BYTES), then decrypt it.
@@ -735,6 +772,16 @@ async fn handle_client_connection(
                         break;
                     }
                 };
+
+                // Rate-limit: drop the frame if this connection is over its message budget.
+                if !rate_limiter.allow(tokio::time::Instant::now()) {
+                    tracing::warn!(
+                        "Rate limit exceeded by {}; dropping {:?}",
+                        peer_addr,
+                        message.message_type
+                    );
+                    continue;
+                }
 
                 //Handle client registration
                 if message.message_type == MessageType::Connect {
@@ -3032,5 +3079,31 @@ mod discovery_tests {
         assert_eq!(info.port, 3625);
         assert_eq!(info.user_count, 3);
         server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod rate_limit_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn allows_burst_then_throttles_then_refills() {
+        let t0 = tokio::time::Instant::now();
+        let mut rl = RateLimiter::new(t0);
+        // The full burst is allowed at a single instant...
+        for _ in 0..(RATE_LIMIT_BURST as usize) {
+            assert!(rl.allow(t0));
+        }
+        // ...then the bucket is empty and further messages are dropped.
+        assert!(!rl.allow(t0));
+
+        // After one second, ~RATE_LIMIT_PER_SEC tokens have refilled — but no more.
+        let t1 = t0 + Duration::from_secs(1);
+        let mut allowed = 0;
+        while rl.allow(t1) {
+            allowed += 1;
+        }
+        assert_eq!(allowed, RATE_LIMIT_PER_SEC as usize);
     }
 }

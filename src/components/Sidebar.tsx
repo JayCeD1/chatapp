@@ -8,6 +8,7 @@ import {
   Plus,
   Search,
   MessageSquare,
+  Settings,
 } from "lucide-react";
 import {
   ChatRoom,
@@ -18,10 +19,12 @@ import {
 } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
 import { Theme } from "../hooks/useTheme";
+import { Preferences } from "../preferences";
 import { initials, avatarColor } from "../utils";
 import { CreateChannelModal } from "./CreateChannelModal";
 import { SearchModal } from "./SearchModal";
 import { NewDmModal } from "./NewDmModal";
+import { SettingsModal } from "./SettingsModal";
 
 interface SidebarProps {
   departments: Department[];
@@ -44,6 +47,8 @@ interface SidebarProps {
   onLogout: () => void;
   theme: Theme;
   onToggleTheme: () => void;
+  preferences: Preferences;
+  onSetPreferences: (patch: Partial<Preferences>) => void;
 }
 
 const statusMeta: Record<ConnectionStatus, { color: string; label: string }> = {
@@ -68,10 +73,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onLogout,
   theme,
   onToggleTheme,
+  preferences,
+  onSetPreferences,
 }) => {
   const [showCreate, setShowCreate] = useState(false);
   const [showSearch, setShowSearch] = useState(false);
   const [showNewDm, setShowNewDm] = useState(false);
+  const [showSettings, setShowSettings] = useState(false);
 
   // DMs live in their own section; channels are grouped by department.
   const channels = chatRooms.filter((r) => !r.is_dm);
@@ -273,6 +281,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
           )}
         </button>
         <button
+          onClick={() => setShowSettings(true)}
+          title="Settings"
+          aria-label="Settings"
+          className="p-2 rounded-md text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] transition-colors"
+        >
+          <Settings className="w-4 h-4" />
+        </button>
+        <button
           onClick={onLogout}
           title="Log out"
           aria-label="Log out"
@@ -307,6 +323,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
           selfName={currentUser.name}
           onStart={onCreateDm}
           onClose={() => setShowNewDm(false)}
+        />
+      )}
+
+      {showSettings && (
+        <SettingsModal
+          theme={theme}
+          onToggleTheme={onToggleTheme}
+          preferences={preferences}
+          onSetPreferences={onSetPreferences}
+          onClose={() => setShowSettings(false)}
         />
       )}
     </aside>

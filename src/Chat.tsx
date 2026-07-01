@@ -60,6 +60,8 @@ const Chat = () => {
       onDismissError={c.dismissError}
       theme={theme}
       onToggleTheme={toggleTheme}
+      preferences={c.preferences}
+      onSetPreferences={c.setPreferences}
     />
   );
 };

@@ -17,6 +17,7 @@ import {
 import { mentionsUser } from "../utils";
 import { notify, ensureNotificationPermission } from "../notifications";
 import { loadProfile, saveProfile } from "../session";
+import { loadPreferences, savePreferences, Preferences } from "../preferences";
 
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
@@ -66,6 +67,10 @@ export const useChatConnection = () => {
   );
   const [serverIp, setServerIp] = useState(
     () => loadProfile().serverIp ?? "127.0.0.1:3625",
+  );
+  // Persisted app preferences (notification level, send-on-Enter).
+  const [preferences, setPreferencesState] = useState<Preferences>(() =>
+    loadPreferences(),
   );
 
   const [currentUser, setCurrentUser] = useState<User | null>(null);
@@ -133,6 +138,17 @@ export const useChatConnection = () => {
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
+  // The notification gate lives in the once-registered ingest callback, so read prefs via a ref;
+  // persist on change here too (keeping the state updater pure — like useTheme).
+  const preferencesRef = useRef(preferences);
+  useEffect(() => {
+    preferencesRef.current = preferences;
+    savePreferences(preferences);
+  }, [preferences]);
+  // Merge a preference change (persistence happens in the effect above).
+  const setPreferences = useCallback((patch: Partial<Preferences>) => {
+    setPreferencesState((prev) => ({ ...prev, ...patch }));
+  }, []);
   // Always-fresh handle to joinRoom so the (stable) ingest callback can open a DM the host
   // just created (DmReady) without capturing a stale joinRoom closure.
   const joinRoomRef = useRef<((room: ChatRoom) => Promise<void>) | null>(null);
@@ -478,8 +494,9 @@ export const useChatConnection = () => {
       return { ...prev, [nm.room]: [...list, nm] };
     });
 
-    // Desktop notification for chat messages from others, when the window isn't
-    // focused or we've been @-mentioned.
+    // Desktop notification for chat messages from others, gated by the user's preference:
+    //   off      → never; mentions → only when @-mentioned;
+    //   all      → when the window isn't focused, or we've been @-mentioned.
     const me = currentUserRef.current;
     if (
       me &&
@@ -487,7 +504,14 @@ export const useChatConnection = () => {
       nm.username !== me.name
     ) {
       const mentioned = mentionsUser(nm.message, me.name);
-      if (!document.hasFocus() || mentioned) {
+      const level = preferencesRef.current.notifications;
+      const shouldNotify =
+        level === "off"
+          ? false
+          : level === "mentions"
+            ? mentioned
+            : !document.hasFocus() || mentioned;
+      if (shouldNotify) {
         notify(`#${nm.room}`, `${nm.username}: ${nm.message}`);
       }
     }
@@ -1166,6 +1190,8 @@ export const useChatConnection = () => {
     directory,
     addMember,
     createDm,
+    preferences,
+    setPreferences,
     canonicalUserId,
     currentUser,
     currentRoom,

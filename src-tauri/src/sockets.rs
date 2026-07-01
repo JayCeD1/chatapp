@@ -173,6 +173,9 @@ pub struct AppState {
     pub current_room: tokio::sync::RwLock<String>,
     pub current_room_id: tokio::sync::RwLock<Option<u64>>,
     pub server_addr: tokio::sync::RwLock<Option<SocketAddr>>,
+    // The query pool, set once at startup — lets broadcast-time eviction reach clean_client
+    // without threading the pool through every distribute_message_to_all call site.
+    pub pool: std::sync::OnceLock<SqlitePool>,
 }
 
 /// Wire-protocol version of the message envelope. Bump when the envelope/payload format
@@ -927,68 +930,93 @@ async fn clean_client(
 }
 
 // ENHANCED MESSAGE DISTRIBUTION - Handles both network + local UI now async to await tokio locks
-async fn distribute_message_to_all(
-    app: &tauri::AppHandle,
-    state: &Arc<AppState>,
-    target_room: &str,
-    message: &Message,
+// Returns a boxed future (rather than `async fn`) so its return type is concrete, not opaque:
+// the eviction path below spawns `clean_client`, which broadcasts via this function — a mutual
+// async recursion that an opaque `async fn` return type can't resolve (`Send`/opaque cycle).
+fn distribute_message_to_all<'a>(
+    app: &'a tauri::AppHandle,
+    state: &'a Arc<AppState>,
+    target_room: &'a str,
+    message: &'a Message,
     exclude_user_id: Option<u64>,
-) {
-    // Briefly hold the collection locks to snapshot the target writers, then release ALL
-    // locks before any network I/O or emit (avoids holding mutexes across .await fan-out).
-    type Target = (
-        Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
-        Arc<tokio::sync::Mutex<TransportState>>,
-        String,
-        u64,
-    );
-    let targets: Vec<Target> = {
-        let streams = state.server_streams.lock().await;
-        let room_clients = state.room_clients.lock().await;
-        let mut v = Vec::new();
-        if let Some(user_ids) = room_clients.get(target_room) {
-            for &user_id in user_ids {
-                //Skip the excluded user (usually the sender)
-                if Some(user_id) == exclude_user_id {
-                    continue;
-                }
-                // NOTE: we intentionally do NOT skip "the server's own user_id" here. The
-                // host is never in server_streams, so a host-id lookup below already returns
-                // None (no network send). But user_ids are assigned by each instance's local
-                // DB and so collide across machines — a client can legitimately share the
-                // host's id, and `streams.get` then resolves to that real client. Skipping by
-                // id dropped such a client from delivery (they could send but never receive).
-                if let Some(conn) = streams.get(&user_id) {
-                    v.push((
-                        Arc::clone(&conn.writer),
-                        Arc::clone(&conn.transport),
-                        conn.username.clone(),
-                        user_id,
-                    ));
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send + 'a>> {
+    Box::pin(async move {
+        // Briefly hold the collection locks to snapshot the target writers, then release ALL
+        // locks before any network I/O or emit (avoids holding mutexes across .await fan-out).
+        type Target = (
+            Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+            Arc<tokio::sync::Mutex<TransportState>>,
+            String,
+            u64,
+            u64,
+        );
+        let targets: Vec<Target> = {
+            let streams = state.server_streams.lock().await;
+            let room_clients = state.room_clients.lock().await;
+            let mut v = Vec::new();
+            if let Some(user_ids) = room_clients.get(target_room) {
+                for &user_id in user_ids {
+                    //Skip the excluded user (usually the sender)
+                    if Some(user_id) == exclude_user_id {
+                        continue;
+                    }
+                    // NOTE: we intentionally do NOT skip "the server's own user_id" here. The
+                    // host is never in server_streams, so a host-id lookup below already returns
+                    // None (no network send). But user_ids are assigned by each instance's local
+                    // DB and so collide across machines — a client can legitimately share the
+                    // host's id, and `streams.get` then resolves to that real client. Skipping by
+                    // id dropped such a client from delivery (they could send but never receive).
+                    if let Some(conn) = streams.get(&user_id) {
+                        v.push((
+                            Arc::clone(&conn.writer),
+                            Arc::clone(&conn.transport),
+                            conn.username.clone(),
+                            user_id,
+                            conn.conn_id,
+                        ));
+                    }
                 }
             }
-        }
-        v
-    }; // locks released here
+            v
+        }; // locks released here
 
-    tracing::info!("📡 Broadcasting to {} network clients", targets.len());
-    for (writer, transport, username, user_id) in targets {
-        let msg = message.clone();
-        tauri::async_runtime::spawn(async move {
-            match send_secure(&writer, &transport, &msg).await {
-                Ok(_) => tracing::info!(" ✅ Sent to {} ({})", username, user_id),
-                Err(e) => tracing::info!("   ❌ Failed to send to {}: {}", username, e),
-            }
-        });
-    }
-    // 2. ALWAYS send it to local UI (this machine's interface)
-    match serde_json::to_string(message) {
-        Ok(payload) => match app.emit("message", payload) {
-            Ok(_) => tracing::info!("📱 Emitted to local UI successfully"),
-            Err(e) => tracing::error!("📱 Failed to emit to local UI: {}", e),
-        },
-        Err(e) => tracing::error!("📱 Failed to serialize message for local UI: {}", e),
-    }
+        tracing::info!("📡 Broadcasting to {} network clients", targets.len());
+        // Pool for eviction (set once at startup); cloned per failed send.
+        let evict_pool = state.pool.get().cloned();
+        for (writer, transport, username, user_id, conn_id) in targets {
+            let msg = message.clone();
+            let state = Arc::clone(state);
+            let app = app.clone();
+            let evict_pool = evict_pool.clone();
+            tauri::async_runtime::spawn(async move {
+                match send_secure(&writer, &transport, &msg).await {
+                    Ok(_) => tracing::info!(" ✅ Sent to {} ({})", username, user_id),
+                    Err(e) => {
+                        // A send failure means the socket is broken → evict the ghost now, instead
+                        // of waiting for the read side to notice at READ_TIMEOUT. clean_client is
+                        // idempotent (compare-and-remove by conn_id), so a live reconnect is safe.
+                        tracing::info!(
+                            "   ❌ Failed to send to {} ({}): {}; evicting",
+                            username,
+                            user_id,
+                            e
+                        );
+                        if let Some(pool) = evict_pool {
+                            let _ = clean_client(&state, &app, user_id, conn_id, &pool).await;
+                        }
+                    }
+                }
+            });
+        }
+        // 2. ALWAYS send it to local UI (this machine's interface)
+        match serde_json::to_string(message) {
+            Ok(payload) => match app.emit("message", payload) {
+                Ok(_) => tracing::info!("📱 Emitted to local UI successfully"),
+                Err(e) => tracing::error!("📱 Failed to emit to local UI: {}", e),
+            },
+            Err(e) => tracing::error!("📱 Failed to serialize message for local UI: {}", e),
+        }
+    })
 }
 
 /// Build the list of usernames currently present in `room` (server truth, from the

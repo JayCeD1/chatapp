@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.4.0] - 2026-07-01
+
+### Security
+
+- **Database encrypted at rest (SQLCipher).** The local database — messages and
+  emails — is now encrypted on disk with SQLCipher, keyed by a random key stored
+  in your OS keychain (with a locked-down key-file fallback where no keychain is
+  available). On upgrade from an older unencrypted build the local database is
+  reset to a fresh encrypted one.
+
 ## [0.3.0] - 2026-07-01
 
 ### Added

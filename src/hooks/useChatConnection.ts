@@ -138,18 +138,16 @@ export const useChatConnection = () => {
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
-  // The notification gate lives in the once-registered ingest callback, so read prefs via a ref.
+  // The notification gate lives in the once-registered ingest callback, so read prefs via a ref;
+  // persist on change here too (keeping the state updater pure — like useTheme).
   const preferencesRef = useRef(preferences);
   useEffect(() => {
     preferencesRef.current = preferences;
+    savePreferences(preferences);
   }, [preferences]);
-  // Merge + persist a preference change.
+  // Merge a preference change (persistence happens in the effect above).
   const setPreferences = useCallback((patch: Partial<Preferences>) => {
-    setPreferencesState((prev) => {
-      const next = { ...prev, ...patch };
-      savePreferences(next);
-      return next;
-    });
+    setPreferencesState((prev) => ({ ...prev, ...patch }));
   }, []);
   // Always-fresh handle to joinRoom so the (stable) ingest callback can open a DM the host
   // just created (DmReady) without capturing a stale joinRoom closure.

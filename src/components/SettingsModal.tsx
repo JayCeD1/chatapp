@@ -71,7 +71,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </h3>
             <div
               className="bg-[var(--surface-2)] p-1 rounded-xl flex"
-              role="group"
+              role="radiogroup"
               aria-label="Theme"
             >
               <ThemeOption
@@ -193,7 +193,8 @@ const ThemeOption: React.FC<{
 }> = ({ icon, label, active, onClick }) => (
   <button
     type="button"
-    aria-pressed={active}
+    role="radio"
+    aria-checked={active}
     onClick={onClick}
     className={`flex-1 flex items-center justify-center gap-1.5 py-2 rounded-lg text-sm font-medium transition-colors ${
       active

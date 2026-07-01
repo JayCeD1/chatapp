@@ -38,10 +38,10 @@ describe("SettingsModal", () => {
     const user = userEvent.setup();
     const { onToggleTheme } = renderSettings();
     // We're in dark mode; picking Light toggles.
-    await user.click(screen.getByRole("button", { name: /light/i }));
+    await user.click(screen.getByRole("radio", { name: /light/i }));
     expect(onToggleTheme).toHaveBeenCalledTimes(1);
     // Picking the already-active Dark option does nothing.
-    await user.click(screen.getByRole("button", { name: /^dark$/i }));
+    await user.click(screen.getByRole("radio", { name: /^dark$/i }));
     expect(onToggleTheme).toHaveBeenCalledTimes(1);
   });
 

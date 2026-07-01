@@ -11,8 +11,8 @@ export interface Preferences {
   //   mentions — notify only when @mentioned
   //   off      — never notify
   notifications: NotificationMode;
-  // true: Enter sends (Shift+Enter reserved). false: Enter does nothing (avoids accidental
-  // sends); Cmd/Ctrl+Enter always sends in either mode.
+  // true: Enter sends (Shift+Enter does not). false: Enter does nothing (avoids accidental
+  // sends). Cmd/Ctrl+Enter always sends in either mode.
   sendOnEnter: boolean;
 }
 

@@ -232,8 +232,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (e.key !== "Enter") return;
-    // Cmd/Ctrl+Enter always sends. Plain Enter sends only when the preference is on (and never
-    // with Shift, which stays reserved). When off, Enter does nothing (avoids accidental sends).
+    // Cmd/Ctrl+Enter always sends. Plain Enter sends only when the preference is on; Shift+Enter
+    // never sends. When the preference is off, Enter does nothing (avoids accidental sends).
     const send = e.metaKey || e.ctrlKey || (sendOnEnter && !e.shiftKey);
     if (send) {
       e.preventDefault();

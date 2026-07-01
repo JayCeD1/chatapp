@@ -17,7 +17,8 @@ import {
 import { mentionsUser, errText } from "../utils";
 import { notify, ensureNotificationPermission } from "../notifications";
 import { loadProfile, saveProfile } from "../session";
-import { loadPreferences, savePreferences, Preferences } from "../preferences";
+import { usePreferences } from "./usePreferences";
+import { useMessageStore } from "./useMessageStore";
 
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
 
@@ -68,46 +69,38 @@ export const useChatConnection = () => {
   const [serverIp, setServerIp] = useState(
     () => loadProfile().serverIp ?? "127.0.0.1:3625",
   );
-  // Persisted app preferences (notification level, send-on-Enter).
-  const [preferences, setPreferencesState] = useState<Preferences>(() =>
-    loadPreferences(),
-  );
+  // Persisted app preferences (notification level, send-on-Enter) — own hook.
+  const { preferences, setPreferences, preferencesRef } = usePreferences();
 
   const [currentUser, setCurrentUser] = useState<User | null>(null);
   const [currentRoom, setCurrentRoom] = useState<ChatRoom | null>(null);
 
   const [departments, setDepartments] = useState<Department[]>([]);
   const [chatRooms, setChatRooms] = useState<ChatRoom[]>([]);
-  // Per-room message store, keyed by room name (what messages carry on the wire).
-  const [messagesByRoom, setMessagesByRoom] = useState<
-    Record<string, Message[]>
-  >({});
-  // Live roster per room (server truth via UserList messages), keyed by room name.
-  const [membersByRoom, setMembersByRoom] = useState<Record<string, string[]>>(
-    {},
-  );
-  // Whether older history may still exist per room (false once a short page returns).
-  const [hasMoreByRoom, setHasMoreByRoom] = useState<Record<string, boolean>>(
-    {},
-  );
-  // Reactions keyed by target message_id.
-  const [reactionsByMessage, setReactionsByMessage] = useState<
-    Record<string, Reaction[]>
-  >({});
+  // Per-room message data (messages, roster, reactions, unread, typing, loading/pagination) —
+  // own hook. The connection logic below still owns ingest + actions and drives these setters.
+  const {
+    messagesByRoom,
+    setMessagesByRoom,
+    membersByRoom,
+    setMembersByRoom,
+    hasMoreByRoom,
+    setHasMoreByRoom,
+    reactionsByMessage,
+    setReactionsByMessage,
+    loadingByRoom,
+    setLoadingByRoom,
+    typingByRoom,
+    setTypingByRoom,
+    unreadByRoom,
+    setUnreadByRoom,
+    messagesByRoomRef,
+    messages,
+    reset: resetMessageStore,
+  } = useMessageStore(currentRoom);
   const [connectionStatus, setConnectionStatus] =
     useState<ConnectionStatus>("connected");
   const [error, setError] = useState<string | null>(null);
-  // Per-room loading state — a single global flag would let one room's history
-  // arrival clear another room's spinner (or get stuck if its push never comes).
-  const [loadingByRoom, setLoadingByRoom] = useState<Record<string, boolean>>(
-    {},
-  );
-  // Ephemeral "who is typing" per room: userId → { username, last-seen ms }.
-  const [typingByRoom, setTypingByRoom] = useState<
-    Record<string, Record<number, { username: string; at: number }>>
-  >({});
-  // Unread message counts per room id (host computes them; client gets pushes).
-  const [unreadByRoom, setUnreadByRoom] = useState<Record<number, number>>({});
   // User directory (host pushes it) for the invite + DM pickers.
   const [directory, setDirectory] = useState<DirectoryUser[]>([]);
   // The host-assigned canonical id for THIS user (client mode). Our local id differs from it,
@@ -130,395 +123,369 @@ export const useChatConnection = () => {
   useEffect(() => {
     currentRoomRef.current = currentRoom;
   }, [currentRoom]);
-  const messagesByRoomRef = useRef(messagesByRoom);
-  useEffect(() => {
-    messagesByRoomRef.current = messagesByRoom;
-  }, [messagesByRoom]);
   const currentUserRef = useRef<User | null>(null);
   useEffect(() => {
     currentUserRef.current = currentUser;
   }, [currentUser]);
-  // The notification gate lives in the once-registered ingest callback, so read prefs via a ref;
-  // persist on change here too (keeping the state updater pure — like useTheme).
-  const preferencesRef = useRef(preferences);
-  useEffect(() => {
-    preferencesRef.current = preferences;
-    savePreferences(preferences);
-  }, [preferences]);
-  // Merge a preference change (persistence happens in the effect above).
-  const setPreferences = useCallback((patch: Partial<Preferences>) => {
-    setPreferencesState((prev) => ({ ...prev, ...patch }));
-  }, []);
   // Always-fresh handle to joinRoom so the (stable) ingest callback can open a DM the host
   // just created (DmReady) without capturing a stale joinRoom closure.
   const joinRoomRef = useRef<((room: ChatRoom) => Promise<void>) | null>(null);
 
-  // Expire stale typing entries (>5s) so a dropped "stop" can't pin an indicator on.
-  // Returns the same reference when nothing changed, so idle rooms don't re-render.
-  useEffect(() => {
-    const id = setInterval(() => {
-      setTypingByRoom((prev) => {
-        const now = Date.now();
-        let changed = false;
-        const next: typeof prev = {};
-        for (const room in prev) {
-          const keep: Record<number, { username: string; at: number }> = {};
-          for (const uid in prev[room]) {
-            const e = prev[room][uid as unknown as number];
-            if (now - e.at < 5000) keep[uid as unknown as number] = e;
-            else changed = true;
-          }
-          if (Object.keys(keep).length) next[room] = keep;
-          else if (Object.keys(prev[room]).length) changed = true;
-        }
-        return changed ? next : prev;
-      });
-    }, 2000);
-    return () => clearInterval(id);
-  }, []);
-
   const PAGE_SIZE = 50;
-
-  // Active room's messages, derived from the store.
-  const messages = currentRoom ? messagesByRoom[currentRoom.name] || [] : [];
 
   // Route an incoming message into the per-room store (deduped); UserList updates the
   // live roster instead of appearing as a chat message.
-  const ingestMessage = useCallback((m: any) => {
-    const nm = normalizeMessage(m);
+  const ingestMessage = useCallback(
+    (m: any) => {
+      const nm = normalizeMessage(m);
 
-    // Authoritative per-room unread counts (room_id → count). Handled BEFORE the
-    // room-required guard below, because this frame intentionally carries no room.
-    if (nm.message_type === "UnreadCounts") {
-      try {
-        const arr = JSON.parse(nm.message) as {
-          room_id: number;
-          count: number;
-        }[];
-        const next: Record<number, number> = {};
-        for (const u of arr) next[u.room_id] = u.count;
-        setUnreadByRoom(next);
-      } catch (err) {
-        console.error("Bad unread payload:", err);
-      }
-      return;
-    }
-
-    // Host-pushed user directory (for invite/DM pickers). No room.
-    if (nm.message_type === "UserDirectory") {
-      try {
-        setDirectory(JSON.parse(nm.message) as DirectoryUser[]);
-      } catch (err) {
-        console.error("Bad directory payload:", err);
-      }
-      return;
-    }
-
-    // Host-side failure of one of our requests (e.g. duplicate channel name) → surface it.
-    if (nm.message_type === "ErrorNotice") {
-      if (nm.message) setError(nm.message);
-      return;
-    }
-
-    // Host tells us our canonical id (client mode) so we can recognise our own messages.
-    if (nm.message_type === "Identity") {
-      canonicalUserIdRef.current = nm.user_id;
-      setCanonicalUserId(nm.user_id);
-      return;
-    }
-
-    // Host-pushed authoritative room list (client mode): our channels + the private rooms /
-    // DMs we belong to, which aren't in our local DB. Replaces the local list outright.
-    if (nm.message_type === "RoomList") {
-      try {
-        setChatRooms(JSON.parse(nm.message) as ChatRoom[]);
-      } catch (err) {
-        console.error("Bad room list payload:", err);
-      }
-      return;
-    }
-
-    // Host opened/created the DM we requested (client mode): add it to the list and switch to it.
-    if (nm.message_type === "DmReady") {
-      try {
-        const room = JSON.parse(nm.message) as ChatRoom;
-        setChatRooms((prev) =>
-          prev.some((r) => r.id === room.id)
-            ? prev.map((r) => (r.id === room.id ? room : r))
-            : [...prev, room],
-        );
-        void joinRoomRef.current?.(room);
-      } catch (err) {
-        console.error("Bad DmReady payload:", err);
-      }
-      return;
-    }
-
-    if (!nm.room) return;
-
-    // Host → client scrollback: a JSON batch of {messages, reactions} for a room.
-    if (nm.message_type === "HistoryResponse") {
-      try {
-        const batch = JSON.parse(nm.message) as {
-          messages: any[];
-          reactions: any[];
-        };
-        const msgs = (batch.messages || []).map((m) =>
-          normalizeMessage({ ...m, room: nm.room }),
-        );
-        // Merge, not replace. A live Chat/Edit/Delete can land in the gap between
-        // the host snapshotting history and this push arriving:
-        //  - a brand-new live message at/after the snapshot's newest is kept;
-        //  - a live edit/delete to a snapshotted message wins over the stale
-        //    snapshot copy (so the gap mutation isn't reverted);
-        //  - older live extras are stale and intentionally discarded.
-        // Sort by id (the host's authoritative order) and fall back to created_at
-        // only for live, id-less rows.
-        setMessagesByRoom((prev) => {
-          const existing = prev[nm.room] || [];
-          const newest = msgs.length ? msgs[msgs.length - 1].created_at : "";
-          const byId = new Map<string, Message>();
-          for (const m of msgs) if (m.message_id) byId.set(m.message_id, m);
-          for (const m of existing) {
-            if (!m.message_id) continue;
-            const snap = byId.get(m.message_id);
-            if (!snap) {
-              if (m.created_at >= newest) byId.set(m.message_id, m); // raced-in live msg
-            } else {
-              const liveAdvanced =
-                (m.deleted_at && !snap.deleted_at) ||
-                (m.edited_at &&
-                  (!snap.edited_at || m.edited_at > snap.edited_at));
-              if (liveAdvanced)
-                byId.set(m.message_id, { ...m, id: m.id ?? snap.id });
-            }
-          }
-          const merged = [...byId.values()].sort((a, b) => {
-            if (a.id != null && b.id != null) return a.id - b.id;
-            return a.created_at < b.created_at
-              ? -1
-              : a.created_at > b.created_at
-                ? 1
-                : 0;
-          });
-          return { ...prev, [nm.room]: merged };
-        });
-        // A full page may have older messages behind it; clients page back via
-        // HistoryRequest (load-older), the host via its local DB.
-        setHasMoreByRoom((prev) => ({
-          ...prev,
-          [nm.room]: msgs.length >= PAGE_SIZE,
-        }));
-
-        const byMsg: Record<string, Reaction[]> = {};
-        for (const r of batch.reactions || []) {
-          (byMsg[r.message_id] ||= []).push({
-            emoji: r.emoji,
-            count: r.count,
-            me: r.me,
-          });
+      // Authoritative per-room unread counts (room_id → count). Handled BEFORE the
+      // room-required guard below, because this frame intentionally carries no room.
+      if (nm.message_type === "UnreadCounts") {
+        try {
+          const arr = JSON.parse(nm.message) as {
+            room_id: number;
+            count: number;
+          }[];
+          const next: Record<number, number> = {};
+          for (const u of arr) next[u.room_id] = u.count;
+          setUnreadByRoom(next);
+        } catch (err) {
+          console.error("Bad unread payload:", err);
         }
-        setReactionsByMessage((prev) => {
-          const next = { ...prev };
-          for (const m of msgs) {
-            if (m.message_id) next[m.message_id] = byMsg[m.message_id] || [];
-          }
-          return next;
-        });
-        setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
-      } catch (err) {
-        console.error("Bad history payload:", err);
-        setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
+        return;
       }
-      return;
-    }
 
-    // Host → client: an older page (response to a load-older request) — PREPEND it,
-    // deduped, then settle the pending loadOlder promise so the scroll can anchor.
-    if (nm.message_type === "HistoryPage") {
-      try {
-        const batch = JSON.parse(nm.message) as {
-          messages: any[];
-          reactions: any[];
-        };
-        const older = (batch.messages || []).map((m) =>
-          normalizeMessage({ ...m, room: nm.room }),
-        );
-        setMessagesByRoom((prev) => {
-          const existing = prev[nm.room] || [];
-          const seen = new Set(existing.map((x) => x.message_id));
-          const fresh = older.filter(
-            (x) => x.message_id && !seen.has(x.message_id),
+      // Host-pushed user directory (for invite/DM pickers). No room.
+      if (nm.message_type === "UserDirectory") {
+        try {
+          setDirectory(JSON.parse(nm.message) as DirectoryUser[]);
+        } catch (err) {
+          console.error("Bad directory payload:", err);
+        }
+        return;
+      }
+
+      // Host-side failure of one of our requests (e.g. duplicate channel name) → surface it.
+      if (nm.message_type === "ErrorNotice") {
+        if (nm.message) setError(nm.message);
+        return;
+      }
+
+      // Host tells us our canonical id (client mode) so we can recognise our own messages.
+      if (nm.message_type === "Identity") {
+        canonicalUserIdRef.current = nm.user_id;
+        setCanonicalUserId(nm.user_id);
+        return;
+      }
+
+      // Host-pushed authoritative room list (client mode): our channels + the private rooms /
+      // DMs we belong to, which aren't in our local DB. Replaces the local list outright.
+      if (nm.message_type === "RoomList") {
+        try {
+          setChatRooms(JSON.parse(nm.message) as ChatRoom[]);
+        } catch (err) {
+          console.error("Bad room list payload:", err);
+        }
+        return;
+      }
+
+      // Host opened/created the DM we requested (client mode): add it to the list and switch to it.
+      if (nm.message_type === "DmReady") {
+        try {
+          const room = JSON.parse(nm.message) as ChatRoom;
+          setChatRooms((prev) =>
+            prev.some((r) => r.id === room.id)
+              ? prev.map((r) => (r.id === room.id ? room : r))
+              : [...prev, room],
           );
-          return { ...prev, [nm.room]: [...fresh, ...existing] };
-        });
-        setHasMoreByRoom((prev) => ({
-          ...prev,
-          [nm.room]: older.length >= PAGE_SIZE,
-        }));
-        const byMsg: Record<string, Reaction[]> = {};
-        for (const r of batch.reactions || []) {
-          (byMsg[r.message_id] ||= []).push({
-            emoji: r.emoji,
-            count: r.count,
-            me: r.me,
-          });
+          void joinRoomRef.current?.(room);
+        } catch (err) {
+          console.error("Bad DmReady payload:", err);
         }
-        setReactionsByMessage((prev) => {
-          const next = { ...prev };
-          for (const m of older) {
-            if (m.message_id && next[m.message_id] === undefined) {
-              next[m.message_id] = byMsg[m.message_id] || [];
+        return;
+      }
+
+      if (!nm.room) return;
+
+      // Host → client scrollback: a JSON batch of {messages, reactions} for a room.
+      if (nm.message_type === "HistoryResponse") {
+        try {
+          const batch = JSON.parse(nm.message) as {
+            messages: any[];
+            reactions: any[];
+          };
+          const msgs = (batch.messages || []).map((m) =>
+            normalizeMessage({ ...m, room: nm.room }),
+          );
+          // Merge, not replace. A live Chat/Edit/Delete can land in the gap between
+          // the host snapshotting history and this push arriving:
+          //  - a brand-new live message at/after the snapshot's newest is kept;
+          //  - a live edit/delete to a snapshotted message wins over the stale
+          //    snapshot copy (so the gap mutation isn't reverted);
+          //  - older live extras are stale and intentionally discarded.
+          // Sort by id (the host's authoritative order) and fall back to created_at
+          // only for live, id-less rows.
+          setMessagesByRoom((prev) => {
+            const existing = prev[nm.room] || [];
+            const newest = msgs.length ? msgs[msgs.length - 1].created_at : "";
+            const byId = new Map<string, Message>();
+            for (const m of msgs) if (m.message_id) byId.set(m.message_id, m);
+            for (const m of existing) {
+              if (!m.message_id) continue;
+              const snap = byId.get(m.message_id);
+              if (!snap) {
+                if (m.created_at >= newest) byId.set(m.message_id, m); // raced-in live msg
+              } else {
+                const liveAdvanced =
+                  (m.deleted_at && !snap.deleted_at) ||
+                  (m.edited_at &&
+                    (!snap.edited_at || m.edited_at > snap.edited_at));
+                if (liveAdvanced)
+                  byId.set(m.message_id, { ...m, id: m.id ?? snap.id });
+              }
             }
+            const merged = [...byId.values()].sort((a, b) => {
+              if (a.id != null && b.id != null) return a.id - b.id;
+              return a.created_at < b.created_at
+                ? -1
+                : a.created_at > b.created_at
+                  ? 1
+                  : 0;
+            });
+            return { ...prev, [nm.room]: merged };
+          });
+          // A full page may have older messages behind it; clients page back via
+          // HistoryRequest (load-older), the host via its local DB.
+          setHasMoreByRoom((prev) => ({
+            ...prev,
+            [nm.room]: msgs.length >= PAGE_SIZE,
+          }));
+
+          const byMsg: Record<string, Reaction[]> = {};
+          for (const r of batch.reactions || []) {
+            (byMsg[r.message_id] ||= []).push({
+              emoji: r.emoji,
+              count: r.count,
+              me: r.me,
+            });
           }
-          return next;
-        });
-      } catch (err) {
-        console.error("Bad history page:", err);
-      } finally {
-        if (pendingOlderRef.current?.room === nm.room) {
-          pendingOlderRef.current.resolve();
-          pendingOlderRef.current = null;
+          setReactionsByMessage((prev) => {
+            const next = { ...prev };
+            for (const m of msgs) {
+              if (m.message_id) next[m.message_id] = byMsg[m.message_id] || [];
+            }
+            return next;
+          });
+          setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
+        } catch (err) {
+          console.error("Bad history payload:", err);
+          setLoadingByRoom((p) => ({ ...p, [nm.room]: false }));
         }
+        return;
       }
-      return;
-    }
 
-    // Ephemeral typing signal — is_emoji carries start(true)/stop(false). Ignore
-    // our own echo; entries also expire on a ticker in case a "stop" never arrives.
-    if (nm.message_type === "Typing") {
-      if (nm.user_id === currentUserRef.current?.id) return;
-      setTypingByRoom((prev) => {
-        const room = { ...(prev[nm.room] || {}) };
-        if (nm.is_emoji) {
-          room[nm.user_id] = { username: nm.username, at: Date.now() };
-        } else {
-          delete room[nm.user_id];
+      // Host → client: an older page (response to a load-older request) — PREPEND it,
+      // deduped, then settle the pending loadOlder promise so the scroll can anchor.
+      if (nm.message_type === "HistoryPage") {
+        try {
+          const batch = JSON.parse(nm.message) as {
+            messages: any[];
+            reactions: any[];
+          };
+          const older = (batch.messages || []).map((m) =>
+            normalizeMessage({ ...m, room: nm.room }),
+          );
+          setMessagesByRoom((prev) => {
+            const existing = prev[nm.room] || [];
+            const seen = new Set(existing.map((x) => x.message_id));
+            const fresh = older.filter(
+              (x) => x.message_id && !seen.has(x.message_id),
+            );
+            return { ...prev, [nm.room]: [...fresh, ...existing] };
+          });
+          setHasMoreByRoom((prev) => ({
+            ...prev,
+            [nm.room]: older.length >= PAGE_SIZE,
+          }));
+          const byMsg: Record<string, Reaction[]> = {};
+          for (const r of batch.reactions || []) {
+            (byMsg[r.message_id] ||= []).push({
+              emoji: r.emoji,
+              count: r.count,
+              me: r.me,
+            });
+          }
+          setReactionsByMessage((prev) => {
+            const next = { ...prev };
+            for (const m of older) {
+              if (m.message_id && next[m.message_id] === undefined) {
+                next[m.message_id] = byMsg[m.message_id] || [];
+              }
+            }
+            return next;
+          });
+        } catch (err) {
+          console.error("Bad history page:", err);
+        } finally {
+          if (pendingOlderRef.current?.room === nm.room) {
+            pendingOlderRef.current.resolve();
+            pendingOlderRef.current = null;
+          }
         }
-        return { ...prev, [nm.room]: room };
-      });
-      return;
-    }
-
-    if (nm.message_type === "UserList") {
-      try {
-        const names = JSON.parse(nm.message) as string[];
-        if (Array.isArray(names)) {
-          setMembersByRoom((prev) => ({ ...prev, [nm.room]: names }));
-        }
-      } catch {
-        // ignore malformed roster
+        return;
       }
-      return;
-    }
 
-    // Reaction: message_id = target, message = emoji, is_emoji = added(true)/removed.
-    if (nm.message_type === "Reaction") {
-      const target = nm.message_id;
-      const emoji = nm.message;
-      const added = !!nm.is_emoji;
-      // In client mode the echo carries the canonical id while our local id differs, so match
-      // either (the host tells us our canonical id via Identity).
-      const byMe =
-        nm.user_id === currentUserRef.current?.id ||
-        nm.user_id === canonicalUserIdRef.current;
-      if (!target || !emoji) return;
-      setReactionsByMessage((prev) => {
-        const list = (prev[target] || []).slice();
-        const idx = list.findIndex((r) => r.emoji === emoji);
-        if (added) {
-          if (idx >= 0) {
-            list[idx] = {
-              ...list[idx],
-              count: list[idx].count + 1,
-              me: list[idx].me || byMe,
-            };
+      // Ephemeral typing signal — is_emoji carries start(true)/stop(false). Ignore
+      // our own echo; entries also expire on a ticker in case a "stop" never arrives.
+      if (nm.message_type === "Typing") {
+        if (nm.user_id === currentUserRef.current?.id) return;
+        setTypingByRoom((prev) => {
+          const room = { ...(prev[nm.room] || {}) };
+          if (nm.is_emoji) {
+            room[nm.user_id] = { username: nm.username, at: Date.now() };
           } else {
-            list.push({ emoji, count: 1, me: byMe });
+            delete room[nm.user_id];
           }
-        } else if (idx >= 0) {
-          const count = list[idx].count - 1;
-          if (count <= 0) list.splice(idx, 1);
-          else
-            list[idx] = {
-              ...list[idx],
-              count,
-              me: byMe ? false : list[idx].me,
-            };
+          return { ...prev, [nm.room]: room };
+        });
+        return;
+      }
+
+      if (nm.message_type === "UserList") {
+        try {
+          const names = JSON.parse(nm.message) as string[];
+          if (Array.isArray(names)) {
+            setMembersByRoom((prev) => ({ ...prev, [nm.room]: names }));
+          }
+        } catch {
+          // ignore malformed roster
         }
-        return { ...prev, [target]: list };
-      });
-      return;
-    }
+        return;
+      }
 
-    // Edit/Delete carry the TARGET message id in message_id; mutate the existing row.
-    if (nm.message_type === "Edit" || nm.message_type === "Delete") {
-      const deleted = nm.message_type === "Delete";
+      // Reaction: message_id = target, message = emoji, is_emoji = added(true)/removed.
+      if (nm.message_type === "Reaction") {
+        const target = nm.message_id;
+        const emoji = nm.message;
+        const added = !!nm.is_emoji;
+        // In client mode the echo carries the canonical id while our local id differs, so match
+        // either (the host tells us our canonical id via Identity).
+        const byMe =
+          nm.user_id === currentUserRef.current?.id ||
+          nm.user_id === canonicalUserIdRef.current;
+        if (!target || !emoji) return;
+        setReactionsByMessage((prev) => {
+          const list = (prev[target] || []).slice();
+          const idx = list.findIndex((r) => r.emoji === emoji);
+          if (added) {
+            if (idx >= 0) {
+              list[idx] = {
+                ...list[idx],
+                count: list[idx].count + 1,
+                me: list[idx].me || byMe,
+              };
+            } else {
+              list.push({ emoji, count: 1, me: byMe });
+            }
+          } else if (idx >= 0) {
+            const count = list[idx].count - 1;
+            if (count <= 0) list.splice(idx, 1);
+            else
+              list[idx] = {
+                ...list[idx],
+                count,
+                me: byMe ? false : list[idx].me,
+              };
+          }
+          return { ...prev, [target]: list };
+        });
+        return;
+      }
+
+      // Edit/Delete carry the TARGET message id in message_id; mutate the existing row.
+      if (nm.message_type === "Edit" || nm.message_type === "Delete") {
+        const deleted = nm.message_type === "Delete";
+        setMessagesByRoom((prev) => {
+          const list = prev[nm.room];
+          if (!list) return prev;
+          return {
+            ...prev,
+            [nm.room]: list.map((m) =>
+              m.message_id && m.message_id === nm.message_id
+                ? deleted
+                  ? { ...m, message: "", deleted_at: new Date().toISOString() }
+                  : {
+                      ...m,
+                      message: nm.message,
+                      edited_at: new Date().toISOString(),
+                    }
+                : m,
+            ),
+          };
+        });
+        return;
+      }
+
       setMessagesByRoom((prev) => {
-        const list = prev[nm.room];
-        if (!list) return prev;
-        return {
-          ...prev,
-          [nm.room]: list.map((m) =>
-            m.message_id && m.message_id === nm.message_id
-              ? deleted
-                ? { ...m, message: "", deleted_at: new Date().toISOString() }
-                : {
-                    ...m,
-                    message: nm.message,
-                    edited_at: new Date().toISOString(),
-                  }
-              : m,
-          ),
-        };
+        const list = prev[nm.room] || [];
+        if (nm.message_id && list.some((p) => p.message_id === nm.message_id)) {
+          return prev;
+        }
+        const dup = list.some(
+          (p) =>
+            !p.message_id &&
+            p.message === nm.message &&
+            p.username === nm.username &&
+            Math.abs(
+              new Date(p.created_at).getTime() -
+                new Date(nm.created_at).getTime(),
+            ) < 1000,
+        );
+        if (dup) return prev;
+        return { ...prev, [nm.room]: [...list, nm] };
       });
-      return;
-    }
 
-    setMessagesByRoom((prev) => {
-      const list = prev[nm.room] || [];
-      if (nm.message_id && list.some((p) => p.message_id === nm.message_id)) {
-        return prev;
+      // Desktop notification for chat messages from others, gated by the user's preference:
+      //   off      → never; mentions → only when @-mentioned;
+      //   all      → when the window isn't focused, or we've been @-mentioned.
+      const me = currentUserRef.current;
+      if (
+        me &&
+        (nm.message_type === "Chat" || !nm.message_type) &&
+        nm.username !== me.name
+      ) {
+        const mentioned = mentionsUser(nm.message, me.name);
+        const level = preferencesRef.current.notifications;
+        const shouldNotify =
+          level === "off"
+            ? false
+            : level === "mentions"
+              ? mentioned
+              : !document.hasFocus() || mentioned;
+        if (shouldNotify) {
+          notify(`#${nm.room}`, `${nm.username}: ${nm.message}`);
+        }
       }
-      const dup = list.some(
-        (p) =>
-          !p.message_id &&
-          p.message === nm.message &&
-          p.username === nm.username &&
-          Math.abs(
-            new Date(p.created_at).getTime() -
-              new Date(nm.created_at).getTime(),
-          ) < 1000,
-      );
-      if (dup) return prev;
-      return { ...prev, [nm.room]: [...list, nm] };
-    });
-
-    // Desktop notification for chat messages from others, gated by the user's preference:
-    //   off      → never; mentions → only when @-mentioned;
-    //   all      → when the window isn't focused, or we've been @-mentioned.
-    const me = currentUserRef.current;
-    if (
-      me &&
-      (nm.message_type === "Chat" || !nm.message_type) &&
-      nm.username !== me.name
-    ) {
-      const mentioned = mentionsUser(nm.message, me.name);
-      const level = preferencesRef.current.notifications;
-      const shouldNotify =
-        level === "off"
-          ? false
-          : level === "mentions"
-            ? mentioned
-            : !document.hasFocus() || mentioned;
-      if (shouldNotify) {
-        notify(`#${nm.room}`, `${nm.username}: ${nm.message}`);
-      }
-    }
-    // Note: host unread badges are refreshed by the backend, which emits authoritative
-    // UnreadCounts to the local UI after each chat is persisted (handled above) — so no
-    // pre-save recompute here (it would read stale, pre-insert counts).
-  }, []);
+      // Note: host unread badges are refreshed by the backend, which emits authoritative
+      // UnreadCounts to the local UI after each chat is persisted (handled above) — so no
+      // pre-save recompute here (it would read stale, pre-insert counts).
+      // preferencesRef is a stable ref (from usePreferences); the store setters are stable
+      // useState setters (React guarantees it) — listed only so the exhaustive-deps linter can
+      // see through the useMessageStore boundary. None ever change identity, so the ingest
+      // callback stays referentially stable and the socket listener is still registered once.
+    },
+    [
+      preferencesRef,
+      setMessagesByRoom,
+      setMembersByRoom,
+      setHasMoreByRoom,
+      setReactionsByMessage,
+      setLoadingByRoom,
+      setTypingByRoom,
+      setUnreadByRoom,
+    ],
+  );
 
   // Load departments on mount.
   useEffect(() => {
@@ -548,50 +515,59 @@ export const useChatConnection = () => {
     }
   };
 
-  const loadRoomMessages = useCallback(async (room: ChatRoom) => {
-    setLoadingByRoom((prev) => ({ ...prev, [room.name]: true }));
-    try {
-      const msgs = (await invoke("get_room_messages", {
-        roomId: room.id,
-        limit: PAGE_SIZE,
-      })) as any[];
-      const normalized = msgs.map((m) => normalizeMessage(m, room.id));
-      setMessagesByRoom((prev) => ({ ...prev, [room.name]: normalized }));
-      setHasMoreByRoom((prev) => ({
-        ...prev,
-        [room.name]: normalized.length >= PAGE_SIZE,
-      }));
+  const loadRoomMessages = useCallback(
+    async (room: ChatRoom) => {
+      setLoadingByRoom((prev) => ({ ...prev, [room.name]: true }));
+      try {
+        const msgs = (await invoke("get_room_messages", {
+          roomId: room.id,
+          limit: PAGE_SIZE,
+        })) as any[];
+        const normalized = msgs.map((m) => normalizeMessage(m, room.id));
+        setMessagesByRoom((prev) => ({ ...prev, [room.name]: normalized }));
+        setHasMoreByRoom((prev) => ({
+          ...prev,
+          [room.name]: normalized.length >= PAGE_SIZE,
+        }));
 
-      // Seed reactions for this room.
-      const me = currentUserRef.current?.id ?? 0;
-      const reax = (await invoke("get_room_reactions", {
-        roomId: room.id,
-        userId: me,
-      })) as ReactionAggregate[];
-      const byMsg: Record<string, Reaction[]> = {};
-      for (const r of reax) {
-        (byMsg[r.message_id] ||= []).push({
-          emoji: r.emoji,
-          count: r.count,
-          me: r.me,
-        });
-      }
-      // Authoritative, room-scoped replace: set each loaded message's reactions to the
-      // aggregate (or [] if none) so emptied reactions can't leave phantom chips. A plain
-      // spread merge could never clear a key the aggregate no longer returns.
-      setReactionsByMessage((prev) => {
-        const next = { ...prev };
-        for (const m of normalized) {
-          if (m.message_id) next[m.message_id] = byMsg[m.message_id] || [];
+        // Seed reactions for this room.
+        const me = currentUserRef.current?.id ?? 0;
+        const reax = (await invoke("get_room_reactions", {
+          roomId: room.id,
+          userId: me,
+        })) as ReactionAggregate[];
+        const byMsg: Record<string, Reaction[]> = {};
+        for (const r of reax) {
+          (byMsg[r.message_id] ||= []).push({
+            emoji: r.emoji,
+            count: r.count,
+            me: r.me,
+          });
         }
-        return next;
-      });
-    } catch (err) {
-      console.error("Error loading messages:", err);
-    } finally {
-      setLoadingByRoom((prev) => ({ ...prev, [room.name]: false }));
-    }
-  }, []);
+        // Authoritative, room-scoped replace: set each loaded message's reactions to the
+        // aggregate (or [] if none) so emptied reactions can't leave phantom chips. A plain
+        // spread merge could never clear a key the aggregate no longer returns.
+        setReactionsByMessage((prev) => {
+          const next = { ...prev };
+          for (const m of normalized) {
+            if (m.message_id) next[m.message_id] = byMsg[m.message_id] || [];
+          }
+          return next;
+        });
+      } catch (err) {
+        console.error("Error loading messages:", err);
+      } finally {
+        setLoadingByRoom((prev) => ({ ...prev, [room.name]: false }));
+      }
+      // Store setters are stable useState setters (see ingest note); listed for exhaustive-deps.
+    },
+    [
+      setLoadingByRoom,
+      setMessagesByRoom,
+      setHasMoreByRoom,
+      setReactionsByMessage,
+    ],
+  );
 
   // Load the page of messages immediately older than the oldest one currently held
   // for the active room, and prepend them (deduped).
@@ -653,7 +629,8 @@ export const useChatConnection = () => {
     } catch (err) {
       console.error("Load older failed:", err);
     }
-  }, []);
+    // messagesByRoomRef + store setters are all stable; listed for exhaustive-deps.
+  }, [messagesByRoomRef, setHasMoreByRoom, setMessagesByRoom]);
 
   // Incoming-message listener — registered ONCE; routes every message to the store.
   // `active` guards the async gap: if this effect is torn down (e.g. StrictMode's
@@ -1151,10 +1128,7 @@ export const useChatConnection = () => {
 
     setCurrentUser(null);
     setCurrentRoom(null);
-    setMessagesByRoom({});
-    setMembersByRoom({});
-    setReactionsByMessage({});
-    setUnreadByRoom({});
+    resetMessageStore();
     setDirectory([]);
     setCanonicalUserId(null);
     canonicalUserIdRef.current = null;

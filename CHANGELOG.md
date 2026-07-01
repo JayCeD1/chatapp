@@ -7,6 +7,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-07-01
+
+### Added
+
+- **LAN host discovery.** "Find hosts on your network" on the login screen finds
+  Nutler hosts via a UDP announce/respond protocol — no more typing the host's IP.
+  Only real Nutler hosts are listed (a versioned, magic-tagged handshake, not a
+  blind port scan), and the room password still gates the actual connection.
+- **Settings panel.** A gear in the sidebar opens preferences that persist across
+  launches: desktop notification level (all / mentions / off), whether Enter
+  sends a message, and light/dark theme.
+
+### Changed
+
+- **Dependency modernization.** Updated across the stack (Vite 8, ESLint 10,
+  lucide-react 1, sqlx 0.9, the Noise library, and the CI actions), each built and
+  tested; releases now ship only the platform installers.
+
+### Security
+
+- Replaced the old network scan with a consent-gated, versioned discovery handshake
+  that can't be turned into a reflection amplifier and never reports an unrelated
+  service as a host (resolves the discovery finding in the security review).
+
 ## [0.2.2] - 2026-06-30
 
 ### Fixed

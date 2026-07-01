@@ -51,6 +51,7 @@ pub fn run() {
             current_room: tokio::sync::RwLock::new(String::new()),
             current_room_id: tokio::sync::RwLock::new(None),
             server_addr: tokio::sync::RwLock::new(None),
+            pool: std::sync::OnceLock::new(),
         }))
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
@@ -95,6 +96,11 @@ pub fn run() {
                 }
             }
 
+            // Give AppState a handle to the pool too (for broadcast-time ghost eviction).
+            let _ = app
+                .state::<std::sync::Arc<sockets::AppState>>()
+                .pool
+                .set(pool.clone());
             app.manage(pool); // makes the pool available to commands
 
             Ok(())

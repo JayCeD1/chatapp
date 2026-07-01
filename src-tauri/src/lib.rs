@@ -18,6 +18,7 @@ use tauri::Manager;
 
 mod db;
 mod db_queries;
+mod error;
 mod migration;
 mod secure;
 mod sockets;

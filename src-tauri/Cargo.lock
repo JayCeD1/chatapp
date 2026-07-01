@@ -2814,6 +2814,7 @@ dependencies = [
  "tauri-plugin-dialog",
  "tauri-plugin-notification",
  "tauri-plugin-opener",
+ "thiserror 2.0.18",
  "tokio",
  "tracing",
  "tracing-subscriber",

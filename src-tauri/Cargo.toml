@@ -38,6 +38,7 @@ tauri-plugin-dialog = "2"
 tauri-plugin-notification = "2"
 snow = "0.10"
 sha2 = "0.11"
+thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 

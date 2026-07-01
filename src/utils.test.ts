@@ -115,3 +115,17 @@ describe("parseMentions", () => {
     ]);
   });
 });
+
+import { errText, errCode } from "./utils";
+
+describe("error helpers", () => {
+  it("extract message + code from a typed AppError object", () => {
+    const e = { code: "conflict", message: "already exists" };
+    expect(errText(e)).toBe("already exists");
+    expect(errCode(e)).toBe("conflict");
+  });
+  it("fall back gracefully for plain string errors", () => {
+    expect(errText("boom")).toBe("boom");
+    expect(errCode("boom")).toBeUndefined();
+  });
+});

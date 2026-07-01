@@ -10,6 +10,7 @@ import {
 } from "lucide-react";
 import { Department, ConnectionMode, ServerInfo } from "../types";
 import { loadProfile } from "../session";
+import { errCode } from "../utils";
 
 interface LoginViewProps {
   departments: Department[];
@@ -99,10 +100,14 @@ export const LoginView: React.FC<LoginViewProps> = ({
     try {
       await onLogin(username, email, departmentId, password);
     } catch (err) {
+      // The backend returns a typed error code (auth = wrong password, network = unreachable).
+      const code = errCode(err);
       setError(
-        String(err).toLowerCase().includes("handshake")
-          ? "Couldn't connect — check the server address and room password."
-          : "Couldn't connect. Please check your details and try again.",
+        code === "auth"
+          ? "Couldn't connect — check the room password."
+          : code === "network"
+            ? `Couldn't reach the server. Check the address (${serverIp}).`
+            : "Couldn't connect. Please check your details and try again.",
       );
     } finally {
       setLoading(false);

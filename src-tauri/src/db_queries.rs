@@ -1,3 +1,4 @@
+use crate::error::{AppError, AppResult};
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqlitePool};
 use tauri::State;
@@ -383,7 +384,7 @@ pub async fn create_room(
     department_id: Option<i64>,
     is_private: Option<bool>,
     created_by: Option<i64>,
-) -> Result<ChatRoom, String> {
+) -> AppResult<ChatRoom> {
     create_room_internal(
         &db,
         name,
@@ -404,10 +405,12 @@ pub async fn create_room_internal(
     department_id: Option<i64>,
     is_private: Option<bool>,
     created_by: Option<i64>,
-) -> Result<ChatRoom, String> {
+) -> AppResult<ChatRoom> {
     let name = name.trim().to_string();
     if name.is_empty() || name.chars().count() > 64 {
-        return Err("Channel name must be between 1 and 64 characters".to_string());
+        return Err(AppError::Validation(
+            "Channel name must be between 1 and 64 characters".to_string(),
+        ));
     }
     let is_private = is_private.unwrap_or(false);
 
@@ -424,9 +427,9 @@ pub async fn create_room_internal(
     .await
     .map_err(|e| {
         if e.to_string().contains("UNIQUE") {
-            "A channel with that name already exists".to_string()
+            AppError::Conflict("A channel with that name already exists".to_string())
         } else {
-            format!("Failed to create channel: {}", e)
+            AppError::Db(format!("Failed to create channel: {}", e))
         }
     })?;
 
@@ -442,8 +445,7 @@ pub async fn create_room_internal(
         .bind(creator)
         .bind(id)
         .execute(pool)
-        .await
-        .map_err(|e| format!("Failed to add creator to channel: {}", e))?;
+        .await?; // sqlx::Error → AppError::Db
     }
 
     let row = sqlx::query(
@@ -454,8 +456,7 @@ pub async fn create_room_internal(
     )
     .bind(id)
     .fetch_one(pool)
-    .await
-    .map_err(|e| e.to_string())?;
+    .await?; // sqlx::Error → AppError::Db
 
     Ok(row_to_room(&row))
 }

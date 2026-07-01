@@ -14,7 +14,7 @@ import {
   User,
   ViewState,
 } from "../types";
-import { mentionsUser } from "../utils";
+import { mentionsUser, errText } from "../utils";
 import { notify, ensureNotificationPermission } from "../notifications";
 import { loadProfile, saveProfile } from "../session";
 import { loadPreferences, savePreferences, Preferences } from "../preferences";
@@ -924,7 +924,7 @@ export const useChatConnection = () => {
         await invoke("client_create_dm", { targetIds });
       }
     } catch (err) {
-      setError(`Couldn't start conversation: ${err}`);
+      setError(`Couldn't start conversation: ${errText(err)}`);
     }
   };
 
@@ -958,7 +958,7 @@ export const useChatConnection = () => {
         });
       }
     } catch (err) {
-      setError(`Couldn't create channel: ${err}`);
+      setError(`Couldn't create channel: ${errText(err)}`);
     }
   };
 

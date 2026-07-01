@@ -5,6 +5,7 @@ use crate::db_queries::{
     room_join_allowed_internal, save_message_internal, toggle_reaction_db,
     touch_last_read_internal, upsert_user_internal, ChatRoom,
 };
+use crate::error::{AppError, AppResult};
 use crate::secure;
 use serde::{Deserialize, Serialize};
 use snow::TransportState;
@@ -1844,7 +1845,7 @@ async fn handle_server_message(
                     }
                     Err(e) => {
                         tracing::warn!("Room create from {} failed: {}", actor, e);
-                        send_error_notice(&state, actor, &e).await;
+                        send_error_notice(&state, actor, &e.to_string()).await;
                     }
                 }
             }
@@ -1934,12 +1935,12 @@ pub async fn client_connect_to_server(
     room: String,
     room_id: u64,
     password: String,
-) -> Result<(), String> {
+) -> AppResult<()> {
     tracing::info!("🔵 Client connecting to server at {}", host);
 
     let stream = TcpStream::connect(&host)
         .await
-        .map_err(|e| format!("Failed to connect to {}: {}", host, e))?;
+        .map_err(|e| AppError::Network(format!("Failed to connect to {}: {}", host, e)))?;
 
     let (mut reader, mut writer) = stream.into_split();
 
@@ -1947,7 +1948,7 @@ pub async fn client_connect_to_server(
     let psk = secure::derive_psk(&password);
     let transport = secure::initiator_handshake(&mut reader, &mut writer, &psk)
         .await
-        .map_err(|e| format!("Secure handshake failed (wrong password?): {}", e))?;
+        .map_err(|e| AppError::Auth(format!("Secure handshake failed (wrong password?): {}", e)))?;
     tracing::info!("🔒 Secure session established with {}", host);
 
     // Update client state
@@ -1985,7 +1986,9 @@ pub async fn client_connect_to_server(
     };
     send_secure_client(state.inner(), &connect_message)
         .await
-        .map_err(|e| format!("Failed to send connect message to server: {}", e))?;
+        .map_err(|e| {
+            AppError::Network(format!("Failed to send connect message to server: {}", e))
+        })?;
 
     // Mark this as the newest connection: any listener from a prior attempt now belongs to an
     // older generation and will suppress its connection_lost emit. This closes the window
@@ -2694,7 +2697,7 @@ pub async fn server_create_room(
     department_id: Option<i64>,
     is_private: bool,
     actor_id: i64,
-) -> Result<ChatRoom, String> {
+) -> AppResult<ChatRoom> {
     let room = create_room_internal(
         db.inner(),
         name,

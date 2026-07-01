@@ -7,6 +7,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-07-01
+
+### Added
+
+- **mDNS/Bonjour host discovery.** Hosts are now also advertised over mDNS
+  (`_nutler._tcp`) alongside the existing UDP discovery, so a host can be found
+  through either path. Best-effort: where multicast is unavailable it simply
+  contributes nothing and UDP discovery still works.
+
+### Changed
+
+- **Clearer connection errors.** A failed login now distinguishes a wrong room
+  password from an unreachable server address, instead of one generic message.
+
+### Fixed
+
+- **Dead connections are cleaned up promptly.** When sending to a peer fails, that
+  connection is now torn down immediately, so a client that drops without a clean
+  disconnect no longer lingers as a ghost member.
+
+### Security
+
+- **Per-message rate limiting.** Each connection is throttled (token bucket) so a
+  buggy or malicious client can't flood the relay and database; normal typing and
+  paste bursts stay well under the limit.
+
+### Internal
+
+- Split the `useChatConnection` "god hook" into focused `usePreferences` and
+  `useMessageStore` hooks (behaviour-preserving), and introduced typed backend
+  error codes (`AppError`) threaded through the key command paths.
+- Upgraded TypeScript to 6.0.
+
 ## [0.4.0] - 2026-07-01
 
 ### Security
@@ -154,4 +187,3 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Added a transport security model and threat boundaries; see
   [SECURITY.md](./SECURITY.md).
-

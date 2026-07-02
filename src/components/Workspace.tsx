@@ -10,8 +10,10 @@ import {
   User,
 } from "../types";
 import { ConnectionStatus } from "../hooks/useChatConnection";
+import { useAttachments } from "../hooks/useAttachments";
 import { Theme } from "../hooks/useTheme";
 import { Preferences } from "../preferences";
+import { AttachmentRef } from "../types";
 import { Sidebar } from "./Sidebar";
 import { ChatPane } from "./ChatPane";
 import { MembersPanel, Member } from "./MembersPanel";
@@ -56,6 +58,8 @@ interface WorkspaceProps {
   onToggleTheme: () => void;
   preferences: Preferences;
   onSetPreferences: (patch: Partial<Preferences>) => void;
+  attachmentsEnabled: boolean;
+  onSendAttachments: (text: string, attachments: AttachmentRef[]) => void;
 }
 
 export const Workspace: React.FC<WorkspaceProps> = ({
@@ -93,7 +97,12 @@ export const Workspace: React.FC<WorkspaceProps> = ({
   onToggleTheme,
   preferences,
   onSetPreferences,
+  attachmentsEnabled,
+  onSendAttachments,
 }) => {
+  // Attachment download/preview lifecycle, owned at this stable (session-long) level so an
+  // in-flight fetch's completion isn't missed across channel switches.
+  const attachments = useAttachments();
   // Live roster for the active room (server truth via UserList). Everyone in it is
   // connected; ensure the current user shows even before the first roster arrives.
   const members: Member[] = useMemo(() => {
@@ -162,6 +171,9 @@ export const Workspace: React.FC<WorkspaceProps> = ({
             directory={directory}
             onAddMember={onAddMember}
             onLeave={onLeaveRoom}
+            attachmentsEnabled={attachmentsEnabled}
+            onSendAttachments={onSendAttachments}
+            attachments={attachments}
           />
         ) : (
           <EmptyState />

@@ -132,6 +132,10 @@ export const useChatConnection = () => {
   // so we use this to recognise our own messages by id rather than by (collision-prone) name.
   const [canonicalUserId, setCanonicalUserId] = useState<number | null>(null);
   const canonicalUserIdRef = useRef<number | null>(null);
+  // Capability flags the host advertised on the Identity frame (client mode). Attachments
+  // are gated on this: a client must never send attachment frames to a host that predates
+  // the feature (an old host drops the connection on the unknown MessageType).
+  const [hostFeatures, setHostFeatures] = useState<string[]>([]);
 
   // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
@@ -197,10 +201,12 @@ export const useChatConnection = () => {
         return;
       }
 
-      // Host tells us our canonical id (client mode) so we can recognise our own messages.
+      // Host tells us our canonical id (client mode) so we can recognise our own messages,
+      // and advertises its capabilities (e.g. attachments-v1) so we can gate optional UI.
       if (nm.message_type === "Identity") {
         canonicalUserIdRef.current = nm.user_id;
         setCanonicalUserId(nm.user_id);
+        if (Array.isArray(nm.features)) setHostFeatures(nm.features);
         return;
       }
 
@@ -1064,6 +1070,32 @@ export const useChatConnection = () => {
     }
   };
 
+  // Whether attachments can be sent right now: the host participant always can (it IS the
+  // current build); a client can only if the host advertised the capability.
+  const attachmentsEnabled =
+    mode === "server" || hostFeatures.includes("attachments-v1");
+
+  // Send a message carrying already-uploaded attachment refs (the blobs are transferred
+  // first by the composer via upload_attachment). One command; the backend branches on
+  // host/client internally, persists sidecar rows before distributing, and echoes to us.
+  const sendMessageWithAttachments = async (
+    text: string,
+    attachments: AttachmentRef[],
+  ) => {
+    if (!currentUser || !currentRoom || attachments.length === 0) return;
+    try {
+      await invoke("send_message_with_attachments", {
+        message: text,
+        user_id: currentUser.id,
+        is_emoji: false,
+        attachments,
+      });
+    } catch (err) {
+      console.error("Send with attachments failed:", err);
+      setError(`Message not sent: ${err}`);
+    }
+  };
+
   // Stable (reads refs) so ChatPane's throttle/debounce timers never call a stale
   // copy. Best-effort: a failed typing ping must never surface or block the composer.
   const sendTyping = useCallback(async (typing: boolean) => {
@@ -1169,6 +1201,7 @@ export const useChatConnection = () => {
     setDirectory([]);
     setCanonicalUserId(null);
     canonicalUserIdRef.current = null;
+    setHostFeatures([]);
     setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
@@ -1213,6 +1246,8 @@ export const useChatConnection = () => {
     createRoom,
     leaveRoom,
     sendMessage,
+    sendMessageWithAttachments,
+    attachmentsEnabled,
     editMessage,
     deleteMessage,
     toggleReaction,

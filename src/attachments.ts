@@ -79,6 +79,22 @@ export const saveAttachment = (
 export const isPreviewableImage = (mime: string): boolean =>
   /^image\/(png|jpeg|gif|webp|avif|bmp|svg\+xml)$/.test(mime);
 
+/** Images at or below this size auto-fetch on render; larger ones (and all non-image
+ *  files) load on an explicit click, so opening a channel never pulls megabytes eagerly. */
+export const AUTO_FETCH_IMAGE_MAX = 512 * 1024;
+
+/** The auto-fetch policy (design §5): small images only. */
+export const shouldAutoFetch = (ref: {
+  mime: string;
+  size: number;
+}): boolean => isPreviewableImage(ref.mime) && ref.size <= AUTO_FETCH_IMAGE_MAX;
+
+/** Max attachments per message (mirrors the backend MAX_ATTACHMENTS_PER_MESSAGE). */
+export const MAX_ATTACHMENTS_PER_MESSAGE = 5;
+
+/** Max attachment size in bytes (mirrors the backend MAX_ATTACHMENT_BYTES = 25 MiB). */
+export const MAX_ATTACHMENT_BYTES = 25 * 1024 * 1024;
+
 const MIME_BY_EXTENSION: Record<string, string> = {
   png: "image/png",
   jpg: "image/jpeg",

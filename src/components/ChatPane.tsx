@@ -1,4 +1,10 @@
-import React, { useState, useEffect, useLayoutEffect, useRef } from "react";
+import React, {
+  useState,
+  useEffect,
+  useLayoutEffect,
+  useRef,
+  useCallback,
+} from "react";
 import {
   Send,
   Smile,
@@ -14,8 +20,32 @@ import {
   Trash2,
   Check,
   X,
+  Paperclip,
+  Download,
+  FileText,
+  AlertCircle,
+  ImageIcon,
 } from "lucide-react";
-import { ChatRoom, DirectoryUser, Message, Reaction, User } from "../types";
+import { open } from "@tauri-apps/plugin-dialog";
+import { getCurrentWebview } from "@tauri-apps/api/webview";
+import {
+  AttachmentRef,
+  ChatRoom,
+  DirectoryUser,
+  Message,
+  Reaction,
+  User,
+} from "../types";
+import { UseAttachments } from "../hooks/useAttachments";
+import {
+  uploadAttachment,
+  mimeFromFilename,
+  isPreviewableImage,
+  shouldAutoFetch,
+  formatBytes,
+  MAX_ATTACHMENTS_PER_MESSAGE,
+  MAX_ATTACHMENT_BYTES,
+} from "../attachments";
 import { InviteModal } from "./InviteModal";
 import {
   initials,
@@ -53,7 +83,26 @@ interface ChatPaneProps {
   onLeave: () => void;
   directory: DirectoryUser[];
   onAddMember: (roomId: number, userId: number) => void;
+  // Attachments: whether the host supports them, the send handler, and the
+  // download/preview lifecycle (owned by Workspace so it survives channel switches).
+  attachmentsEnabled: boolean;
+  onSendAttachments: (text: string, attachments: AttachmentRef[]) => void;
+  attachments: UseAttachments;
 }
+
+// A file selected in the composer, tracked from pick/drop through its upload. The blob
+// transfers first (upload_attachment); the message is sent only once refs are ready.
+interface PendingAttachment {
+  localId: string; // client-generated UUID → becomes AttachmentRef.id
+  name: string;
+  size?: number;
+  status: "uploading" | "ready" | "failed";
+  ref?: AttachmentRef;
+  error?: string;
+}
+
+const basename = (path: string): string =>
+  path.split(/[\\/]/).pop() || path || "file";
 
 const EMOJIS = [
   "😊",
@@ -92,6 +141,9 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   onLeave,
   directory,
   onAddMember,
+  attachmentsEnabled,
+  onSendAttachments,
+  attachments,
 }) => {
   // DMs are stored under a synthetic name; show the derived label and drop the "#" prefix.
   const isDm = !!room.is_dm;
@@ -100,6 +152,19 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   const [inputText, setInputText] = useState("");
   const [showEmoji, setShowEmoji] = useState(false);
   const [showInvite, setShowInvite] = useState(false);
+  // Composer attachment state (pre-send uploads) + drag-over highlight.
+  const [pending, setPending] = useState<PendingAttachment[]>([]);
+  const [dragOver, setDragOver] = useState(false);
+  const pendingRef = useRef<PendingAttachment[]>([]);
+  useEffect(() => {
+    pendingRef.current = pending;
+  }, [pending]);
+  const uploadingCount = pending.filter(
+    (p) => p.status === "uploading",
+  ).length;
+  const readyRefs = pending
+    .filter((p) => p.status === "ready" && p.ref)
+    .map((p) => p.ref!);
   const [loadingOlder, setLoadingOlder] = useState(false);
   const [editingId, setEditingId] = useState<string | null>(null);
   const [editText, setEditText] = useState("");
@@ -155,6 +220,8 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     setEditingId(null);
     setEditText("");
     setReactingId(null);
+    setPending([]);
+    setDragOver(false);
     restoreRef.current = null;
     loadingOlderRef.current = false;
   }, [room.id]);
@@ -221,8 +288,108 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     };
   }, [room.id]);
 
+  // Upload one picked/dropped file; its chip flips uploading → ready (with the ref the
+  // send will carry) or failed. Content-address + size come back from the backend.
+  const uploadOne = useCallback(async (path: string, localId: string) => {
+    try {
+      const up = await uploadAttachment(path);
+      const ref: AttachmentRef = {
+        id: localId,
+        sha256: up.sha256,
+        name: up.name,
+        mime: mimeFromFilename(up.name),
+        size: up.size,
+      };
+      setPending((prev) =>
+        prev.map((p) =>
+          p.localId === localId
+            ? { ...p, status: "ready", name: up.name, size: up.size, ref }
+            : p,
+        ),
+      );
+    } catch (e) {
+      setPending((prev) =>
+        prev.map((p) =>
+          p.localId === localId
+            ? { ...p, status: "failed", error: String(e) }
+            : p,
+        ),
+      );
+    }
+  }, []);
+
+  // Add files to the composer (respecting the per-message cap) and start their uploads.
+  const addFiles = useCallback(
+    (paths: string[]) => {
+      const room = MAX_ATTACHMENTS_PER_MESSAGE - pendingRef.current.length;
+      if (room <= 0) return;
+      const take = paths.slice(0, room);
+      const items: PendingAttachment[] = take.map((p) => ({
+        localId: crypto.randomUUID(),
+        name: basename(p),
+        status: "uploading",
+      }));
+      setPending((prev) => [...prev, ...items]);
+      items.forEach((it, i) => void uploadOne(take[i], it.localId));
+    },
+    [uploadOne],
+  );
+
+  const pickFiles = useCallback(async () => {
+    try {
+      const sel = await open({ multiple: true });
+      if (!sel) return;
+      addFiles(Array.isArray(sel) ? sel : [sel]);
+    } catch {
+      /* dialog dismissed / unavailable */
+    }
+  }, [addFiles]);
+
+  const removePending = (localId: string) =>
+    setPending((prev) => prev.filter((p) => p.localId !== localId));
+
+  // OS file drag-drop onto the window (webview-wide). Gated on the host supporting
+  // attachments; the latest addFiles is read via a ref so the listener stays stable.
+  const addFilesRef = useRef(addFiles);
+  addFilesRef.current = addFiles;
+  useEffect(() => {
+    if (!attachmentsEnabled) return;
+    let active = true;
+    let unlisten: (() => void) | undefined;
+    getCurrentWebview()
+      .onDragDropEvent((event) => {
+        const p = event.payload;
+        if (p.type === "enter" || p.type === "over") setDragOver(true);
+        else if (p.type === "leave") setDragOver(false);
+        else if (p.type === "drop") {
+          setDragOver(false);
+          if (Array.isArray(p.paths) && p.paths.length)
+            addFilesRef.current(p.paths);
+        }
+      })
+      .then((u) => {
+        if (active) unlisten = u;
+        else u();
+      });
+    return () => {
+      active = false;
+      unlisten?.();
+      setDragOver(false);
+    };
+  }, [attachmentsEnabled]);
+
   const handleSend = () => {
+    if (uploadingCount > 0) return; // wait for in-flight uploads to finish
     const text = inputText.trim();
+    if (readyRefs.length > 0) {
+      // A message may carry attachments with or without a caption.
+      onSendAttachments(text, readyRefs);
+      setPending([]);
+      setInputText("");
+      setShowEmoji(false);
+      stopTyping();
+      return;
+    }
     if (!text) return;
     onSendMessage(text);
     setInputText("");
@@ -259,7 +426,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   })();
 
   return (
-    <section className="flex flex-col h-full min-w-0 bg-[var(--bg)]">
+    <section className="relative flex flex-col h-full min-w-0 bg-[var(--bg)]">
       {/* Header */}
       <header className="flex items-center justify-between px-5 h-14 border-b border-[var(--border)] shrink-0">
         <div className="flex items-center gap-2 min-w-0">
@@ -482,7 +649,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                           <div className="text-sm italic text-[var(--text-faint)]">
                             This message was deleted
                           </div>
-                        ) : (
+                        ) : msg.message ? (
                           <div
                             className={`break-words leading-relaxed max-w-[90%] ${
                               msg.is_emoji ? "text-3xl" : "text-sm"
@@ -502,7 +669,33 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
                               </span>
                             )}
                           </div>
-                        )}
+                        ) : null}
+
+                        {!isDeleted &&
+                          msg.attachments &&
+                          msg.attachments.length > 0 && (
+                            <div
+                              className={`mt-1.5 flex flex-col gap-1.5 ${
+                                isMe ? "items-end" : "items-start"
+                              }`}
+                            >
+                              {msg.attachments.map((att) =>
+                                isPreviewableImage(att.mime) ? (
+                                  <AttachmentImage
+                                    key={att.id}
+                                    att={att}
+                                    attachments={attachments}
+                                  />
+                                ) : (
+                                  <AttachmentFile
+                                    key={att.id}
+                                    att={att}
+                                    attachments={attachments}
+                                  />
+                                ),
+                              )}
+                            </div>
+                          )}
 
                         {msgReactions.length > 0 && (
                           <div
@@ -635,6 +828,46 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
             </span>
           )}
         </div>
+        {/* Pending attachment chips (uploading before send) */}
+        {pending.length > 0 && (
+          <div className="flex flex-wrap gap-2 px-1 mb-2">
+            {pending.map((p) => (
+              <div
+                key={p.localId}
+                title={p.error || p.name}
+                className={`flex items-center gap-2 max-w-[220px] rounded-lg px-2.5 py-1.5 text-xs border ${
+                  p.status === "failed"
+                    ? "border-[var(--danger)] bg-[var(--danger-soft,var(--surface-2))]"
+                    : "border-[var(--border)] bg-[var(--surface-2)]"
+                }`}
+              >
+                {p.status === "uploading" ? (
+                  <Loader2 className="w-3.5 h-3.5 animate-spin text-[var(--text-faint)] shrink-0" />
+                ) : p.status === "failed" ? (
+                  <AlertCircle className="w-3.5 h-3.5 text-[var(--danger)] shrink-0" />
+                ) : (
+                  <Paperclip className="w-3.5 h-3.5 text-[var(--accent-strong)] shrink-0" />
+                )}
+                <span className="truncate text-[var(--text-dim)]">
+                  {p.name}
+                </span>
+                {p.size != null && (
+                  <span className="text-[var(--text-faint)] shrink-0">
+                    {formatBytes(p.size)}
+                  </span>
+                )}
+                <button
+                  onClick={() => removePending(p.localId)}
+                  aria-label={`Remove ${p.name}`}
+                  className="text-[var(--text-faint)] hover:text-[var(--text)] shrink-0"
+                >
+                  <X className="w-3.5 h-3.5" />
+                </button>
+              </div>
+            ))}
+          </div>
+        )}
+
         <div className="relative flex items-end gap-2">
           {showEmoji && (
             <div className="absolute bottom-14 left-0 bg-[var(--surface-2)] border border-[var(--border)] p-2 rounded-xl shadow-2xl grid grid-cols-6 gap-1 z-50 animate-scale-in">
@@ -650,6 +883,20 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
               ))}
             </div>
           )}
+
+          <button
+            onClick={pickFiles}
+            disabled={!attachmentsEnabled}
+            title={
+              attachmentsEnabled
+                ? "Attach files"
+                : "This host doesn't support attachments"
+            }
+            aria-label="Attach files"
+            className="p-2.5 rounded-lg transition-colors text-[var(--text-faint)] hover:text-[var(--text)] hover:bg-[var(--surface-2)] disabled:opacity-40 disabled:cursor-not-allowed"
+          >
+            <Paperclip className="w-5 h-5" />
+          </button>
 
           <button
             onClick={() => setShowEmoji((s) => !s)}
@@ -682,14 +929,37 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
 
           <button
             onClick={handleSend}
-            disabled={!inputText.trim()}
+            disabled={
+              uploadingCount > 0 ||
+              (!inputText.trim() && readyRefs.length === 0)
+            }
             aria-label="Send message"
             className="p-2.5 rounded-lg bg-[var(--accent)] text-white shadow-lg shadow-[var(--accent-soft)] hover:bg-[var(--accent-strong)] disabled:opacity-40 disabled:cursor-not-allowed transition-colors"
           >
-            <Send className="w-5 h-5" />
+            {uploadingCount > 0 ? (
+              <Loader2 className="w-5 h-5 animate-spin" />
+            ) : (
+              <Send className="w-5 h-5" />
+            )}
           </button>
         </div>
       </div>
+
+      {/* File drag-drop overlay */}
+      {dragOver && attachmentsEnabled && (
+        <div className="absolute inset-0 z-50 flex items-center justify-center bg-[var(--bg)]/80 backdrop-blur-sm pointer-events-none">
+          <div className="flex flex-col items-center gap-3 px-8 py-6 rounded-2xl border-2 border-dashed border-[var(--accent)]">
+            <Paperclip className="w-8 h-8 text-[var(--accent-strong)]" />
+            <p className="text-sm font-medium text-[var(--text)]">
+              Drop files to attach
+            </p>
+            <p className="text-xs text-[var(--text-faint)]">
+              Up to {MAX_ATTACHMENTS_PER_MESSAGE} files ·{" "}
+              {MAX_ATTACHMENT_BYTES / (1024 * 1024)} MB each
+            </p>
+          </div>
+        </div>
+      )}
     </section>
   );
 };
@@ -728,6 +998,113 @@ const MessageText: React.FC<{ text: string; meName: string }> = ({
     )}
   </>
 );
+
+// Inline image attachment: small images auto-load; larger ones show a click-to-load tile
+// (so opening a channel never pulls megabytes eagerly). Clicking a loaded image saves it.
+const AttachmentImage: React.FC<{
+  att: AttachmentRef;
+  attachments: UseAttachments;
+}> = ({ att, attachments }) => {
+  const view = attachments.viewFor(att.sha256);
+  const { load } = attachments;
+
+  useEffect(() => {
+    if (view.status === "idle" && shouldAutoFetch(att)) load(att);
+  }, [att, view.status, load]);
+
+  if (view.url) {
+    return (
+      <button
+        onClick={() => void attachments.download(att).catch(() => {})}
+        title={`${att.name} — click to save`}
+        className="block rounded-lg overflow-hidden border border-[var(--border)] hover:border-[var(--accent)] transition-colors"
+      >
+        <img
+          src={view.url}
+          alt={att.name}
+          className="max-w-[320px] max-h-[320px] object-cover"
+        />
+      </button>
+    );
+  }
+
+  const failed = view.status === "failed";
+  const loading = view.status === "loading";
+  return (
+    <button
+      onClick={() => load(att)}
+      disabled={loading}
+      className={`flex items-center gap-2.5 w-[240px] px-3 py-2.5 rounded-lg border text-left transition-colors ${
+        failed
+          ? "border-[var(--danger)] text-[var(--danger)]"
+          : "border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)] text-[var(--text-dim)]"
+      }`}
+    >
+      {loading ? (
+        <Loader2 className="w-4 h-4 animate-spin text-[var(--text-faint)] shrink-0" />
+      ) : failed ? (
+        <AlertCircle className="w-4 h-4 shrink-0" />
+      ) : (
+        <ImageIcon className="w-4 h-4 text-[var(--accent-strong)] shrink-0" />
+      )}
+      <span className="flex flex-col min-w-0">
+        <span className="truncate text-xs font-medium">{att.name}</span>
+        <span className="text-[11px] text-[var(--text-faint)]">
+          {loading
+            ? `Loading… ${Math.round((view.progress ?? 0) * 100)}%`
+            : failed
+              ? view.error || "Failed — click to retry"
+              : `Image · ${formatBytes(att.size)} · click to view`}
+        </span>
+      </span>
+    </button>
+  );
+};
+
+// Non-image attachment: a card with a download action (fetches then opens the save dialog).
+const AttachmentFile: React.FC<{
+  att: AttachmentRef;
+  attachments: UseAttachments;
+}> = ({ att, attachments }) => {
+  const view = attachments.viewFor(att.sha256);
+  const loading = view.status === "loading";
+  const failed = view.status === "failed";
+  return (
+    <button
+      onClick={() => void attachments.download(att).catch(() => {})}
+      disabled={loading}
+      title={`Save ${att.name}`}
+      className={`flex items-center gap-3 w-[260px] px-3 py-2.5 rounded-lg border text-left transition-colors ${
+        failed
+          ? "border-[var(--danger)]"
+          : "border-[var(--border)] bg-[var(--surface-2)] hover:border-[var(--accent)]"
+      }`}
+    >
+      <div className="flex items-center justify-center w-9 h-9 rounded-lg bg-[var(--surface-3)] shrink-0">
+        <FileText className="w-4.5 h-4.5 text-[var(--accent-strong)]" />
+      </div>
+      <span className="flex flex-col min-w-0 flex-1">
+        <span className="truncate text-xs font-medium text-[var(--text)]">
+          {att.name}
+        </span>
+        <span className="text-[11px] text-[var(--text-faint)]">
+          {loading
+            ? `Downloading… ${Math.round((view.progress ?? 0) * 100)}%`
+            : failed
+              ? view.error || "Failed — click to retry"
+              : formatBytes(att.size)}
+        </span>
+      </span>
+      {loading ? (
+        <Loader2 className="w-4 h-4 animate-spin text-[var(--text-faint)] shrink-0" />
+      ) : failed ? (
+        <AlertCircle className="w-4 h-4 text-[var(--danger)] shrink-0" />
+      ) : (
+        <Download className="w-4 h-4 text-[var(--text-faint)] shrink-0" />
+      )}
+    </button>
+  );
+};
 
 const MessageSkeletons: React.FC = () => (
   <div className="space-y-4 px-2 pt-2" aria-hidden="true">

@@ -268,10 +268,19 @@ async fn accept_fetch_begin(state: &Arc<AppState>, begin: &FetchBeginPayload) ->
     {
         let mut pending = state.attachments_client.pending.lock().await;
         match pending.get(&begin.attachment_id) {
+            // Requested this id AND the sha matches — consume the slot and proceed.
             Some(expected) if *expected == begin.sha256 => {
                 pending.remove(&begin.attachment_id);
             }
-            _ => return false, // unsolicited or sha-swapped — drop
+            // Requested this id but the host answered with a DIFFERENT sha (content
+            // substitution attempt): consume the slot so a buggy/hostile host can't pin
+            // it, and drop the Begin.
+            Some(_) => {
+                pending.remove(&begin.attachment_id);
+                return false;
+            }
+            // Never requested this id — unsolicited; drop without touching the registry.
+            None => return false,
         }
     }
     if begin.size == 0 || begin.size > MAX_ATTACHMENT_BYTES {
@@ -1169,7 +1178,11 @@ pub async fn upload_attachment(
     if !meta.is_file() {
         return Err("Only files can be attached".to_string());
     }
-    if meta.len() as usize > MAX_ATTACHMENT_BYTES {
+    // Early exit on the stat, but the authoritative cap is on the bytes actually read
+    // below — a file can grow between stat and read (symlink swap, active writer), and
+    // store_blob has no upper bound of its own.
+    let too_big = |n: usize| n > MAX_ATTACHMENT_BYTES;
+    if too_big(meta.len() as usize) {
         return Err(format!(
             "Files up to {} MB are supported",
             MAX_ATTACHMENT_BYTES / (1024 * 1024)
@@ -1180,6 +1193,12 @@ pub async fn upload_attachment(
         .map_err(|e| format!("Couldn't read the file: {e}"))?;
     if bytes.is_empty() {
         return Err("Cannot attach an empty file".to_string());
+    }
+    if too_big(bytes.len()) {
+        return Err(format!(
+            "Files up to {} MB are supported",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        ));
     }
     let name = std::path::Path::new(&path)
         .file_name()
@@ -1874,7 +1893,8 @@ mod transfer_tests {
         // the in-flight assembly.
         assert!(!accept_fetch_begin(&state, &unsolicited).await);
 
-        // A sha-swapped Begin for a pending id is rejected (host can't substitute content).
+        // A sha-swapped Begin for a pending id is rejected AND releases the slot (a host
+        // can't substitute content, nor pin the slot by answering with a wrong sha).
         let other_sha = blob_store::hex_sha256(b"other");
         assert!(register_pending_fetch(&state, "att-y", &other_sha)
             .await
@@ -1885,6 +1905,12 @@ mod transfer_tests {
             size: 1024,
         };
         assert!(!accept_fetch_begin(&state, &swapped).await);
+        assert!(!state
+            .attachments_client
+            .pending
+            .lock()
+            .await
+            .contains_key("att-y"));
 
         // An oversize Begin consumes the pending slot but allocates nothing.
         assert!(register_pending_fetch(&state, "att-z", &sha).await.is_ok());

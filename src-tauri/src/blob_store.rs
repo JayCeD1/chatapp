@@ -71,6 +71,33 @@ pub async fn blob_exists_complete(pool: &SqlitePool, sha256: &str) -> AppResult<
     Ok(complete_blob_size(pool, sha256).await?.is_some())
 }
 
+/// Record that `user_id` hash-proved possession of `sha256` by completing an upload — so they
+/// may reference it in a message even before it is visible in a room they can access (§9a
+/// item 9). Idempotent, and safe for two users uploading identical bytes concurrently.
+pub async fn record_uploader(pool: &SqlitePool, sha256: &str, user_id: i64) -> AppResult<()> {
+    sqlx::query(
+        "INSERT INTO attachment_blob_uploaders (sha256, user_id) VALUES ($1, $2)
+         ON CONFLICT(sha256, user_id) DO NOTHING",
+    )
+    .bind(sha256)
+    .bind(user_id)
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Whether `user_id` has a recorded (hash-proven) upload of `sha256`.
+pub async fn user_uploaded(pool: &SqlitePool, sha256: &str, user_id: i64) -> AppResult<bool> {
+    Ok(sqlx::query_scalar::<_, i64>(
+        "SELECT 1 FROM attachment_blob_uploaders WHERE sha256 = $1 AND user_id = $2 LIMIT 1",
+    )
+    .bind(sha256)
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await?
+    .is_some())
+}
+
 /// The stored size of a blob, `Some(size)` only if it is complete (declared size equals the
 /// summed chunk bytes). Callers use this to validate a claimed size without reading bytes.
 pub async fn complete_blob_size(pool: &SqlitePool, sha256: &str) -> AppResult<Option<i64>> {
@@ -377,5 +404,29 @@ mod tests {
         assert_eq!(delete_orphan_blobs(&pool, Some(3600)).await.unwrap(), 1);
         assert!(blob_exists_complete(&pool, &fresh).await.unwrap());
         assert!(!blob_exists_complete(&pool, &old).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn record_uploader_is_idempotent_and_per_user() {
+        let pool = setup().await;
+        let sha = store_blob(&pool, b"shared bytes").await.unwrap();
+
+        assert!(!user_uploaded(&pool, &sha, 1).await.unwrap());
+        record_uploader(&pool, &sha, 1).await.unwrap();
+        record_uploader(&pool, &sha, 1).await.unwrap(); // idempotent — no error, no dup row
+        assert!(user_uploaded(&pool, &sha, 1).await.unwrap());
+        assert!(!user_uploaded(&pool, &sha, 2).await.unwrap());
+
+        // A second uploader of the same bytes gets their own row (concurrent-dedup case).
+        record_uploader(&pool, &sha, 2).await.unwrap();
+        assert!(user_uploaded(&pool, &sha, 2).await.unwrap());
+
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM attachment_blob_uploaders WHERE sha256 = $1")
+                .bind(&sha)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(rows, 2);
     }
 }

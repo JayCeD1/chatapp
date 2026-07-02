@@ -1675,8 +1675,14 @@ async fn handle_server_message(
             // the whole frame, so an unvalidated ref (never uploaded, wrong size, spoofed)
             // would propagate to every member as an unfetchable card.
             if let Some(refs) = &message.attachments {
-                if let Err(reason) =
-                    crate::attachments::validate_chat_attachments(&pool, refs).await
+                // Client sender: gated by the connection-bound canonical id, so a peer can
+                // only reference content it uploaded or can see in an accessible room.
+                if let Err(reason) = crate::attachments::validate_chat_attachments(
+                    &pool,
+                    crate::attachments::RefActor::Client(actor as i64),
+                    refs,
+                )
+                .await
                 {
                     tracing::warn!(
                         "Dropped chat with bad attachments from {}: {}",
@@ -2369,8 +2375,14 @@ pub async fn send_message_with_attachments(
     };
 
     if *state.is_server.read().await {
-        // The host validates its own sends against the same rules it enforces on clients.
-        crate::attachments::validate_chat_attachments(db.inner(), &attachments).await?;
+        // The host is the trusted authority (it reads all plaintext and stores every blob),
+        // so it's exempt from the reference gate but still gets the structural checks.
+        crate::attachments::validate_chat_attachments(
+            db.inner(),
+            crate::attachments::RefActor::Host,
+            &attachments,
+        )
+        .await?;
         save_message_internal(
             db.inner(),
             chat_message.room_id as i64,

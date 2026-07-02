@@ -409,9 +409,18 @@ pub async fn handle_upload_start(
         return;
     }
 
-    // Dedup fast-path: identical bytes already stored and complete → no transfer needed.
+    // Dedup fast-path: identical bytes already stored → reply UploadOk (no transfer) — but
+    // ONLY if the sender may reference this content (§9a item 9). Otherwise fall through to a
+    // normal upload, so "the blob exists but isn't yours" is indistinguishable from "the blob
+    // doesn't exist": both take the Ok(None)/unauthorized branch and reply UploadReady after
+    // the SAME work. `may_reference_sha` is evaluated UNCONDITIONALLY first so the two negative
+    // cases cost the same (no timing oracle). An attacker who only knows a hash thus learns
+    // nothing and can complete an upload only by actually possessing the bytes.
+    let may_ref = may_reference_sha(pool, user_id as i64, &req.sha256)
+        .await
+        .unwrap_or(false);
     match blob_store::complete_blob_size(pool, &req.sha256).await {
-        Ok(Some(_)) => {
+        Ok(Some(_)) if may_ref => {
             let payload =
                 serde_json::to_string(&ShaPayload { sha256: req.sha256 }).unwrap_or_default();
             send_control(
@@ -422,7 +431,7 @@ pub async fn handle_upload_start(
             .await;
             return;
         }
-        Ok(None) => {}
+        Ok(_) => {}
         Err(e) => {
             tracing::error!("Upload dedup check failed: {}", e);
             send_attachment_error(state, user_id, Some(&req.sha256), None, "Storage error").await;
@@ -553,6 +562,14 @@ pub async fn handle_upload_done(
 
     match blob_store::store_blob(pool, &session.buf).await {
         Ok(stored_sha) if stored_sha == session.sha256 => {
+            // Record proof-of-possession so this user may reference the content (§9a item 9).
+            // Done on EVERY successful completion — including when store_blob deduped an
+            // existing blob — so a second uploader of the same bytes still gets their own row.
+            // Non-fatal on error: worst case the user re-uploads to reference it.
+            if let Err(e) = blob_store::record_uploader(pool, &session.sha256, user_id as i64).await
+            {
+                tracing::error!("Failed to record uploader possession: {}", e);
+            }
             let payload = serde_json::to_string(&ShaPayload {
                 sha256: session.sha256,
             })
@@ -808,11 +825,38 @@ async fn stream_blob_to_client(
     .await;
 }
 
+/// Who is asking to reference attachment content. `Host` is the local trusted authority (it
+/// already reads all plaintext and stores every blob directly), so it is exempt from the
+/// possession/visibility gate. A remote peer is `Client(canonical_user_id)` and must prove it
+/// may reference the content. This is a typed distinction (not a magic user id) so the
+/// exemption can't be reached by a crafted frame.
+pub enum RefActor {
+    Host,
+    Client(i64),
+}
+
+/// May `user_id` reference `sha256` in a message? Yes iff they hash-proved possession by
+/// completing an upload (persistent `attachment_blob_uploaders` row) OR the content is already
+/// visible to them in an accessible room (§9a item 9). Possession is checked first (cheap
+/// indexed lookup by PK).
+async fn may_reference_sha(pool: &SqlitePool, user_id: i64, sha256: &str) -> Result<bool, String> {
+    if blob_store::user_uploaded(pool, sha256, user_id)
+        .await
+        .map_err(|e| e.to_string())?
+    {
+        return Ok(true);
+    }
+    crate::db_queries::sha_referenced_in_accessible_room(pool, user_id, sha256).await
+}
+
 /// Validate the attachment refs on an inbound Chat frame BEFORE persisting or relaying
 /// (§9a trap 1: the relay clones the whole message, so unvalidated refs would propagate).
-/// Every ref must point at a complete stored blob whose size matches the claim.
+/// Every ref must point at a complete stored blob whose size matches the claim, AND — for a
+/// remote sender — content the sender is authorized to reference (§9a item 9). The host is
+/// exempt from the reference gate (trusted authority) but still gets the structural checks.
 pub async fn validate_chat_attachments(
     pool: &SqlitePool,
+    actor: RefActor,
     refs: &[AttachmentRef],
 ) -> Result<(), String> {
     if refs.is_empty() || refs.len() > MAX_ATTACHMENTS_PER_MESSAGE {
@@ -841,6 +885,15 @@ pub async fn validate_chat_attachments(
             Err(e) => {
                 tracing::error!("Attachment validation failed: {}", e);
                 return Err("Storage error".to_string());
+            }
+        }
+        // Reference gate for remote senders: they must have uploaded this content or be able
+        // to see it in an accessible room. The failure string is DELIBERATELY identical to the
+        // not-uploaded case above — a distinct "not authorized" message would itself be an
+        // existence oracle ("this hash exists, just not for you").
+        if let RefActor::Client(uid) = actor {
+            if !may_reference_sha(pool, uid, &r.sha256).await? {
+                return Err("Attachment was not uploaded".to_string());
             }
         }
     }
@@ -1916,7 +1969,7 @@ mod transfer_tests {
         // A valid single ref is accepted.
         let valid = make_ref("a1", &sha, bytes.len() as u64);
         assert!(
-            validate_chat_attachments(&pool, std::slice::from_ref(&valid))
+            validate_chat_attachments(&pool, RefActor::Host, std::slice::from_ref(&valid))
                 .await
                 .is_ok()
         );
@@ -1925,23 +1978,31 @@ mod transfer_tests {
         let many: Vec<_> = (0..=MAX_ATTACHMENTS_PER_MESSAGE)
             .map(|i| make_ref(&format!("m{i}"), &sha, bytes.len() as u64))
             .collect();
-        assert!(validate_chat_attachments(&pool, &many).await.is_err());
+        assert!(validate_chat_attachments(&pool, RefActor::Host, &many)
+            .await
+            .is_err());
 
         // Size mismatch vs the stored blob.
         let wrong_size = make_ref("a2", &sha, 1);
-        assert!(validate_chat_attachments(&pool, &[wrong_size])
-            .await
-            .is_err());
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Host, &[wrong_size])
+                .await
+                .is_err()
+        );
 
         // Never-uploaded content.
         let ghost_sha = blob_store::hex_sha256(b"never uploaded");
         let ghost = make_ref("a3", &ghost_sha, 42);
-        assert!(validate_chat_attachments(&pool, &[ghost]).await.is_err());
-
-        // Duplicate ref ids within one message.
-        assert!(validate_chat_attachments(&pool, &[valid.clone(), valid])
+        assert!(validate_chat_attachments(&pool, RefActor::Host, &[ghost])
             .await
             .is_err());
+
+        // Duplicate ref ids within one message.
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Host, &[valid.clone(), valid])
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]
@@ -2160,5 +2221,111 @@ mod transfer_tests {
             tokio::time::Instant::now(),
             CHUNK_RATE_BYTES_PER_SEC as usize
         ));
+    }
+
+    #[tokio::test]
+    async fn client_cannot_reference_unowned_sha() {
+        let pool = test_pool().await; // users 1, 2
+        let bytes = patterned_bytes(4096);
+        let sha = blob_store::store_blob(&pool, &bytes).await.unwrap();
+        // User 1 uploaded it; it lives only in user 1's PRIVATE room (user 2 not a member).
+        blob_store::record_uploader(&pool, &sha, 1).await.unwrap();
+        let room = create_room_internal(&pool, "priv".to_string(), None, None, Some(true), Some(1))
+            .await
+            .unwrap();
+        let rid = room.id.unwrap();
+        let _ = seed_attachment_row(&pool, rid, 1, "msg-unowned", &sha, bytes.len() as u64).await;
+
+        let r = AttachmentRef {
+            id: "new-att".to_string(),
+            sha256: sha.clone(),
+            name: "f.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size: bytes.len() as u64,
+            width: None,
+            height: None,
+        };
+        // User 2 knows the hash but never uploaded it and can't see the room → rejected, with
+        // the SAME string as "not uploaded" (no exists-but-not-yours oracle).
+        let err = validate_chat_attachments(&pool, RefActor::Client(2), std::slice::from_ref(&r))
+            .await
+            .unwrap_err();
+        assert_eq!(err, "Attachment was not uploaded");
+        // User 1 (the uploader) may reference it.
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Client(1), std::slice::from_ref(&r))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn uploader_may_reference_after_recording() {
+        let pool = test_pool().await;
+        let bytes = patterned_bytes(2048);
+        let sha = blob_store::store_blob(&pool, &bytes).await.unwrap();
+        let r = AttachmentRef {
+            id: "a".to_string(),
+            sha256: sha.clone(),
+            name: "f.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size: bytes.len() as u64,
+            width: None,
+            height: None,
+        };
+        // No possession, no room visibility → rejected.
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Client(2), std::slice::from_ref(&r))
+                .await
+                .is_err()
+        );
+        // After recording possession (survives reconnect — it's a persistent row) → allowed.
+        blob_store::record_uploader(&pool, &sha, 2).await.unwrap();
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Client(2), std::slice::from_ref(&r))
+                .await
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn host_actor_exempt_but_still_structural() {
+        let pool = test_pool().await;
+        let bytes = patterned_bytes(1024);
+        let sha = blob_store::store_blob(&pool, &bytes).await.unwrap();
+        let r = AttachmentRef {
+            id: "a".to_string(),
+            sha256: sha.clone(),
+            name: "f.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size: bytes.len() as u64,
+            width: None,
+            height: None,
+        };
+        // Host: no uploader row, no room visibility → still Ok (trusted authority, exempt).
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Host, std::slice::from_ref(&r))
+                .await
+                .is_ok()
+        );
+        // Structural checks still apply to the host: size mismatch and non-existent sha fail.
+        let bad_size = AttachmentRef {
+            size: 999_999,
+            ..r.clone()
+        };
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Host, std::slice::from_ref(&bad_size))
+                .await
+                .is_err()
+        );
+        let ghost = AttachmentRef {
+            sha256: blob_store::hex_sha256(b"never stored"),
+            ..r.clone()
+        };
+        assert!(
+            validate_chat_attachments(&pool, RefActor::Host, std::slice::from_ref(&ghost))
+                .await
+                .is_err()
+        );
     }
 }

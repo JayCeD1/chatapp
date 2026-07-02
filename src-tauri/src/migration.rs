@@ -275,11 +275,36 @@ pub fn get_migrations() -> Vec<Migration> {
             CREATE INDEX idx_attachments_sha ON attachments(sha256);",
             kind: MigrationKind::Up,
         },
+        // Migration 15: proof-of-possession for attachment referencing (§9a item 9). A row
+        // means `user_id` completed a hash-verified upload of `sha256`, so they may reference
+        // it in a Chat even before it's visible in any room they can access — this preserves
+        // "knowing a hash grants nothing" (a member can't reference a sha they merely learned).
+        // Cascades with the blob, so orphan-blob GC auto-reaps these rows.
+        Migration {
+            version: 15,
+            description: "add_attachment_blob_uploaders",
+            sql: "CREATE TABLE attachment_blob_uploaders (
+                sha256     TEXT NOT NULL REFERENCES attachment_blobs(sha256) ON DELETE CASCADE,
+                user_id    INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY (sha256, user_id)
+            );
+            CREATE INDEX idx_blob_uploaders_user ON attachment_blob_uploaders(user_id);",
+            kind: MigrationKind::Up,
+        },
+        // Down for v15:
+        Migration {
+            version: 15,
+            description: "drop_attachment_blob_uploaders",
+            sql: "DROP TABLE IF EXISTS attachment_blob_uploaders;",
+            kind: MigrationKind::Down,
+        },
         // Down for v14: drop the attachment tables (children first for the FKs)
         Migration {
             version: 14,
             description: "drop_attachments_and_blob_store",
-            sql: "DROP TABLE IF EXISTS attachments;
+            sql: "DROP TABLE IF EXISTS attachment_blob_uploaders;
+                  DROP TABLE IF EXISTS attachments;
                   DROP TABLE IF EXISTS attachment_blob_chunks;
                   DROP TABLE IF EXISTS attachment_blobs;",
             kind: MigrationKind::Down,

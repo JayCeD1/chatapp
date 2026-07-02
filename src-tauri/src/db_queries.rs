@@ -497,6 +497,20 @@ pub async fn leave_room(
     Ok(())
 }
 
+/// The single source of truth for "user `$1` may access room `cr`": the room is public, the
+/// user created it, or the user is an active member. A macro (not a `const`) so it expands to
+/// a string LITERAL that `concat!` can fold into each query at compile time — both the
+/// room-join gate and the attachment-referencing gate share it, so they can never drift (§9a
+/// item 9). Assumes a `chat_rooms cr` alias is in scope; `$1` = user_id.
+macro_rules! room_access_predicate {
+    () => {
+        "(cr.is_private = 0
+          OR cr.created_by = $1
+          OR EXISTS (SELECT 1 FROM user_rooms ur
+                     WHERE ur.room_id = cr.id AND ur.user_id = $1 AND ur.is_active = 1))"
+    };
+}
+
 /// Whether `user_id` may open `room_id`: the room is public, or the user created it, or the
 /// user is an active member. Unknown room → not allowed. Used to enforce private channels.
 pub async fn room_join_allowed_internal(
@@ -504,20 +518,44 @@ pub async fn room_join_allowed_internal(
     user_id: i64,
     room_id: i64,
 ) -> Result<bool, String> {
-    let allowed: Option<bool> = sqlx::query_scalar(
-        "SELECT (cr.is_private = 0
-                 OR cr.created_by = $1
-                 OR EXISTS (SELECT 1 FROM user_rooms ur
-                            WHERE ur.room_id = cr.id AND ur.user_id = $1 AND ur.is_active = 1))
-         FROM chat_rooms cr
-         WHERE cr.id = $2",
-    )
-    .bind(user_id)
-    .bind(room_id)
+    let allowed: Option<bool> = sqlx::query_scalar(concat!(
+        "SELECT ",
+        room_access_predicate!(),
+        " FROM chat_rooms cr WHERE cr.id = $2"
+    ))
+    .bind(user_id) // $1
+    .bind(room_id) // $2
     .fetch_optional(pool)
     .await
     .map_err(|e| format!("Failed to check room access: {}", e))?;
     Ok(allowed.unwrap_or(false))
+}
+
+/// May `user_id` reference `sha256` by content? True iff it is attached to a non-deleted
+/// message in a room they can access — the same access predicate as `room_join_allowed_internal`
+/// (shared macro, so no drift). The other half of "may reference" (they uploaded it themselves)
+/// is checked separately in `may_reference_sha`. Preserves "knowing a hash grants nothing":
+/// a member can only reference content they can already legitimately see.
+pub async fn sha_referenced_in_accessible_room(
+    pool: &SqlitePool,
+    user_id: i64,
+    sha256: &str,
+) -> Result<bool, String> {
+    let hit: Option<i64> = sqlx::query_scalar(concat!(
+        "SELECT 1
+         FROM attachments a
+         JOIN messages m ON m.message_id = a.message_id AND m.deleted_at IS NULL
+         JOIN chat_rooms cr ON cr.id = m.room_id
+         WHERE a.sha256 = $2 AND ",
+        room_access_predicate!(),
+        " LIMIT 1"
+    ))
+    .bind(user_id) // $1 (predicate)
+    .bind(sha256) // $2
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to check attachment access: {}", e))?;
+    Ok(hit.is_some())
 }
 
 /// Add `user_id` to `room_id` (an invite). Only someone who can already access the room
@@ -1611,5 +1649,106 @@ mod tests {
             .unwrap();
         assert_eq!(survivor.len(), 1);
         assert_eq!(survivor[0].id, "att-3");
+    }
+
+    // Drift guard (§9a item 9): whether a sha is referenceable-by-visibility must agree
+    // EXACTLY with room access, since both share `room_access_predicate!`. Also proves the
+    // visibility half across public / private-creator / private-member / non-member / deleted.
+    #[tokio::test]
+    async fn sha_reference_visibility_matches_room_access() {
+        let pool = setup().await; // Alice=1, Bob=2; room 1 pre-seeded public.
+
+        // Attach a blob to a message in `room_id` (authored by `author`), return its sha.
+        async fn seed(pool: &SqlitePool, room_id: i64, author: i64, id: &str) -> String {
+            let sha = crate::blob_store::store_blob(pool, id.as_bytes())
+                .await
+                .unwrap();
+            let mid = format!("msg-{id}");
+            save_message_internal(
+                pool,
+                room_id,
+                author,
+                "see attached".to_string(),
+                "Chat".to_string(),
+                false,
+                mid.clone(),
+            )
+            .await
+            .unwrap();
+            insert_attachments_for_message(
+                pool,
+                &mid,
+                &[crate::sockets::AttachmentRef {
+                    id: format!("att-{id}"),
+                    sha256: sha.clone(),
+                    name: "f.bin".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                    size: id.len() as u64,
+                    width: None,
+                    height: None,
+                }],
+            )
+            .await
+            .unwrap();
+            sha
+        }
+
+        // Public room: both users can access AND can reference; the two gates agree.
+        let sha_pub = seed(&pool, 1, 1, "pub").await;
+        for uid in [1i64, 2] {
+            let vis = sha_referenced_in_accessible_room(&pool, uid, &sha_pub)
+                .await
+                .unwrap();
+            assert!(vis, "public content must be referenceable by {uid}");
+            assert_eq!(
+                vis,
+                room_join_allowed_internal(&pool, uid, 1).await.unwrap()
+            );
+        }
+
+        // Private room owned by Alice (1); Bob (2) is not a member.
+        sqlx::raw_sql(
+            "INSERT INTO chat_rooms (id, name, is_private, created_by) VALUES (100, 'secret', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sha_priv = seed(&pool, 100, 1, "priv").await;
+        for uid in [1i64, 2] {
+            assert_eq!(
+                sha_referenced_in_accessible_room(&pool, uid, &sha_priv)
+                    .await
+                    .unwrap(),
+                room_join_allowed_internal(&pool, uid, 100).await.unwrap(),
+                "reference-visibility must match room access for user {uid}"
+            );
+        }
+        assert!(sha_referenced_in_accessible_room(&pool, 1, &sha_priv)
+            .await
+            .unwrap()); // creator
+        assert!(!sha_referenced_in_accessible_room(&pool, 2, &sha_priv)
+            .await
+            .unwrap()); // non-member CANNOT reference by hash
+
+        // Add Bob as a member → now he can reference it, still matching room access.
+        sqlx::raw_sql("INSERT INTO user_rooms (user_id, room_id, is_active) VALUES (2, 100, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sha_referenced_in_accessible_room(&pool, 2, &sha_priv)
+            .await
+            .unwrap());
+        assert_eq!(
+            sha_referenced_in_accessible_room(&pool, 2, &sha_priv)
+                .await
+                .unwrap(),
+            room_join_allowed_internal(&pool, 2, 100).await.unwrap()
+        );
+
+        // Soft-deleting the message removes it from the visibility surface for everyone.
+        delete_message_db(&pool, "msg-priv", 1).await.unwrap();
+        assert!(!sha_referenced_in_accessible_room(&pool, 1, &sha_priv)
+            .await
+            .unwrap());
     }
 }

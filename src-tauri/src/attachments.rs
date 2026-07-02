@@ -22,7 +22,8 @@ use sqlx::SqlitePool;
 use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::Duration;
-use tauri::Emitter;
+use tauri::{Emitter, State};
+use tauri_plugin_dialog::DialogExt;
 use uuid::Uuid;
 
 /// Hard cap on a single attachment (design §2). Bounds host memory (uploads buffer in RAM)
@@ -219,13 +220,77 @@ impl BlobCache {
     }
 }
 
-/// Client-side transfer state: one upload driver at a time, in-flight download assemblies
-/// keyed by sha256, and the LRU byte cache.
+/// Client-side transfer state: one upload driver at a time, fetches we've actually asked
+/// for (`pending`), in-flight download assemblies keyed by sha256, and the LRU byte cache.
 #[derive(Default)]
 pub struct ClientTransfers {
     upload: tokio::sync::Mutex<Option<ActiveUpload>>,
+    // attachment_id → expected sha256 of fetches this client sent. A FetchBegin is honored
+    // ONLY for an entry here (§9a trap 10: never trust an unsolicited FetchBegin), and
+    // pending + downloads together are capped so a broken host can't run the client's
+    // memory up N × 25 MiB.
+    pending: tokio::sync::Mutex<HashMap<String, String>>,
     downloads: tokio::sync::Mutex<HashMap<String, DownloadAssembly>>,
     cache: tokio::sync::Mutex<BlobCache>,
+}
+
+/// Cap on pending + in-flight download assemblies client-side (§9a trap 10).
+const MAX_CLIENT_ASSEMBLIES: usize = 4;
+
+/// Register a fetch the client is about to send. `Ok(true)` = send the Fetch frame;
+/// `Ok(false)` = the same content is already pending/in-flight (the eventual
+/// `attachment_ready`/`attachment_failed` event carries the sha, so the UI can key on it);
+/// `Err` = the client is at its concurrent-download cap.
+async fn register_pending_fetch(
+    state: &Arc<AppState>,
+    attachment_id: &str,
+    sha256: &str,
+) -> Result<bool, String> {
+    let mut pending = state.attachments_client.pending.lock().await;
+    let downloads = state.attachments_client.downloads.lock().await;
+    if pending.contains_key(attachment_id)
+        || pending.values().any(|s| s == sha256)
+        || downloads.contains_key(sha256)
+    {
+        return Ok(false);
+    }
+    if pending.len() + downloads.len() >= MAX_CLIENT_ASSEMBLIES {
+        return Err("Too many downloads in progress — try again shortly".to_string());
+    }
+    pending.insert(attachment_id.to_string(), sha256.to_string());
+    Ok(true)
+}
+
+/// Honor a FetchBegin only if it answers a fetch we sent (matching attachment id AND sha).
+/// Returns true when an assembly was created. The pending slot is consumed either way once
+/// the id matches, so a host replying with a bogus size can't pin a cap slot forever.
+async fn accept_fetch_begin(state: &Arc<AppState>, begin: &FetchBeginPayload) -> bool {
+    {
+        let mut pending = state.attachments_client.pending.lock().await;
+        match pending.get(&begin.attachment_id) {
+            Some(expected) if *expected == begin.sha256 => {
+                pending.remove(&begin.attachment_id);
+            }
+            _ => return false, // unsolicited or sha-swapped — drop
+        }
+    }
+    if begin.size == 0 || begin.size > MAX_ATTACHMENT_BYTES {
+        return false;
+    }
+    let mut downloads = state.attachments_client.downloads.lock().await;
+    if downloads.contains_key(&begin.sha256) {
+        return false; // an assembly for this content is already in flight — don't clobber it
+    }
+    downloads.insert(
+        begin.sha256.clone(),
+        DownloadAssembly {
+            attachment_id: begin.attachment_id.clone(),
+            expected: begin.size,
+            buf: Vec::with_capacity(begin.size),
+            next_seq: 0,
+        },
+    );
+    true
 }
 
 // ---- Shared helpers ----
@@ -743,12 +808,9 @@ pub async fn validate_chat_attachments(
 }
 
 // ---- Client-side driver + frame interceptor ----
-// The upload/fetch drivers become Tauri commands in Phase 4; until then they're only
-// exercised by the loopback integration tests.
 
 /// Upload `bytes` to the host over the live client connection and return the content sha.
 /// One upload at a time; progress is emitted as `attachment_progress` events.
-#[allow(dead_code)] // TODO(attachments Phase 4): wired by the upload command.
 pub async fn client_upload_attachment(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
@@ -793,7 +855,6 @@ pub async fn client_upload_attachment(
     result.map(|_| sha256)
 }
 
-#[allow(dead_code)]
 async fn drive_upload(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
@@ -849,7 +910,6 @@ async fn drive_upload(
     }
 }
 
-#[allow(dead_code)]
 async fn await_signal(
     rx: &mut tokio::sync::mpsc::Receiver<UploadSignal>,
 ) -> Result<UploadSignal, String> {
@@ -860,9 +920,10 @@ async fn await_signal(
     }
 }
 
-/// Request an attachment's bytes from the host (no-op if already cached — the `attachment_ready`
-/// event fires either way). The bytes land in the client cache; Phase 4's command reads them out.
-#[allow(dead_code)] // TODO(attachments Phase 4): wired by the fetch command.
+/// Request an attachment's bytes from the host (no-op if already cached or the same content
+/// is already in flight — the `attachment_ready`/`attachment_failed` events carry the sha,
+/// so the UI keys on it). The bytes land in the client cache; `get_attachment_bytes` reads
+/// them out.
 pub async fn client_fetch_attachment(
     app: &tauri::AppHandle,
     state: &Arc<AppState>,
@@ -882,26 +943,33 @@ pub async fn client_fetch_attachment(
             return Ok(());
         }
     }
-    {
-        let downloads = state.attachments_client.downloads.lock().await;
-        if downloads.contains_key(&sha256) {
-            return Ok(()); // already fetching this content; the ready event will cover it
-        }
+    if !register_pending_fetch(state, &attachment_id, &sha256).await? {
+        return Ok(()); // already pending/in flight for this content
     }
-    let payload =
-        serde_json::to_string(&FetchPayload { attachment_id }).map_err(|e| e.to_string())?;
-    send_secure_client(state, &control_frame(MessageType::AttachmentFetch, payload)).await
+    let payload = serde_json::to_string(&FetchPayload {
+        attachment_id: attachment_id.clone(),
+    })
+    .map_err(|e| e.to_string())?;
+    let sent =
+        send_secure_client(state, &control_frame(MessageType::AttachmentFetch, payload)).await;
+    if sent.is_err() {
+        // Release the cap slot we reserved — the request never left.
+        let mut pending = state.attachments_client.pending.lock().await;
+        pending.remove(&attachment_id);
+    }
+    sent
 }
 
-/// Read a fetched/uploaded blob out of the client cache (Phase 4's `get_attachment_bytes`).
-#[allow(dead_code)] // TODO(attachments Phase 4): wired by the bytes command.
+/// Read a fetched/uploaded blob out of the client cache (`get_attachment_bytes`).
 pub async fn cached_blob(state: &Arc<AppState>, sha256: &str) -> Option<Arc<Vec<u8>>> {
     let mut cache = state.attachments_client.cache.lock().await;
     cache.get(sha256)
 }
 
 /// Reset all client-side transfer state (disconnect/reconnect): fail the active upload,
-/// drop in-flight assemblies. The cache survives — content-addressed bytes stay valid.
+/// drop pending fetches and in-flight assemblies. The cache survives — content-addressed
+/// bytes stay valid. NOTE (§9a trap 12): dropped downloads emit no event from here; the UI
+/// must fail in-flight fetch states on `connection_lost` (Phase 5 obligation).
 pub async fn reset_client(state: &Arc<AppState>) {
     let upload = {
         let mut slot = state.attachments_client.upload.lock().await;
@@ -913,8 +981,8 @@ pub async fn reset_client(state: &Arc<AppState>) {
             .send(UploadSignal::Failed("Connection lost".to_string()))
             .await;
     }
-    let mut downloads = state.attachments_client.downloads.lock().await;
-    downloads.clear();
+    state.attachments_client.pending.lock().await.clear();
+    state.attachments_client.downloads.lock().await.clear();
 }
 
 /// Intercept attachment protocol frames on the client read path. Returns true when the frame
@@ -936,18 +1004,7 @@ pub async fn intercept_client_frame(
         }
         MessageType::AttachmentFetchBegin => {
             if let Ok(begin) = serde_json::from_str::<FetchBeginPayload>(&message.message) {
-                if begin.size > 0 && begin.size <= MAX_ATTACHMENT_BYTES {
-                    let mut downloads = state.attachments_client.downloads.lock().await;
-                    downloads.insert(
-                        begin.sha256.clone(),
-                        DownloadAssembly {
-                            attachment_id: begin.attachment_id,
-                            expected: begin.size,
-                            buf: Vec::with_capacity(begin.size),
-                            next_seq: 0,
-                        },
-                    );
-                }
+                accept_fetch_begin(state, &begin).await;
             }
             true
         }
@@ -974,6 +1031,12 @@ pub async fn intercept_client_frame(
                     }
                     let mut downloads = state.attachments_client.downloads.lock().await;
                     downloads.remove(sha);
+                }
+                // A failed fetch releases its pending cap slot (the host errored before or
+                // instead of FetchBegin — e.g. denied, gone, or busy).
+                if let Some(id) = &err.attachment_id {
+                    let mut pending = state.attachments_client.pending.lock().await;
+                    pending.remove(id);
                 }
                 let _ = app.emit(
                     "attachment_failed",
@@ -1075,6 +1138,174 @@ async fn finish_download(app: &tauri::AppHandle, state: &Arc<AppState>, payload:
             "sha256": done.sha256,
         }),
     );
+}
+
+// ---- Tauri command boundary (design §9 task 4.1) ----
+// One command each for upload / fetch / bytes / save, branching internally on host vs
+// client mode (the host participant never touches the wire — its bytes live in its own DB).
+
+/// What the composer needs to build an `AttachmentRef` after an upload: the content
+/// address the store assigned, plus the size and display name taken from the file.
+#[derive(Serialize)]
+pub struct UploadedAttachment {
+    pub sha256: String,
+    pub size: u64,
+    pub name: String,
+}
+
+/// Upload a file by path (from the attach dialog or a native drag-drop, both of which
+/// yield paths — the path is user-chosen, never derived from message content). Host mode
+/// stores straight into the blob store; client mode drives the wire upload.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn upload_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    path: String,
+) -> Result<UploadedAttachment, String> {
+    let meta = tokio::fs::metadata(&path)
+        .await
+        .map_err(|e| format!("Couldn't read the file: {e}"))?;
+    if !meta.is_file() {
+        return Err("Only files can be attached".to_string());
+    }
+    if meta.len() as usize > MAX_ATTACHMENT_BYTES {
+        return Err(format!(
+            "Files up to {} MB are supported",
+            MAX_ATTACHMENT_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = tokio::fs::read(&path)
+        .await
+        .map_err(|e| format!("Couldn't read the file: {e}"))?;
+    if bytes.is_empty() {
+        return Err("Cannot attach an empty file".to_string());
+    }
+    let name = std::path::Path::new(&path)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "file".to_string());
+    let size = bytes.len() as u64;
+
+    let is_server = *state.is_server.read().await;
+    let sha256 = if is_server {
+        let sha = blob_store::store_blob(db.inner(), &bytes)
+            .await
+            .map_err(|e| e.to_string())?;
+        // Mirror the client's instant-preview path: the host UI reads bytes back through
+        // get_attachment_bytes, which serves the host from its DB — nothing else needed.
+        emit_progress(&app, &sha, "upload", bytes.len(), bytes.len());
+        sha
+    } else {
+        client_upload_attachment(&app, state.inner(), bytes).await?
+    };
+    Ok(UploadedAttachment { sha256, size, name })
+}
+
+/// Make an attachment's bytes available locally, firing `attachment_ready` (or
+/// `attachment_failed`) with the sha when they are. Host mode verifies its own store;
+/// client mode pulls over the wire (auto-fetch and click-to-download share this path).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn fetch_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    attachment_id: String,
+    sha256: String,
+) -> Result<(), String> {
+    let is_server = *state.is_server.read().await;
+    if !is_server {
+        return client_fetch_attachment(&app, state.inner(), attachment_id, sha256).await;
+    }
+    match blob_store::complete_blob_size(db.inner(), &sha256).await {
+        Ok(Some(_)) => {
+            let _ = app.emit(
+                "attachment_ready",
+                serde_json::json!({ "attachment_id": attachment_id, "sha256": sha256 }),
+            );
+            Ok(())
+        }
+        _ => {
+            let _ = app.emit(
+                "attachment_failed",
+                serde_json::json!({
+                    "sha256": sha256,
+                    "attachment_id": attachment_id,
+                    "reason": "Attachment is no longer available",
+                }),
+            );
+            Ok(())
+        }
+    }
+}
+
+/// Hand an available blob's bytes to the webview as a raw IPC response (never JSON) —
+/// the UI turns them into an object URL for previews. Host reads its store; client reads
+/// its cache (populated by fetch_attachment / its own upload).
+#[tauri::command(rename_all = "snake_case")]
+pub async fn get_attachment_bytes(
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    sha256: String,
+) -> Result<tauri::ipc::Response, String> {
+    let bytes = attachment_bytes(state.inner(), db.inner(), &sha256).await?;
+    Ok(tauri::ipc::Response::new(bytes))
+}
+
+/// Save an attachment to disk. The (sanitized) original filename is ONLY the dialog's
+/// suggestion — the user-chosen dialog path is the single path we write (design §6).
+/// Returns false when the user cancels the dialog.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn save_attachment(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    sha256: String,
+    suggested_name: String,
+) -> Result<bool, String> {
+    let bytes = attachment_bytes(state.inner(), db.inner(), &sha256).await?;
+    let safe_name = crate::sanitize::sanitize_filename(&suggested_name);
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    app.dialog()
+        .file()
+        .set_file_name(&safe_name)
+        .save_file(move |picked| {
+            let _ = tx.send(picked);
+        });
+    let Some(picked) = rx
+        .await
+        .map_err(|_| "The save dialog closed unexpectedly".to_string())?
+    else {
+        return Ok(false); // user cancelled
+    };
+    let dest = picked.into_path().map_err(|e| e.to_string())?;
+    tokio::fs::write(&dest, &bytes)
+        .await
+        .map_err(|e| format!("Couldn't save the file: {e}"))?;
+    Ok(true)
+}
+
+/// Shared bytes lookup for the two read commands: host → blob store, client → cache.
+async fn attachment_bytes(
+    state: &Arc<AppState>,
+    pool: &SqlitePool,
+    sha256: &str,
+) -> Result<Vec<u8>, String> {
+    if !is_hex_sha256(sha256) {
+        return Err("Invalid attachment hash".to_string());
+    }
+    if *state.is_server.read().await {
+        blob_store::read_blob(pool, sha256)
+            .await
+            .map_err(|e| e.to_string())?
+            .ok_or_else(|| "Attachment is no longer available".to_string())
+    } else {
+        cached_blob(state, sha256)
+            .await
+            .map(|arc| arc.as_ref().clone())
+            .ok_or_else(|| "Attachment isn't downloaded yet".to_string())
+    }
 }
 
 #[cfg(test)]
@@ -1614,6 +1845,104 @@ mod transfer_tests {
         assert!(validate_chat_attachments(&pool, &[valid.clone(), valid])
             .await
             .is_err());
+    }
+
+    #[tokio::test]
+    async fn fetch_begin_is_only_honored_for_requested_fetches() {
+        let state = test_state();
+        let sha = blob_store::hex_sha256(b"content");
+
+        // Unsolicited FetchBegin: rejected, no assembly allocated (§9a trap 10).
+        let unsolicited = FetchBeginPayload {
+            attachment_id: "att-x".to_string(),
+            sha256: sha.clone(),
+            size: 1024,
+        };
+        assert!(!accept_fetch_begin(&state, &unsolicited).await);
+        assert!(state.attachments_client.downloads.lock().await.is_empty());
+
+        // Requested fetch: accepted once, pending slot consumed.
+        assert!(register_pending_fetch(&state, "att-x", &sha).await.unwrap());
+        assert!(accept_fetch_begin(&state, &unsolicited).await);
+        assert!(state
+            .attachments_client
+            .downloads
+            .lock()
+            .await
+            .contains_key(&sha));
+        // A repeat Begin for the same content is unsolicited again AND must not clobber
+        // the in-flight assembly.
+        assert!(!accept_fetch_begin(&state, &unsolicited).await);
+
+        // A sha-swapped Begin for a pending id is rejected (host can't substitute content).
+        let other_sha = blob_store::hex_sha256(b"other");
+        assert!(register_pending_fetch(&state, "att-y", &other_sha)
+            .await
+            .unwrap());
+        let swapped = FetchBeginPayload {
+            attachment_id: "att-y".to_string(),
+            sha256: sha.clone(),
+            size: 1024,
+        };
+        assert!(!accept_fetch_begin(&state, &swapped).await);
+
+        // An oversize Begin consumes the pending slot but allocates nothing.
+        assert!(register_pending_fetch(&state, "att-z", &sha).await.is_ok());
+        // (att-z shares sha with an in-flight download, so register dedupes it — use a
+        // fresh sha to exercise the size gate.)
+        let big_sha = blob_store::hex_sha256(b"big");
+        assert!(register_pending_fetch(&state, "att-big", &big_sha)
+            .await
+            .unwrap());
+        let oversize = FetchBeginPayload {
+            attachment_id: "att-big".to_string(),
+            sha256: big_sha.clone(),
+            size: MAX_ATTACHMENT_BYTES + 1,
+        };
+        assert!(!accept_fetch_begin(&state, &oversize).await);
+        assert!(!state
+            .attachments_client
+            .downloads
+            .lock()
+            .await
+            .contains_key(&big_sha));
+        assert!(!state
+            .attachments_client
+            .pending
+            .lock()
+            .await
+            .contains_key("att-big"));
+    }
+
+    #[tokio::test]
+    async fn pending_fetch_registry_dedupes_and_caps() {
+        let state = test_state();
+
+        // Same id or same content dedupes to Ok(false) — one wire fetch per content.
+        let sha0 = blob_store::hex_sha256(b"c0");
+        assert!(register_pending_fetch(&state, "a0", &sha0).await.unwrap());
+        assert!(!register_pending_fetch(&state, "a0", &sha0).await.unwrap());
+        assert!(!register_pending_fetch(&state, "a0-dup", &sha0)
+            .await
+            .unwrap());
+
+        // Fill to the cap with distinct content, then the next registration errors.
+        for i in 1..MAX_CLIENT_ASSEMBLIES {
+            let sha = blob_store::hex_sha256(format!("c{i}").as_bytes());
+            assert!(register_pending_fetch(&state, &format!("a{i}"), &sha)
+                .await
+                .unwrap());
+        }
+        let overflow_sha = blob_store::hex_sha256(b"overflow");
+        assert!(register_pending_fetch(&state, "a-overflow", &overflow_sha)
+            .await
+            .is_err());
+
+        // reset_client releases every slot.
+        reset_client(&state).await;
+        assert!(register_pending_fetch(&state, "a-overflow", &overflow_sha)
+            .await
+            .unwrap());
     }
 
     /// Two connections uploading identical bytes concurrently must both end in a

@@ -155,6 +155,12 @@ pub fn run() {
             send_as_server_participant,
             client_connect_to_server,
             send_as_client,
+            // Attachments (docs/architecture/attachments.md)
+            sockets::send_message_with_attachments,
+            attachments::upload_attachment,
+            attachments::fetch_attachment,
+            attachments::get_attachment_bytes,
+            attachments::save_attachment,
             server_participant_join_room,
             client_join_room,
             client_leave_room,

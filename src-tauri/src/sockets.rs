@@ -1688,9 +1688,52 @@ async fn handle_server_message(
                     }
                     return Ok(());
                 }
+                // Attachment-bearing chats persist the message row + sidecar rows BEFORE
+                // distributing (§9a trap 11): recipients auto-fetch on receipt, and the
+                // fetch resolves through these rows — distributing first would race it
+                // into a spurious "no longer available".
+                if let Err(e) = save_message_internal(
+                    &pool,
+                    message.room_id as i64,
+                    message.user_id as i64,
+                    message.message.clone(),
+                    "Chat".to_string(),
+                    message.is_emoji,
+                    message.message_id.clone(),
+                )
+                .await
+                {
+                    tracing::error!("Failed to save chat message to db: {}", e);
+                    return Ok(());
+                }
+                if let Err(e) =
+                    insert_attachments_for_message(&pool, &message.message_id, refs).await
+                {
+                    tracing::error!("Failed to save attachment metadata: {}", e);
+                    return Ok(());
+                }
+                distribute_message_to_all(
+                    &app,
+                    &state,
+                    &message.room,
+                    &message,
+                    Some(message.user_id),
+                )
+                .await;
+                let pool_clone = pool.clone();
+                let state_clone = Arc::clone(&state);
+                let app_clone = app.clone();
+                let room = message.room.clone();
+                let room_id = message.room_id;
+                tauri::async_runtime::spawn(async move {
+                    notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id)
+                        .await;
+                });
+                return Ok(());
             }
-            // Distribute first (live delivery to in-room clients), then persist and refresh
-            // unread badges in a single task so the unread recompute sees the saved row.
+            // Plain chats keep the low-latency order: distribute first (live delivery to
+            // in-room clients), then persist and refresh unread badges in a single task so
+            // the unread recompute sees the saved row.
             distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
                 .await;
 
@@ -1701,7 +1744,6 @@ async fn handle_server_message(
             let room_id = message.room_id;
             let msg_clone = message.clone();
             tauri::async_runtime::spawn(async move {
-                let message_id = msg_clone.message_id.clone();
                 if let Err(e) = save_message_internal(
                     &pool_clone,
                     msg_clone.room_id as i64,
@@ -1715,15 +1757,6 @@ async fn handle_server_message(
                 {
                     tracing::error!("Failed to save chat message to db: {}", e);
                     return;
-                }
-                // The sidecar rows are a separate insert from the message row (§9a trap 2);
-                // history and fetch resolution both key off them.
-                if let Some(refs) = &msg_clone.attachments {
-                    if let Err(e) =
-                        insert_attachments_for_message(&pool_clone, &message_id, refs).await
-                    {
-                        tracing::error!("Failed to save attachment metadata: {}", e);
-                    }
                 }
                 notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id).await;
             });
@@ -2281,6 +2314,88 @@ pub async fn send_as_client(
         }
     }
 
+    Ok(())
+}
+
+/// Send a Chat carrying attachment refs, in either mode. The blobs must already be uploaded
+/// (`upload_attachment`) — this sends only the metadata-bearing message. The caption may be
+/// empty (a bare file drop is a valid message). Host mode persists the message + sidecar
+/// rows BEFORE distributing (§9a trap 11); client mode sends the frame and echoes locally,
+/// mirroring send_as_client.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn send_message_with_attachments(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    message: String,
+    user_id: u64,
+    is_emoji: bool,
+    attachments: Vec<AttachmentRef>,
+) -> Result<(), String> {
+    if attachments.is_empty() {
+        return Err("Nothing attached".to_string());
+    }
+    if message.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(format!("Message exceeds {} characters", MAX_MESSAGE_CHARS));
+    }
+
+    let username = state.username.read().await.clone();
+    let room = state.current_room.read().await.clone();
+    let room_id = state.current_room_id.read().await.unwrap_or(1);
+
+    let chat_message = Message {
+        version: PROTOCOL_VERSION,
+        message_type: MessageType::Chat,
+        username: username.clone(),
+        user_id,
+        message: message.clone(),
+        room_id,
+        room,
+        created_at: now_secs(),
+        is_emoji,
+        email: None,
+        attachments: Some(attachments.clone()),
+        features: None,
+        message_id: Uuid::new_v4().to_string(),
+    };
+
+    if *state.is_server.read().await {
+        // The host validates its own sends against the same rules it enforces on clients.
+        crate::attachments::validate_chat_attachments(db.inner(), &attachments).await?;
+        save_message_internal(
+            db.inner(),
+            chat_message.room_id as i64,
+            chat_message.user_id as i64,
+            chat_message.message.clone(),
+            "Chat".to_string(),
+            chat_message.is_emoji,
+            chat_message.message_id.clone(),
+        )
+        .await
+        .map_err(|e| format!("Failed to save message: {e}"))?;
+        insert_attachments_for_message(db.inner(), &chat_message.message_id, &attachments)
+            .await
+            .map_err(|e| e.to_string())?;
+        distribute_message_to_all(&app, state.inner(), &chat_message.room, &chat_message, None)
+            .await;
+
+        let pool_clone = db.inner().clone();
+        let state_clone = Arc::clone(state.inner());
+        let app_clone = app.clone();
+        let room = chat_message.room.clone();
+        let room_id = chat_message.room_id;
+        tauri::async_runtime::spawn(async move {
+            notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id).await;
+        });
+    } else {
+        send_secure_client(state.inner(), &chat_message)
+            .await
+            .map_err(|e| format!("Failed to send message to server: {}", e))?;
+        // Show in own UI immediately (don't wait for the server echo).
+        if let Ok(payload) = serde_json::to_string(&chat_message) {
+            let _ = app.emit("message", payload);
+        }
+    }
     Ok(())
 }
 

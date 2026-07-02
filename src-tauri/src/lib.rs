@@ -109,7 +109,24 @@ pub fn run() {
                 .state::<std::sync::Arc<sockets::AppState>>()
                 .pool
                 .set(pool.clone());
-            app.manage(pool); // makes the pool available to commands
+            app.manage(pool.clone()); // makes the pool available to commands
+
+            // Age-gated orphan-blob sweep: collect attachment blobs no message references and
+            // older than the grace window (covers a crashed upload's leftover blob, and a
+            // deleted message's blob after its sidecar rows are dropped). Runs at startup and
+            // hourly for the app's lifetime; a no-op on a client (no blobs stored locally).
+            // The grace window keeps it from reaping a fresh in-flight upload (§9a trap 6).
+            tauri::async_runtime::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    ticker.tick().await;
+                    match blob_store::delete_orphan_blobs(&pool, Some(3600)).await {
+                        Ok(n) if n > 0 => tracing::info!("Swept {} orphan attachment blob(s)", n),
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("Orphan blob sweep failed: {}", e),
+                    }
+                }
+            });
 
             Ok(())
         })

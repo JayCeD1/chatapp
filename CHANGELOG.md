@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **File & image attachments.** Share files and images in any channel or DM.
+  Attach via the composer's paperclip (file picker) or by dragging files onto
+  the window; images preview inline (small ones load automatically, larger ones
+  on click), other files show a download card. Up to 5 files per message, 25 MB
+  each, with a caption or on their own.
+  - Transfer is chunked over the existing encrypted (Noise) connection — no new
+    ports or protocols. Files are content-addressed (SHA-256), so re-sending the
+    same file transfers it only once, and verified end-to-end on receipt.
+  - Stored encrypted at rest in the same SQLCipher database as messages, behind
+    a storage abstraction that can be swapped for another backend without
+    touching the chat, transfer, or UI code.
+  - Designed for a future end-to-end-encrypted path from day one (the server
+    treats attachment bytes as opaque blobs and never inspects them); see
+    `docs/architecture/attachments.md` and ADR-0005. Orphaned/deleted-message
+    blobs are swept on an hourly grace-gated GC.
+
 ## [0.5.0] - 2026-07-01
 
 ### Added

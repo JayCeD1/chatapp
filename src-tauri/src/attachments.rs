@@ -48,6 +48,10 @@ const CHUNK_BURST_BYTES: f64 = 8.0 * 1024.0 * 1024.0;
 const MAX_CHUNK_B64_LEN: usize = 61_440;
 /// How long the client upload driver waits for each host control reply.
 const CONTROL_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Per-frame send timeout while streaming a download, so a black-holed TCP write (a peer that
+/// vanished without a FIN) can't pin a download slot + its 25 MiB buffer for minutes until
+/// TCP retransmission gives up (§9a trap 13).
+const STREAM_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 /// Client-side in-memory blob cache budget (session-scoped LRU; re-fetching on LAN is cheap).
 const CLIENT_CACHE_MAX_BYTES: usize = 256 * 1024 * 1024;
 
@@ -678,6 +682,19 @@ pub async fn handle_fetch(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64
     });
 }
 
+/// Send one frame with a timeout (§9a trap 13). Returns false on error OR timeout, so the
+/// streaming caller aborts and its slot is released instead of pinned on a dead socket.
+async fn send_frame_timed(
+    writer: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
+    transport: &Arc<tokio::sync::Mutex<snow::TransportState>>,
+    msg: &Message,
+) -> bool {
+    matches!(
+        tokio::time::timeout(STREAM_SEND_TIMEOUT, send_secure(writer, transport, msg)).await,
+        Ok(Ok(())),
+    )
+}
+
 /// The streaming half of a fetch: read the blob (single snapshot), then FetchBegin → chunk
 /// loop → FetchDone over the requester's connection. Sequential awaited writes give natural
 /// TCP backpressure; the writer mutex is released between chunks so chat frames interleave.
@@ -734,13 +751,12 @@ async fn stream_blob_to_client(
         size: bytes.len(),
     })
     .unwrap_or_default();
-    if send_secure(
+    if !send_frame_timed(
         &writer,
         &transport,
         &control_frame(MessageType::AttachmentFetchBegin, begin),
     )
     .await
-    .is_err()
     {
         return;
     }
@@ -752,13 +768,12 @@ async fn stream_blob_to_client(
             data: BASE64.encode(chunk),
         })
         .unwrap_or_default();
-        if send_secure(
+        if !send_frame_timed(
             &writer,
             &transport,
             &control_frame(MessageType::AttachmentChunk, payload),
         )
         .await
-        .is_err()
         {
             return;
         }
@@ -769,7 +784,7 @@ async fn stream_blob_to_client(
         sha256: sha256.to_string(),
     })
     .unwrap_or_default();
-    let _ = send_secure(
+    let _ = send_frame_timed(
         &writer,
         &transport,
         &control_frame(MessageType::AttachmentFetchDone, done),

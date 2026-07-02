@@ -1,10 +1,10 @@
 use crate::db_queries::{
-    add_room_member_internal, create_room_internal, delete_message_db, edit_message_db,
-    get_attachments_for_message_ids, get_chat_rooms_internal, get_or_create_dm_internal,
-    get_room_messages_internal, get_room_reactions_internal, get_unread_counts_internal,
-    insert_attachments_for_message, list_users_internal, room_join_allowed_internal,
-    save_message_internal, toggle_reaction_db, touch_last_read_internal, upsert_user_internal,
-    ChatRoom,
+    add_room_member_internal, create_room_internal, delete_attachments_for_message,
+    delete_message_db, edit_message_db, get_attachments_for_message_ids, get_chat_rooms_internal,
+    get_or_create_dm_internal, get_room_messages_internal, get_room_reactions_internal,
+    get_unread_counts_internal, insert_attachments_for_message, list_users_internal,
+    room_join_allowed_internal, save_message_internal, toggle_reaction_db,
+    touch_last_read_internal, upsert_user_internal, ChatRoom,
 };
 use crate::error::{AppError, AppResult};
 use crate::secure;
@@ -1902,6 +1902,15 @@ async fn handle_server_message(
             let editor = auth_user_id.unwrap_or(message.user_id) as i64;
             if let Ok(rows) = delete_message_db(&pool, &message.message_id, editor).await {
                 if rows > 0 {
+                    // Drop the deleted message's attachment sidecar rows so its files leave
+                    // the fetch surface immediately (get_attachment_fetch_info → None). The
+                    // now-orphaned blobs are collected by the age-gated periodic sweep — NOT
+                    // here (§9a trap 6: an unscoped/ungated blob delete could reap another
+                    // user's in-flight upload sharing the same content).
+                    if let Err(e) = delete_attachments_for_message(&pool, &message.message_id).await
+                    {
+                        tracing::error!("Failed to drop attachment rows on delete: {}", e);
+                    }
                     let mut del = message.clone();
                     del.message = String::new();
                     // A deleted message's broadcast must not carry its attachment refs

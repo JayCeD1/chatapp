@@ -114,6 +114,29 @@ export const useAttachments = () => {
       }),
     );
 
+    // On a dropped connection the backend clears in-flight download assemblies silently
+    // (§9a trap 12), so fail any still-loading fetch here rather than leave a card spinning.
+    // Already-ready previews keep their bytes (content-addressed, still valid).
+    unlisten.push(
+      listen("connection_lost", () => {
+        wantUrlRef.current.clear();
+        Object.keys(waitersRef.current).forEach((sha) =>
+          settleWaiters(sha, "Connection lost"),
+        );
+        setViews((prev) => {
+          const next = { ...prev };
+          for (const [sha, v] of Object.entries(next)) {
+            if (v.status === "loading")
+              next[sha] = {
+                status: "failed",
+                error: "Connection lost — retry",
+              };
+          }
+          return next;
+        });
+      }),
+    );
+
     return () => {
       unlisten.forEach((p) => p.then((u) => u()));
       Object.values(urlsRef.current).forEach((u) => URL.revokeObjectURL(u));

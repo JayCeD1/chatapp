@@ -74,3 +74,39 @@ change (not yet done — payload is still the inline `message` field).
 **Consequences.** Cheap insurance now in place: v1 (plaintext) and an eventual v2 (ciphertext)
 can coexist, and a peer can branch/reject on `version`. Next step toward E2EE is separating
 content from metadata (Constraint 2).
+
+---
+
+## ADR-0005 — Attachments: chunked transfer over Noise, content-addressed SQLCipher blob store, capability-gated
+
+**Status:** Accepted (implemented) — full design in [attachments.md](./attachments.md)
+
+**Context.** File/image sharing (messaging-platform Constraint 8) was the first post-audit
+feature. Constraint 8 requires the encrypted-blob + metadata-sidecar pattern *from day one*,
+and the gap analysis asked that new message content go under a separable content sub-object
+(Constraint 2), so a future "encrypt the content" stays localized.
+
+**Decision.** Four load-bearing choices:
+1. **Envelope.** Attachments ride as an optional, serde-defaulted `attachments: Vec<AttachmentRef>`
+   content sub-object on `Message` (metadata only — id, sha256, name, mime, size, dims). Blob
+   bytes never ride a Chat frame. **No `PROTOCOL_VERSION` bump:** the real coexistence hazard is
+   an unknown `MessageType` (an old host drops the connection on parse failure), so the feature
+   is gated on a **host capability flag** (`features: ["attachments-v1"]` on the Identity frame),
+   not a version bump.
+2. **Transfer.** Chunked (44 KiB) over the existing Noise connection — the true per-frame cap is
+   Noise's 65 535-byte record, not the 10 MiB app frame. Two-phase upload (blob first, verified
+   against its declared sha *before* persisting), pull-based membership-gated download. A second
+   blob channel was rejected (duplicate session/auth surface).
+3. **Storage** behind a replaceable `blob_store` seam (maintainer requirement): content-addressed
+   (sha256) chunked BLOB rows in the existing SQLCipher DB — inherits encryption-at-rest for free
+   and removes the path-traversal class. Filesystem/object-storage backends can replace it without
+   touching wire or app code. 25 MiB cap.
+4. **Opacity.** The host never parses blob bytes (no thumbnailing/indexing/sniffing) — so swapping
+   plaintext blobs for ciphertext later is localized.
+
+**Consequences.** Constraint 8 goes from N/A to met; Constraint 2 improves (content is now a
+separable sub-object). New host-visible, **E2EE-incompatible** behaviors are logged in the gap
+analysis (plaintext-readable blobs, cross-user sha dedup, visible filename/mime metadata). One
+open item for a future release gate: sha-based Chat-ref validation currently lets any room member
+fetch any stored blob whose hash they learn — either scope validation to shas the sender can
+already see, or amend Constraints 6/8 to accept it (attachments.md §9a item 9).

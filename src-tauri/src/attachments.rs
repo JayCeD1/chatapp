@@ -1076,3 +1076,564 @@ async fn finish_download(app: &tauri::AppHandle, state: &Arc<AppState>, payload:
         }),
     );
 }
+
+#[cfg(test)]
+mod transfer_tests {
+    use super::*;
+    use crate::db_queries::{
+        create_room_internal, delete_message_db, insert_attachments_for_message,
+        save_message_internal,
+    };
+    use crate::secure;
+    use crate::sockets::{read_frame, ClientConnection};
+    use snow::TransportState;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
+
+    fn test_state() -> Arc<AppState> {
+        Arc::new(AppState {
+            server_streams: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            client_stream: Arc::new(tokio::sync::Mutex::new(None)),
+            client_transport: Arc::new(tokio::sync::Mutex::new(None)),
+            client_listener: Arc::new(tokio::sync::Mutex::new(None)),
+            client_heartbeat: Arc::new(tokio::sync::Mutex::new(None)),
+            discovery_responder: Arc::new(tokio::sync::Mutex::new(None)),
+            room_clients: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            ip_conn_counts: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            attachments_host: Default::default(),
+            attachments_client: Default::default(),
+            username: tokio::sync::RwLock::new(String::new()),
+            user_id: tokio::sync::RwLock::new(None),
+            is_server: tokio::sync::RwLock::new(false),
+            current_room: tokio::sync::RwLock::new(String::new()),
+            current_room_id: tokio::sync::RwLock::new(None),
+            server_addr: tokio::sync::RwLock::new(None),
+            pool: std::sync::OnceLock::new(),
+            mdns: std::sync::Mutex::new(None),
+        })
+    }
+
+    async fn test_pool() -> SqlitePool {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory db");
+        crate::db::run_migrations(&pool)
+            .await
+            .expect("run migrations");
+        sqlx::raw_sql("PRAGMA foreign_keys=ON;")
+            .execute(&pool)
+            .await
+            .expect("enable foreign keys");
+        sqlx::raw_sql(
+            "INSERT INTO users (id, name, email, department_id)
+                 VALUES (1, 'Alice', 'a@x', 1), (2, 'Bob', 'b@x', 1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed users");
+        pool
+    }
+
+    /// The client's view of a registered connection: the host side lives in
+    /// `state.server_streams[user_id]`; the returned halves keep the socket alive
+    /// and let the test read the host's encrypted replies.
+    struct TestClient {
+        reader: tokio::net::tcp::OwnedReadHalf,
+        transport: TransportState,
+        // Held so the host-side read path never sees an EOF mid-test.
+        _writer: tokio::net::tcp::OwnedWriteHalf,
+        _host_reader: tokio::net::tcp::OwnedReadHalf,
+    }
+
+    /// Real socket pair + real Noise handshake, host side registered in server_streams
+    /// under `user_id` — exactly the state the host handlers act on.
+    async fn connect_client(state: &Arc<AppState>, user_id: u64) -> TestClient {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let addr = listener.local_addr().expect("local addr");
+        let psk = secure::derive_psk("transfer-tests");
+
+        let (host_side, client_side) = tokio::join!(
+            async {
+                let (stream, _) = listener.accept().await.expect("accept");
+                let (mut r, mut w) = stream.into_split();
+                let t = secure::responder_handshake(&mut r, &mut w, &psk)
+                    .await
+                    .expect("responder handshake");
+                (r, w, t)
+            },
+            async {
+                let stream = tokio::net::TcpStream::connect(addr).await.expect("connect");
+                let (mut r, mut w) = stream.into_split();
+                let t = secure::initiator_handshake(&mut r, &mut w, &psk)
+                    .await
+                    .expect("initiator handshake");
+                (r, w, t)
+            }
+        );
+        let (host_r, host_w, host_t) = host_side;
+        let (cli_r, cli_w, cli_t) = client_side;
+
+        let conn = ClientConnection {
+            writer: Arc::new(tokio::sync::Mutex::new(host_w)),
+            transport: Arc::new(tokio::sync::Mutex::new(host_t)),
+            username: format!("user-{user_id}"),
+            current_room: "Company Wide".to_string(),
+            room_id: 1,
+            user_id,
+            conn_id: user_id,
+        };
+        state.server_streams.lock().await.insert(user_id, conn);
+
+        TestClient {
+            reader: cli_r,
+            transport: cli_t,
+            _writer: cli_w,
+            _host_reader: host_r,
+        }
+    }
+
+    /// Read + decrypt the next host reply off the client socket (bounded, so a missing
+    /// reply fails the test instead of hanging it).
+    async fn next_reply(client: &mut TestClient) -> Message {
+        let frame = tokio::time::timeout(REPLY_TIMEOUT, read_frame(&mut client.reader))
+            .await
+            .expect("timed out waiting for a host reply")
+            .expect("read frame")
+            .expect("non-empty frame");
+        let plain = secure::decrypt(&mut client.transport, &frame).expect("decrypt reply");
+        serde_json::from_str(std::str::from_utf8(&plain).expect("utf8"))
+            .expect("reply deserializes as Message")
+    }
+
+    fn patterned_bytes(len: usize) -> Vec<u8> {
+        (0..len).map(|i| (i % 249) as u8).collect()
+    }
+
+    fn start_payload(sha256: &str, size: usize) -> String {
+        serde_json::to_string(&UploadStartPayload {
+            sha256: sha256.to_string(),
+            size,
+        })
+        .unwrap()
+    }
+
+    fn chunk_payload(sha256: &str, seq: u64, raw: &[u8]) -> String {
+        serde_json::to_string(&ChunkPayload {
+            sha256: sha256.to_string(),
+            seq,
+            data: BASE64.encode(raw),
+        })
+        .unwrap()
+    }
+
+    fn sha_payload(sha256: &str) -> String {
+        serde_json::to_string(&ShaPayload {
+            sha256: sha256.to_string(),
+        })
+        .unwrap()
+    }
+
+    fn fetch_payload(attachment_id: &str) -> String {
+        serde_json::to_string(&FetchPayload {
+            attachment_id: attachment_id.to_string(),
+        })
+        .unwrap()
+    }
+
+    /// Drive a complete wire upload of `bytes` for an already-connected `user_id`.
+    async fn upload_via_wire(
+        state: &Arc<AppState>,
+        pool: &SqlitePool,
+        client: &mut TestClient,
+        user_id: u64,
+        bytes: &[u8],
+    ) -> String {
+        let sha = blob_store::hex_sha256(bytes);
+        handle_upload_start(state, pool, user_id, &start_payload(&sha, bytes.len())).await;
+        let ready = next_reply(client).await;
+        assert_eq!(ready.message_type, MessageType::AttachmentUploadReady);
+        for (seq, chunk) in bytes.chunks(ATTACHMENT_CHUNK_BYTES).enumerate() {
+            handle_upload_chunk(state, user_id, &chunk_payload(&sha, seq as u64, chunk)).await;
+        }
+        handle_upload_done(state, pool, user_id, &sha_payload(&sha)).await;
+        let ok = next_reply(client).await;
+        assert_eq!(ok.message_type, MessageType::AttachmentUploadOk);
+        sha
+    }
+
+    /// Seed a Chat message row + attachment sidecar row pointing at `sha`, returning the
+    /// attachment id a fetch would use.
+    async fn seed_attachment_row(
+        pool: &SqlitePool,
+        room_id: i64,
+        author: i64,
+        message_id: &str,
+        sha: &str,
+        size: u64,
+    ) -> String {
+        save_message_internal(
+            pool,
+            room_id,
+            author,
+            "see attached".to_string(),
+            "Chat".to_string(),
+            false,
+            message_id.to_string(),
+        )
+        .await
+        .expect("save message row");
+        let attachment_id = format!("att-{message_id}");
+        insert_attachments_for_message(
+            pool,
+            message_id,
+            &[AttachmentRef {
+                id: attachment_id.clone(),
+                sha256: sha.to_string(),
+                name: "file.bin".to_string(),
+                mime: "application/octet-stream".to_string(),
+                size,
+                width: None,
+                height: None,
+            }],
+        )
+        .await
+        .expect("insert sidecar row");
+        attachment_id
+    }
+
+    #[tokio::test]
+    async fn upload_round_trips_and_fetch_streams_back_identical_bytes() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut client = connect_client(&state, 1).await;
+        let bytes = patterned_bytes(200 * 1024);
+
+        let sha = upload_via_wire(&state, &pool, &mut client, 1, &bytes).await;
+        assert!(blob_store::blob_exists_complete(&pool, &sha)
+            .await
+            .expect("exists check"));
+
+        let att_id = seed_attachment_row(&pool, 1, 1, "msg-rt", &sha, bytes.len() as u64).await;
+        handle_fetch(&state, &pool, 1, &fetch_payload(&att_id)).await;
+
+        let begin = next_reply(&mut client).await;
+        assert_eq!(begin.message_type, MessageType::AttachmentFetchBegin);
+        let begin: FetchBeginPayload = serde_json::from_str(&begin.message).expect("begin json");
+        assert_eq!(begin.sha256, sha);
+        assert_eq!(begin.size, bytes.len());
+
+        let mut assembled = Vec::with_capacity(bytes.len());
+        let mut expect_seq = 0u64;
+        loop {
+            let frame = next_reply(&mut client).await;
+            match frame.message_type {
+                MessageType::AttachmentChunk => {
+                    let chunk: ChunkPayload =
+                        serde_json::from_str(&frame.message).expect("chunk json");
+                    assert_eq!(chunk.sha256, sha);
+                    assert_eq!(chunk.seq, expect_seq, "chunks must arrive in order");
+                    expect_seq += 1;
+                    assembled.extend_from_slice(&BASE64.decode(&chunk.data).expect("b64"));
+                }
+                MessageType::AttachmentFetchDone => break,
+                other => panic!("unexpected frame during fetch: {other:?}"),
+            }
+        }
+        assert_eq!(assembled, bytes);
+        assert_eq!(blob_store::hex_sha256(&assembled), sha);
+    }
+
+    #[tokio::test]
+    async fn oversize_upload_start_is_rejected_before_buffering() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut client = connect_client(&state, 1).await;
+        let sha = blob_store::hex_sha256(b"whatever");
+
+        handle_upload_start(
+            &state,
+            &pool,
+            1,
+            &start_payload(&sha, MAX_ATTACHMENT_BYTES + 1),
+        )
+        .await;
+        let reply = next_reply(&mut client).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentError);
+
+        // No session was created: a chunk is silently dropped (no reply, no state)...
+        handle_upload_chunk(&state, 1, &chunk_payload(&sha, 0, b"data")).await;
+        assert!(state.attachments_host.uploads.lock().await.is_empty());
+
+        // ...and a subsequent valid Start still works.
+        handle_upload_start(&state, &pool, 1, &start_payload(&sha, 8)).await;
+        let reply = next_reply(&mut client).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentUploadReady);
+    }
+
+    #[tokio::test]
+    async fn upload_done_with_mismatched_hash_stores_nothing() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut client = connect_client(&state, 1).await;
+
+        let bytes = patterned_bytes(1024);
+        let true_sha = blob_store::hex_sha256(&bytes);
+        let declared_sha = blob_store::hex_sha256(b"something else entirely");
+
+        handle_upload_start(&state, &pool, 1, &start_payload(&declared_sha, bytes.len())).await;
+        assert_eq!(
+            next_reply(&mut client).await.message_type,
+            MessageType::AttachmentUploadReady
+        );
+        handle_upload_chunk(&state, 1, &chunk_payload(&declared_sha, 0, &bytes)).await;
+        handle_upload_done(&state, &pool, 1, &sha_payload(&declared_sha)).await;
+
+        let reply = next_reply(&mut client).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentError);
+        assert!(!blob_store::blob_exists_complete(&pool, &declared_sha)
+            .await
+            .unwrap());
+        assert!(!blob_store::blob_exists_complete(&pool, &true_sha)
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn out_of_order_chunk_aborts_the_upload() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut client = connect_client(&state, 1).await;
+        let bytes = patterned_bytes(100 * 1024);
+        let sha = blob_store::hex_sha256(&bytes);
+
+        handle_upload_start(&state, &pool, 1, &start_payload(&sha, bytes.len())).await;
+        assert_eq!(
+            next_reply(&mut client).await.message_type,
+            MessageType::AttachmentUploadReady
+        );
+        let chunks: Vec<&[u8]> = bytes.chunks(ATTACHMENT_CHUNK_BYTES).collect();
+        handle_upload_chunk(&state, 1, &chunk_payload(&sha, 0, chunks[0])).await;
+        handle_upload_chunk(&state, 1, &chunk_payload(&sha, 2, chunks[2])).await;
+
+        let reply = next_reply(&mut client).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentError);
+        assert!(state.attachments_host.uploads.lock().await.is_empty());
+
+        // The connection can start over cleanly.
+        handle_upload_start(&state, &pool, 1, &start_payload(&sha, bytes.len())).await;
+        assert_eq!(
+            next_reply(&mut client).await.message_type,
+            MessageType::AttachmentUploadReady
+        );
+    }
+
+    #[tokio::test]
+    async fn fetch_is_denied_to_non_members() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut alice = connect_client(&state, 1).await;
+        let mut bob = connect_client(&state, 2).await;
+
+        // Alice creates a private room (creator auto-joins) and posts an attachment there.
+        let room = create_room_internal(
+            &pool,
+            "alice-private".to_string(),
+            None,
+            None,
+            Some(true),
+            Some(1),
+        )
+        .await
+        .expect("create private room");
+        let room_id = room.id.expect("room id");
+
+        let bytes = patterned_bytes(64 * 1024);
+        let sha = upload_via_wire(&state, &pool, &mut alice, 1, &bytes).await;
+        let att_id =
+            seed_attachment_row(&pool, room_id, 1, "msg-priv", &sha, bytes.len() as u64).await;
+
+        // Bob is not a member: error reply, and no FetchBegin ever reaches him.
+        handle_fetch(&state, &pool, 2, &fetch_payload(&att_id)).await;
+        let reply = next_reply(&mut bob).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentError);
+        let err: ErrorPayload = serde_json::from_str(&reply.message).expect("error json");
+        assert!(err.reason.contains("authorized"), "got: {}", err.reason);
+
+        // Unknown attachment ids are indistinguishable from deleted ones.
+        handle_fetch(&state, &pool, 2, &fetch_payload("no-such-attachment")).await;
+        let reply = next_reply(&mut bob).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentError);
+        let err: ErrorPayload = serde_json::from_str(&reply.message).expect("error json");
+        assert!(
+            err.reason.contains("no longer available"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn deleted_message_attachment_is_unfetchable() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut client = connect_client(&state, 1).await;
+
+        let bytes = patterned_bytes(32 * 1024);
+        let sha = upload_via_wire(&state, &pool, &mut client, 1, &bytes).await;
+        let att_id = seed_attachment_row(&pool, 1, 1, "msg-del", &sha, bytes.len() as u64).await;
+
+        let deleted = delete_message_db(&pool, "msg-del", 1)
+            .await
+            .expect("delete");
+        assert_eq!(deleted, 1);
+
+        handle_fetch(&state, &pool, 1, &fetch_payload(&att_id)).await;
+        let reply = next_reply(&mut client).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentError);
+        let err: ErrorPayload = serde_json::from_str(&reply.message).expect("error json");
+        assert!(
+            err.reason.contains("no longer available"),
+            "got: {}",
+            err.reason
+        );
+    }
+
+    #[tokio::test]
+    async fn chat_frames_interleave_during_a_large_fetch() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut client = connect_client(&state, 1).await;
+
+        let bytes = patterned_bytes(4 * 1024 * 1024);
+        let sha = blob_store::store_blob(&pool, &bytes).await.expect("store");
+        let att_id = seed_attachment_row(&pool, 1, 1, "msg-big", &sha, bytes.len() as u64).await;
+
+        handle_fetch(&state, &pool, 1, &fetch_payload(&att_id)).await;
+        assert_eq!(
+            next_reply(&mut client).await.message_type,
+            MessageType::AttachmentFetchBegin
+        );
+
+        // While the chunk stream is flowing, race a Chat frame onto the same connection.
+        let conn = {
+            let streams = state.server_streams.lock().await;
+            let c = streams.get(&1).expect("registered conn");
+            (Arc::clone(&c.writer), Arc::clone(&c.transport))
+        };
+        let mut chat = control_frame(MessageType::Chat, "interleaved hello".to_string());
+        chat.room = "Company Wide".to_string();
+        chat.room_id = 1;
+        let sender = tauri::async_runtime::spawn(async move {
+            send_secure(&conn.0, &conn.1, &chat)
+                .await
+                .expect("chat send");
+        });
+
+        let mut saw_chat_at: Option<usize> = None;
+        let mut frames = 0usize;
+        loop {
+            let frame = next_reply(&mut client).await;
+            frames += 1;
+            match frame.message_type {
+                MessageType::Chat => saw_chat_at = Some(frames),
+                MessageType::AttachmentFetchDone => break,
+                MessageType::AttachmentChunk => {}
+                other => panic!("unexpected frame: {other:?}"),
+            }
+        }
+        sender.await.expect("sender task");
+        let position = saw_chat_at.expect("chat frame must arrive during the stream");
+        assert!(
+            position < frames,
+            "chat frame arrived at {position}, only with/after FetchDone at {frames} — head-of-line blocked"
+        );
+    }
+
+    #[tokio::test]
+    async fn duplicate_upload_start_after_stored_blob_fast_paths_to_ok() {
+        let state = test_state();
+        let pool = test_pool().await;
+        let mut client = connect_client(&state, 1).await;
+        let bytes = patterned_bytes(50 * 1024);
+
+        let sha = upload_via_wire(&state, &pool, &mut client, 1, &bytes).await;
+
+        // Same content again: immediate UploadOk, no Ready, no session created.
+        handle_upload_start(&state, &pool, 1, &start_payload(&sha, bytes.len())).await;
+        let reply = next_reply(&mut client).await;
+        assert_eq!(reply.message_type, MessageType::AttachmentUploadOk);
+        assert!(state.attachments_host.uploads.lock().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn validate_chat_attachments_rejects_bad_refs() {
+        let pool = test_pool().await;
+        let bytes = patterned_bytes(10 * 1024);
+        let sha = blob_store::store_blob(&pool, &bytes).await.expect("store");
+
+        let make_ref = |id: &str, sha: &str, size: u64| AttachmentRef {
+            id: id.to_string(),
+            sha256: sha.to_string(),
+            name: "f.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size,
+            width: None,
+            height: None,
+        };
+
+        // A valid single ref is accepted.
+        let valid = make_ref("a1", &sha, bytes.len() as u64);
+        assert!(
+            validate_chat_attachments(&pool, std::slice::from_ref(&valid))
+                .await
+                .is_ok()
+        );
+
+        // Too many refs.
+        let many: Vec<_> = (0..=MAX_ATTACHMENTS_PER_MESSAGE)
+            .map(|i| make_ref(&format!("m{i}"), &sha, bytes.len() as u64))
+            .collect();
+        assert!(validate_chat_attachments(&pool, &many).await.is_err());
+
+        // Size mismatch vs the stored blob.
+        let wrong_size = make_ref("a2", &sha, 1);
+        assert!(validate_chat_attachments(&pool, &[wrong_size])
+            .await
+            .is_err());
+
+        // Never-uploaded content.
+        let ghost_sha = blob_store::hex_sha256(b"never uploaded");
+        let ghost = make_ref("a3", &ghost_sha, 42);
+        assert!(validate_chat_attachments(&pool, &[ghost]).await.is_err());
+
+        // Duplicate ref ids within one message.
+        assert!(validate_chat_attachments(&pool, &[valid.clone(), valid])
+            .await
+            .is_err());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn byte_rate_limiter_refills_over_time() {
+        let mut limiter = ByteRateLimiter::new(tokio::time::Instant::now());
+
+        // The full burst is available up front...
+        assert!(limiter.allow(tokio::time::Instant::now(), CHUNK_BURST_BYTES as usize));
+        // ...then the bucket is empty.
+        assert!(!limiter.allow(tokio::time::Instant::now(), 1024));
+
+        // One second refills ~CHUNK_RATE_BYTES_PER_SEC.
+        tokio::time::advance(Duration::from_secs(1)).await;
+        assert!(limiter.allow(
+            tokio::time::Instant::now(),
+            (CHUNK_RATE_BYTES_PER_SEC as usize) - 1024
+        ));
+        assert!(!limiter.allow(
+            tokio::time::Instant::now(),
+            CHUNK_RATE_BYTES_PER_SEC as usize
+        ));
+    }
+}

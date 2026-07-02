@@ -46,3 +46,7 @@ thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+[dev-dependencies]
+# Paused-clock control (tokio::time::advance) for rate-limiter tests.
+tokio = { version = "1.47.1", features = ["test-util"] }
+

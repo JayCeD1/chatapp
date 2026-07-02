@@ -117,7 +117,7 @@ fn spawn_client_heartbeat(
 /// Read one length-prefixed frame: a 4-byte big-endian length header followed by
 /// that many payload bytes. Returns `Ok(None)` for a zero-length keep-alive frame.
 /// Rejects oversized frames so a malicious peer cannot trigger a huge allocation.
-async fn read_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
+pub(crate) async fn read_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
 where
     R: AsyncReadExt + Unpin,
 {

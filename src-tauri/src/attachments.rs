@@ -1085,23 +1085,40 @@ async fn handle_download_chunk(app: &tauri::AppHandle, state: &Arc<AppState>, pa
         return;
     };
     if chunk.data.len() > MAX_CHUNK_B64_LEN {
-        let mut downloads = state.attachments_client.downloads.lock().await;
-        downloads.remove(&chunk.sha256);
+        fail_download(
+            app,
+            state,
+            &chunk.sha256,
+            "Malformed attachment data — retry",
+        )
+        .await;
         return;
     }
     let Ok(bytes) = BASE64.decode(&chunk.data) else {
-        let mut downloads = state.attachments_client.downloads.lock().await;
-        downloads.remove(&chunk.sha256);
+        fail_download(
+            app,
+            state,
+            &chunk.sha256,
+            "Malformed attachment data — retry",
+        )
+        .await;
         return;
     };
 
     let progress = {
         let mut downloads = state.attachments_client.downloads.lock().await;
         let Some(asm) = downloads.get_mut(&chunk.sha256) else {
-            return; // unsolicited chunk — drop
+            return; // unsolicited chunk — drop (no assembly to fail)
         };
         if chunk.seq != asm.next_seq || asm.buf.len() + bytes.len() > asm.expected {
-            downloads.remove(&chunk.sha256);
+            drop(downloads);
+            fail_download(
+                app,
+                state,
+                &chunk.sha256,
+                "Attachment transfer error — retry",
+            )
+            .await;
             return;
         }
         asm.buf.extend_from_slice(&bytes);
@@ -1109,6 +1126,26 @@ async fn handle_download_chunk(app: &tauri::AppHandle, state: &Arc<AppState>, pa
         (asm.buf.len(), asm.expected)
     };
     emit_progress(app, &chunk.sha256, "download", progress.0, progress.1);
+}
+
+/// Tear down an in-flight download and tell the UI, so a mid-stream protocol error surfaces
+/// as a retryable failed card instead of a card that spins forever (§9a trap 12 family).
+async fn fail_download(app: &tauri::AppHandle, state: &Arc<AppState>, sha256: &str, reason: &str) {
+    let attachment_id = {
+        let mut downloads = state.attachments_client.downloads.lock().await;
+        downloads.remove(sha256).map(|asm| asm.attachment_id)
+    };
+    let Some(attachment_id) = attachment_id else {
+        return; // nothing in flight for this sha — no card to fail
+    };
+    let _ = app.emit(
+        "attachment_failed",
+        serde_json::json!({
+            "sha256": sha256,
+            "attachment_id": attachment_id,
+            "reason": reason,
+        }),
+    );
 }
 
 async fn finish_download(app: &tauri::AppHandle, state: &Arc<AppState>, payload: &str) {
@@ -1165,6 +1202,16 @@ pub struct UploadedAttachment {
 /// Upload a file by path (from the attach dialog or a native drag-drop, both of which
 /// yield paths — the path is user-chosen, never derived from message content). Host mode
 /// stores straight into the blob store; client mode drives the wire upload.
+///
+/// TRUST BOUNDARY (reviewed, accepted for this threat model): this command reads whatever
+/// absolute path the webview hands it. That is safe only because the webview is fully
+/// trusted — strict CSP, no remote content, our own bundled JS, and no `dangerouslySetInnerHTML`
+/// anywhere, so there is no script-injection point. The webview is *already* the full trust
+/// boundary for every command (send-as-user, connect, etc.); this one extends a webview
+/// compromise from "chat data" to "any readable file", which is why it is called out here.
+/// If untrusted content rendering is ever introduced, move the file-picker path Rust-side
+/// (open the dialog here, as `save_attachment` does) so the webview can't name arbitrary
+/// paths — recorded as §9a item 14.
 #[tauri::command(rename_all = "snake_case")]
 pub async fn upload_attachment(
     app: tauri::AppHandle,

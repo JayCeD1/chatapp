@@ -59,7 +59,10 @@ interface WorkspaceProps {
   preferences: Preferences;
   onSetPreferences: (patch: Partial<Preferences>) => void;
   attachmentsEnabled: boolean;
-  onSendAttachments: (text: string, attachments: AttachmentRef[]) => void;
+  onSendAttachments: (
+    text: string,
+    attachments: AttachmentRef[],
+  ) => Promise<boolean>;
 }
 
 export const Workspace: React.FC<WorkspaceProps> = ({

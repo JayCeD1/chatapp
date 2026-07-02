@@ -24,6 +24,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tauri::{Emitter, State};
 use tauri_plugin_dialog::DialogExt;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
 /// Hard cap on a single attachment (design §2). Bounds host memory (uploads buffer in RAM)
@@ -683,16 +684,31 @@ pub async fn handle_fetch(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64
 }
 
 /// Send one frame with a timeout (§9a trap 13). Returns false on error OR timeout, so the
-/// streaming caller aborts and its slot is released instead of pinned on a dead socket.
+/// streaming caller aborts and its download slot is released instead of pinned on a dead
+/// socket.
+///
+/// A timeout needs care: `tokio::time::timeout` cancels by DROPPING the `send_secure` future,
+/// which is not cancellation-safe — `secure::encrypt` has already advanced the Noise send
+/// nonce (and a partial frame may be on the wire), so the connection is now desynced and
+/// every later frame to this peer would fail the AEAD tag. Rather than leave it live-but-
+/// corrupted in `server_streams`, shut the write half down so it's a clean disconnect: after
+/// a 30s stall on a single ~60 KB frame the peer is almost certainly gone/asleep, and the
+/// client reconnects. (A plain send error means the socket is already broken — the read loop
+/// tears it down; no shutdown needed.)
 async fn send_frame_timed(
     writer: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     transport: &Arc<tokio::sync::Mutex<snow::TransportState>>,
     msg: &Message,
 ) -> bool {
-    matches!(
-        tokio::time::timeout(STREAM_SEND_TIMEOUT, send_secure(writer, transport, msg)).await,
-        Ok(Ok(())),
-    )
+    match tokio::time::timeout(STREAM_SEND_TIMEOUT, send_secure(writer, transport, msg)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            tracing::warn!("Attachment stream send timed out; closing the stalled connection");
+            let _ = writer.lock().await.shutdown().await;
+            false
+        }
+    }
 }
 
 /// The streaming half of a fetch: read the blob (single snapshot), then FetchBegin → chunk

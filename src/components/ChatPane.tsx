@@ -86,7 +86,10 @@ interface ChatPaneProps {
   // Attachments: whether the host supports them, the send handler, and the
   // download/preview lifecycle (owned by Workspace so it survives channel switches).
   attachmentsEnabled: boolean;
-  onSendAttachments: (text: string, attachments: AttachmentRef[]) => void;
+  onSendAttachments: (
+    text: string,
+    attachments: AttachmentRef[],
+  ) => Promise<boolean>;
   attachments: UseAttachments;
 }
 
@@ -378,12 +381,14 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     };
   }, [attachmentsEnabled]);
 
-  const handleSend = () => {
+  const handleSend = async () => {
     if (uploadingCount > 0) return; // wait for in-flight uploads to finish
     const text = inputText.trim();
     if (readyRefs.length > 0) {
-      // A message may carry attachments with or without a caption.
-      onSendAttachments(text, readyRefs);
+      // A message may carry attachments with or without a caption. Clear the composer only
+      // if the host accepted the send, so a rejection doesn't discard the user's files.
+      const ok = await onSendAttachments(text, readyRefs);
+      if (!ok) return;
       setPending([]);
       setInputText("");
       setShowEmoji(false);
@@ -404,7 +409,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
     const send = e.metaKey || e.ctrlKey || (sendOnEnter && !e.shiftKey);
     if (send) {
       e.preventDefault();
-      handleSend();
+      void handleSend();
     }
   };
 
@@ -928,7 +933,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
           </div>
 
           <button
-            onClick={handleSend}
+            onClick={() => void handleSend()}
             disabled={
               uploadingCount > 0 ||
               (!inputText.trim() && readyRefs.length === 0)
@@ -1022,7 +1027,7 @@ const AttachmentImage: React.FC<{
         <img
           src={view.url}
           alt={att.name}
-          className="max-w-[320px] max-h-[320px] object-cover"
+          className="max-w-[320px] max-h-[320px] object-contain"
         />
       </button>
     );

@@ -24,6 +24,11 @@ export interface AttachmentView {
 
 const IDLE: AttachmentView = { status: "idle" };
 
+// Cap on live preview object URLs: each pins a Blob in webview memory (independent of the
+// Rust-side LRU), so bound it here too. Evicted previews drop to idle and re-fetch from the
+// Rust cache on demand — cheap on a LAN.
+const MAX_PREVIEW_URLS = 64;
+
 /**
  * Owns the client-side download/preview lifecycle for attachments on rendered messages:
  * fetch orchestration, object-URL creation + revocation, and progress/failure tracking.
@@ -34,8 +39,9 @@ const IDLE: AttachmentView = { status: "idle" };
 export const useAttachments = () => {
   const [views, setViews] = useState<Record<string, AttachmentView>>({});
 
-  // Object URLs to revoke on unmount (sha → url).
+  // Object URLs to revoke on unmount (sha → url), plus creation order for LRU eviction.
   const urlsRef = useRef<Record<string, string>>({});
+  const urlOrderRef = useRef<string[]>([]);
   // shas we want an object URL built for on ready (image previews); a plain download
   // doesn't build one (avoids holding a 25 MiB blob URL for a file we only save to disk).
   const wantUrlRef = useRef<Set<string>>(new Set());
@@ -96,6 +102,19 @@ export const useAttachments = () => {
           }
           const url = URL.createObjectURL(blob);
           urlsRef.current[sha256] = url;
+          urlOrderRef.current.push(sha256);
+          // Evict the oldest preview URL(s) over the cap: revoke + drop to idle so its
+          // component releases the <img> and re-fetches on demand if scrolled back to.
+          while (urlOrderRef.current.length > MAX_PREVIEW_URLS) {
+            const oldest = urlOrderRef.current.shift();
+            if (!oldest || oldest === sha256) continue;
+            const stale = urlsRef.current[oldest];
+            if (stale) {
+              URL.revokeObjectURL(stale);
+              delete urlsRef.current[oldest];
+              setView(oldest, { status: "idle", url: undefined });
+            }
+          }
           setView(sha256, { status: "ready", url, progress: 1 });
         } catch (err) {
           setView(sha256, { status: "failed", error: String(err) });
@@ -141,6 +160,7 @@ export const useAttachments = () => {
       unlisten.forEach((p) => p.then((u) => u()));
       Object.values(urlsRef.current).forEach((u) => URL.revokeObjectURL(u));
       urlsRef.current = {};
+      urlOrderRef.current = [];
     };
   }, [setView, settleWaiters]);
 

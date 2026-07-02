@@ -206,7 +206,9 @@ export const useChatConnection = () => {
       if (nm.message_type === "Identity") {
         canonicalUserIdRef.current = nm.user_id;
         setCanonicalUserId(nm.user_id);
-        if (Array.isArray(nm.features)) setHostFeatures(nm.features);
+        // Always set (reset when absent) so a capability never leaks from a prior host —
+        // sending an attachment frame to a host that lacks the feature drops the connection.
+        setHostFeatures(Array.isArray(nm.features) ? nm.features : []);
         return;
       }
 
@@ -1078,11 +1080,14 @@ export const useChatConnection = () => {
   // Send a message carrying already-uploaded attachment refs (the blobs are transferred
   // first by the composer via upload_attachment). One command; the backend branches on
   // host/client internally, persists sidecar rows before distributing, and echoes to us.
+  // Returns whether the send succeeded, so the composer only clears its pending files +
+  // caption on success (a host-side rejection — bad refs, a GC-swept blob — must not
+  // silently discard what the user attached).
   const sendMessageWithAttachments = async (
     text: string,
     attachments: AttachmentRef[],
-  ) => {
-    if (!currentUser || !currentRoom || attachments.length === 0) return;
+  ): Promise<boolean> => {
+    if (!currentUser || !currentRoom || attachments.length === 0) return false;
     try {
       await invoke("send_message_with_attachments", {
         message: text,
@@ -1090,9 +1095,11 @@ export const useChatConnection = () => {
         is_emoji: false,
         attachments,
       });
+      return true;
     } catch (err) {
       console.error("Send with attachments failed:", err);
       setError(`Message not sent: ${err}`);
+      return false;
     }
   };
 

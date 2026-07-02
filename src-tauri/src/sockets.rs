@@ -3134,8 +3134,7 @@ mod envelope_tests {
     fn round_trip_with_attachments_preserves_attachment_refs() {
         let attachment = AttachmentRef {
             id: "att-3f7b2f4a".to_string(),
-            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
-                .to_string(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
             name: "release-plan.png".to_string(),
             mime: "image/png".to_string(),
             size: 98_765,

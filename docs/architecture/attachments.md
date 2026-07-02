@@ -263,6 +263,14 @@ From the architect escalation review of the Phase 1 diff — each is invisible t
 4. **History divergence window:** until task 3.4 lands, live messages show attachments but scrollback (built from DB rows) won't. Also re-check `send_room_history`'s trim budget once attachment metadata joins the payload.
 5. **`blob_store` transaction ordering (Phase 2):** the query pool enforces `foreign_keys=ON`, so `store_blob` must insert the `attachment_blobs` parent row before chunk rows in its transaction.
 
+From the Phase 2 architect review:
+
+6. **The Delete-handler GC must be age-gated too (Phase 6).** `delete_orphan_blobs(pool, None)` (and the raw §5 `NOT IN` SQL) can sweep a fresh blob sitting in another user's upload→Chat gap; their Chat's sidecar insert then hard-fails on the FK. Scoping to the deleted message's shas alone is insufficient — dedup means an in-flight upload can share a sha with a just-deleted message. Use a short age gate (e.g. 1 hour) in the Delete handler as well.
+7. **Verify the declared sha BEFORE calling `store_blob` (Phase 3).** `store_blob` computes and returns the true hash; persist-then-compare would store mismatched garbage under its real hash until the hourly sweep — a disk-fill primitive. The upload handler must hash the assembled bytes and compare against the declared sha first (the store's internal re-hash is cheap redundancy).
+8. **Host-wide download concurrency cap (Phase 3).** §2 caps uploads at 4 host-wide but sets no host-wide download cap (`read_blob` materializes ≤25 MiB per fetch; N connections × 2 downloads each is unbounded memory). Add a host-wide cap in the 3.1 spec. Also: `read_blob` is transactional (snapshot), so a fetch racing GC returns `Ok(None)` — the fetch handler should map that to attachment-gone, and still treat a `Db("corrupt")` error as a server-side problem, not attachment-gone.
+
+Conscious deviation recorded: §9 task 2.1 said `read_blob` "streamed by seq"; the implementation materializes the full blob (bounded by the 25 MiB cap — the same budget §2 accepts for upload buffering). A chunked/streaming read variant can be added beside it later without breaking callers.
+
 Backlog note (pre-existing, not attachment-specific): migration batches run in autocommit and the `_migrations` row is inserted after the batch, so a crash mid-batch leaves partial DDL that fails on retry (`CREATE TABLE` without `IF NOT EXISTS`). Applies to v9/v11/v14 alike; fix as a convention change, not in this feature.
 
 ---

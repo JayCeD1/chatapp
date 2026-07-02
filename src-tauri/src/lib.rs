@@ -16,11 +16,13 @@ use crate::sockets::{
 use std::sync::Arc;
 use tauri::Manager;
 
+mod blob_store;
 mod db;
 mod db_queries;
 mod error;
 mod mdns;
 mod migration;
+mod sanitize;
 mod secure;
 mod sockets;
 

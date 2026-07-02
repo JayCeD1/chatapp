@@ -1088,6 +1088,90 @@ pub async fn get_unread_counts(
     get_unread_counts_internal(&db, user_id).await
 }
 
+#[derive(Serialize, sqlx::FromRow, Clone, Debug)]
+#[allow(dead_code)]
+pub struct AttachmentRow {
+    pub id: String,
+    pub message_id: String,
+    pub sha256: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
+#[allow(dead_code)]
+pub async fn insert_attachments_for_message(
+    pool: &SqlitePool,
+    message_id: &str,
+    refs: &[crate::sockets::AttachmentRef],
+) -> AppResult<()> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    for attachment in refs {
+        let size = i64::try_from(attachment.size).map_err(|_| {
+            AppError::Validation("Attachment size is too large to store".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO attachments (id, message_id, sha256, filename, mime, size, width, height)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&attachment.id)
+        .bind(message_id)
+        .bind(&attachment.sha256)
+        .bind(&attachment.name)
+        .bind(&attachment.mime)
+        .bind(size)
+        .bind(attachment.width.map(i64::from))
+        .bind(attachment.height.map(i64::from))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn get_attachments_for_message_ids(
+    pool: &SqlitePool,
+    message_ids: &[String],
+) -> AppResult<Vec<AttachmentRow>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, message_id, sha256, filename, mime, size, width, height
+         FROM attachments
+         WHERE message_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for message_id in message_ids {
+        separated.push_bind(message_id);
+    }
+    separated.push_unseparated(") ORDER BY message_id, id");
+
+    Ok(query
+        .build_query_as::<AttachmentRow>()
+        .fetch_all(pool)
+        .await?)
+}
+
+#[allow(dead_code)]
+pub async fn delete_attachments_for_message(pool: &SqlitePool, message_id: &str) -> AppResult<u64> {
+    let result = sqlx::query("DELETE FROM attachments WHERE message_id = $1")
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,6 +1190,11 @@ mod tests {
         crate::db::run_migrations(&pool)
             .await
             .expect("run migrations");
+
+        sqlx::raw_sql("PRAGMA foreign_keys=ON;")
+            .execute(&pool)
+            .await
+            .expect("enable foreign keys");
 
         sqlx::raw_sql(
             "INSERT INTO users (id, name, email, department_id)
@@ -1402,5 +1491,99 @@ mod tests {
             .unwrap();
         assert!(allowed);
         assert!(!denied);
+    }
+
+    #[tokio::test]
+    async fn attachment_metadata_queries_are_idempotent_filter_and_delete() {
+        let pool = setup().await;
+        assert!(get_attachments_for_message_ids(&pool, &[])
+            .await
+            .unwrap()
+            .is_empty());
+
+        let sha1 = crate::blob_store::store_blob(&pool, b"one").await.unwrap();
+        let sha2 = crate::blob_store::store_blob(&pool, b"two").await.unwrap();
+        let sha3 = crate::blob_store::store_blob(&pool, b"three")
+            .await
+            .unwrap();
+        let refs = vec![
+            crate::sockets::AttachmentRef {
+                id: "att-1".to_string(),
+                sha256: sha1.clone(),
+                name: "one.txt".to_string(),
+                mime: "text/plain".to_string(),
+                size: 3,
+                width: None,
+                height: None,
+            },
+            crate::sockets::AttachmentRef {
+                id: "att-2".to_string(),
+                sha256: sha2.clone(),
+                name: "two.png".to_string(),
+                mime: "image/png".to_string(),
+                size: 3,
+                width: Some(640),
+                height: Some(480),
+            },
+        ];
+        let other_refs = vec![crate::sockets::AttachmentRef {
+            id: "att-3".to_string(),
+            sha256: sha3,
+            name: "three.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size: 5,
+            width: None,
+            height: None,
+        }];
+
+        insert_attachments_for_message(&pool, "message-1", &refs)
+            .await
+            .unwrap();
+        insert_attachments_for_message(&pool, "message-2", &other_refs)
+            .await
+            .unwrap();
+        insert_attachments_for_message(&pool, "message-1", &refs)
+            .await
+            .unwrap();
+
+        let rows = get_attachments_for_message_ids(&pool, &["message-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "att-1");
+        assert_eq!(rows[0].message_id, "message-1");
+        assert_eq!(rows[0].sha256, sha1);
+        assert_eq!(rows[0].filename, "one.txt");
+        assert_eq!(rows[0].mime, "text/plain");
+        assert_eq!(rows[0].size, 3);
+        assert_eq!(rows[1].id, "att-2");
+        assert_eq!(rows[1].sha256, sha2);
+        assert_eq!(rows[1].width, Some(640));
+        assert_eq!(rows[1].height, Some(480));
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attachments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+
+        assert_eq!(
+            delete_attachments_for_message(&pool, "message-1")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            delete_attachments_for_message(&pool, "message-1")
+                .await
+                .unwrap(),
+            0
+        );
+
+        let survivor = get_attachments_for_message_ids(&pool, &["message-2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(survivor.len(), 1);
+        assert_eq!(survivor[0].id, "att-3");
     }
 }

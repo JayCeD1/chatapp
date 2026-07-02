@@ -84,10 +84,8 @@ export const isPreviewableImage = (mime: string): boolean =>
 export const AUTO_FETCH_IMAGE_MAX = 512 * 1024;
 
 /** The auto-fetch policy (design §5): small images only. */
-export const shouldAutoFetch = (ref: {
-  mime: string;
-  size: number;
-}): boolean => isPreviewableImage(ref.mime) && ref.size <= AUTO_FETCH_IMAGE_MAX;
+export const shouldAutoFetch = (ref: { mime: string; size: number }): boolean =>
+  isPreviewableImage(ref.mime) && ref.size <= AUTO_FETCH_IMAGE_MAX;
 
 /** Max attachments per message (mirrors the backend MAX_ATTACHMENTS_PER_MESSAGE). */
 export const MAX_ATTACHMENTS_PER_MESSAGE = 5;

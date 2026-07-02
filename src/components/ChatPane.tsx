@@ -162,9 +162,7 @@ export const ChatPane: React.FC<ChatPaneProps> = ({
   useEffect(() => {
     pendingRef.current = pending;
   }, [pending]);
-  const uploadingCount = pending.filter(
-    (p) => p.status === "uploading",
-  ).length;
+  const uploadingCount = pending.filter((p) => p.status === "uploading").length;
   const readyRefs = pending
     .filter((p) => p.status === "ready" && p.ref)
     .map((p) => p.ref!);

@@ -57,18 +57,15 @@ export const useAttachments = () => {
     }));
   }, []);
 
-  const settleWaiters = useCallback(
-    (sha: string, err?: string) => {
-      const list = waitersRef.current[sha];
-      if (!list) return;
-      delete waitersRef.current[sha];
-      for (const w of list) {
-        if (err) w.reject(new Error(err));
-        else w.resolve();
-      }
-    },
-    [],
-  );
+  const settleWaiters = useCallback((sha: string, err?: string) => {
+    const list = waitersRef.current[sha];
+    if (!list) return;
+    delete waitersRef.current[sha];
+    for (const w of list) {
+      if (err) w.reject(new Error(err));
+      else w.resolve();
+    }
+  }, []);
 
   useEffect(() => {
     const unlisten: Array<Promise<() => void>> = [];

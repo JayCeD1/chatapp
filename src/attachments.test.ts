@@ -61,9 +61,9 @@ describe("isPreviewableImage", () => {
 describe("shouldAutoFetch (auto-fetch policy §5)", () => {
   it("auto-fetches small images only", () => {
     expect(shouldAutoFetch({ mime: "image/png", size: 1024 })).toBe(true);
-    expect(shouldAutoFetch({ mime: "image/png", size: AUTO_FETCH_IMAGE_MAX })).toBe(
-      true,
-    );
+    expect(
+      shouldAutoFetch({ mime: "image/png", size: AUTO_FETCH_IMAGE_MAX }),
+    ).toBe(true);
   });
 
   it("does not auto-fetch large images", () => {

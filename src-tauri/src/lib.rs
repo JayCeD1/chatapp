@@ -16,6 +16,7 @@ use crate::sockets::{
 use std::sync::Arc;
 use tauri::Manager;
 
+mod attachments;
 mod blob_store;
 mod db;
 mod db_queries;
@@ -49,6 +50,8 @@ pub fn run() {
             discovery_responder: Arc::new(tokio::sync::Mutex::new(None)),
             room_clients: Arc::new(tokio::sync::Mutex::new(Default::default())),
             ip_conn_counts: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            attachments_host: Default::default(),
+            attachments_client: Default::default(),
             username: tokio::sync::RwLock::new(String::new()),
             user_id: tokio::sync::RwLock::new(None),
             is_server: tokio::sync::RwLock::new(false),

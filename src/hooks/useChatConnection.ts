@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AttachmentRef,
   ChatRoom,
   ConnectionMode,
   Department,
@@ -21,6 +22,28 @@ import { usePreferences } from "./usePreferences";
 import { useMessageStore } from "./useMessageStore";
 
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
+
+// History batches carry attachment metadata as a flat sidecar list (DB rows with `filename`);
+// group it by message and reshape to the wire AttachmentRef (`name`) so history messages and
+// live messages render identically.
+const groupHistoryAttachments = (
+  rows: any[] | undefined,
+): Record<string, AttachmentRef[]> => {
+  const byMsg: Record<string, AttachmentRef[]> = {};
+  for (const a of rows || []) {
+    if (!a?.message_id || !a?.id) continue;
+    (byMsg[a.message_id] ||= []).push({
+      id: a.id,
+      sha256: a.sha256,
+      name: a.filename,
+      mime: a.mime,
+      size: a.size,
+      width: a.width ?? undefined,
+      height: a.height ?? undefined,
+    });
+  }
+  return byMsg;
+};
 
 // Normalize a message from either source into one shape with an ISO-8601 UTC timestamp,
 // so the UI never has to branch on origin:
@@ -216,9 +239,15 @@ export const useChatConnection = () => {
           const batch = JSON.parse(nm.message) as {
             messages: any[];
             reactions: any[];
+            attachments?: any[];
           };
+          const attByMsg = groupHistoryAttachments(batch.attachments);
           const msgs = (batch.messages || []).map((m) =>
-            normalizeMessage({ ...m, room: nm.room }),
+            normalizeMessage({
+              ...m,
+              room: nm.room,
+              attachments: attByMsg[m.message_id],
+            }),
           );
           // Merge, not replace. A live Chat/Edit/Delete can land in the gap between
           // the host snapshotting history and this push arriving:
@@ -294,9 +323,15 @@ export const useChatConnection = () => {
           const batch = JSON.parse(nm.message) as {
             messages: any[];
             reactions: any[];
+            attachments?: any[];
           };
+          const attByMsg = groupHistoryAttachments(batch.attachments);
           const older = (batch.messages || []).map((m) =>
-            normalizeMessage({ ...m, room: nm.room }),
+            normalizeMessage({
+              ...m,
+              room: nm.room,
+              attachments: attByMsg[m.message_id],
+            }),
           );
           setMessagesByRoom((prev) => {
             const existing = prev[nm.room] || [];

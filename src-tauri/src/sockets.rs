@@ -1,9 +1,10 @@
 use crate::db_queries::{
     add_room_member_internal, create_room_internal, delete_message_db, edit_message_db,
-    get_chat_rooms_internal, get_or_create_dm_internal, get_room_messages_internal,
-    get_room_reactions_internal, get_unread_counts_internal, list_users_internal,
-    room_join_allowed_internal, save_message_internal, toggle_reaction_db,
-    touch_last_read_internal, upsert_user_internal, ChatRoom,
+    get_attachments_for_message_ids, get_chat_rooms_internal, get_or_create_dm_internal,
+    get_room_messages_internal, get_room_reactions_internal, get_unread_counts_internal,
+    insert_attachments_for_message, list_users_internal, room_join_allowed_internal,
+    save_message_internal, toggle_reaction_db, touch_last_read_internal, upsert_user_internal,
+    ChatRoom,
 };
 use crate::error::{AppError, AppResult};
 use crate::secure;
@@ -144,7 +145,7 @@ where
 
 /// Current UNIX time in seconds. Returns 0 if the system clock is before the epoch
 /// instead of panicking — these run on network-triggered code paths.
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -207,6 +208,11 @@ pub struct AppState {
     pub current_room: tokio::sync::RwLock<String>,
     pub current_room_id: tokio::sync::RwLock<Option<u64>>,
     pub server_addr: tokio::sync::RwLock<Option<SocketAddr>>,
+    // Attachment transfer state: host-side upload sessions/download slots, and the client's
+    // upload driver, download assemblies + blob cache (attachments.rs).
+    pub attachments_host: crate::attachments::HostTransfers,
+    pub attachments_client: crate::attachments::ClientTransfers,
+
     // The query pool, set once at startup — lets broadcast-time eviction reach clean_client
     // without threading the pool through every distribute_message_to_all call site.
     pub pool: std::sync::OnceLock<SqlitePool>,
@@ -438,6 +444,29 @@ pub enum MessageType {
     // Host → a single client: a human-readable error (in `message`) for a request that failed
     // host-side (e.g. a duplicate channel name), so the client can surface it.
     ErrorNotice,
+    // ---- Attachment transfer (docs/architecture/attachments.md §2). All payloads are JSON in
+    // `message`. Clients only send these to hosts advertising the `attachments-v1` capability
+    // (an old host drops the connection on any unknown variant). ----
+    // Client → host: declare an upload `{sha256, size}`. Host replies UploadReady (send the
+    // chunks), UploadOk (dedup — blob already stored), or AttachmentError.
+    AttachmentUploadStart,
+    AttachmentUploadReady,
+    // Both directions: one blob chunk `{sha256, seq, data(base64)}`. Bypasses the per-message
+    // rate limit in favor of a per-connection byte budget.
+    AttachmentChunk,
+    // Client → host: all chunks sent `{sha256}`; host verifies the hash, persists, replies
+    // UploadOk or AttachmentError.
+    AttachmentUploadDone,
+    AttachmentUploadOk,
+    // Client → host: pull an attachment's bytes `{attachment_id}` (membership-gated; keyed by
+    // attachment id, never by sha, so knowing a hash grants nothing).
+    AttachmentFetch,
+    // Host → client: fetch stream framing `{attachment_id, sha256, size}` / `{attachment_id,
+    // sha256}` around the AttachmentChunk stream.
+    AttachmentFetchBegin,
+    AttachmentFetchDone,
+    // Either direction: a transfer failed `{sha256?, attachment_id?, reason}`.
+    AttachmentError,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -787,6 +816,9 @@ async fn handle_client_connection(
     // Per-connection inbound rate limit (token bucket): a burst allowance that refills at a
     // sustained rate, so one peer can't flood the host with messages.
     let mut rate_limiter = RateLimiter::new(tokio::time::Instant::now());
+    // Attachment chunks are exempt from the message-count bucket (a 25 MiB upload is ~580
+    // frames) and governed by this per-connection BYTE budget instead.
+    let mut chunk_limiter = crate::attachments::ByteRateLimiter::new(tokio::time::Instant::now());
 
     let mut client_info: Option<ClientConnection> = None;
     loop {
@@ -831,8 +863,14 @@ async fn handle_client_connection(
                     }
                 };
 
-                // Rate-limit: drop the frame if this connection is over its message budget.
-                if !rate_limiter.allow(tokio::time::Instant::now()) {
+                // Rate-limit: attachment chunks consume the byte bucket (they're bulk data at
+                // high frame rates); everything else consumes the message-count bucket.
+                if message.message_type == MessageType::AttachmentChunk {
+                    if !chunk_limiter.allow(tokio::time::Instant::now(), message.message.len()) {
+                        tracing::warn!("Chunk byte budget exceeded by {}; dropping", peer_addr);
+                        continue;
+                    }
+                } else if !rate_limiter.allow(tokio::time::Instant::now()) {
                     tracing::warn!(
                         "Rate limit exceeded by {}; dropping {:?}",
                         peer_addr,
@@ -987,6 +1025,9 @@ async fn clean_client(
             users.retain(|&id| id != client.user_id);
         }
     }
+    // Drop any half-received upload buffer this connection owned (download streams release
+    // their own slots when their next send fails).
+    crate::attachments::drop_upload_session(state, user_id).await;
     tracing::info!(
         "Client disconnected: {} (ID: {})",
         client.username,
@@ -1198,10 +1239,21 @@ async fn send_room_history(
     let all_reactions = get_room_reactions_internal(pool, room_id as i64, user_id as i64)
         .await
         .unwrap_or_default();
+    // Attachment metadata for the page (~150 bytes/ref; blob bytes NEVER ride history —
+    // clients fetch on demand, so the trim loop's one-frame invariant holds).
+    let all_attachments = {
+        let ids: Vec<String> = messages
+            .iter()
+            .filter_map(|m| m.message_id.clone())
+            .collect();
+        get_attachments_for_message_ids(pool, &ids)
+            .await
+            .unwrap_or_default()
+    };
 
-    // Build the batch for a given message set, carrying ONLY the reactions whose target
-    // survives the trim (reactions are room-wide, so an untrimmed list could overflow the
-    // frame on its own).
+    // Build the batch for a given message set, carrying ONLY the reactions/attachments whose
+    // target survives the trim (both are page-wide lists, so an untrimmed list could overflow
+    // the frame on its own).
     let make = |msgs: &[crate::db_queries::Message]| -> Message {
         let ids: std::collections::HashSet<&str> = msgs
             .iter()
@@ -1211,7 +1263,16 @@ async fn send_room_history(
             .iter()
             .filter(|r| ids.contains(r.message_id.as_str()))
             .collect();
-        let payload = serde_json::json!({ "messages": msgs, "reactions": reactions }).to_string();
+        let attachments: Vec<_> = all_attachments
+            .iter()
+            .filter(|a| ids.contains(a.message_id.as_str()))
+            .collect();
+        let payload = serde_json::json!({
+            "messages": msgs,
+            "reactions": reactions,
+            "attachments": attachments,
+        })
+        .to_string();
         Message {
             version: PROTOCOL_VERSION,
             message_type: msg_type,
@@ -1610,6 +1671,24 @@ async fn handle_server_message(
                 );
                 return Ok(());
             }
+            // Validate attachment refs BEFORE distributing or persisting: the relay clones
+            // the whole frame, so an unvalidated ref (never uploaded, wrong size, spoofed)
+            // would propagate to every member as an unfetchable card.
+            if let Some(refs) = &message.attachments {
+                if let Err(reason) =
+                    crate::attachments::validate_chat_attachments(&pool, refs).await
+                {
+                    tracing::warn!(
+                        "Dropped chat with bad attachments from {}: {}",
+                        actor,
+                        reason
+                    );
+                    if let Some(requester) = auth_user_id {
+                        send_error_notice(&state, requester, &reason).await;
+                    }
+                    return Ok(());
+                }
+            }
             // Distribute first (live delivery to in-room clients), then persist and refresh
             // unread badges in a single task so the unread recompute sees the saved row.
             distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
@@ -1622,6 +1701,7 @@ async fn handle_server_message(
             let room_id = message.room_id;
             let msg_clone = message.clone();
             tauri::async_runtime::spawn(async move {
+                let message_id = msg_clone.message_id.clone();
                 if let Err(e) = save_message_internal(
                     &pool_clone,
                     msg_clone.room_id as i64,
@@ -1635,6 +1715,15 @@ async fn handle_server_message(
                 {
                     tracing::error!("Failed to save chat message to db: {}", e);
                     return;
+                }
+                // The sidecar rows are a separate insert from the message row (§9a trap 2);
+                // history and fetch resolution both key off them.
+                if let Some(refs) = &msg_clone.attachments {
+                    if let Err(e) =
+                        insert_attachments_for_message(&pool_clone, &message_id, refs).await
+                    {
+                        tracing::error!("Failed to save attachment metadata: {}", e);
+                    }
                 }
                 notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id).await;
             });
@@ -1782,6 +1871,10 @@ async fn handle_server_message(
                 if rows > 0 {
                     let mut del = message.clone();
                     del.message = String::new();
+                    // A deleted message's broadcast must not carry its attachment refs
+                    // (§9a trap 3) — recipients would render cards for content that the
+                    // fetch gate already treats as gone.
+                    del.attachments = None;
                     distribute_message_to_all(&app, &state, &message.room, &del, None).await;
                 }
             }
@@ -1931,7 +2024,32 @@ async fn handle_server_message(
                 }
             }
         }
+        // Attachment transfer (attachments.rs). All host-side handlers require the
+        // connection-bound id — an unauthenticated connection never reaches here, but the
+        // guard also keeps sessions keyed by canonical identity, not frame contents.
+        MessageType::AttachmentUploadStart => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_upload_start(&state, &pool, uid, &message.message).await;
+            }
+        }
+        MessageType::AttachmentChunk => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_upload_chunk(&state, uid, &message.message).await;
+            }
+        }
+        MessageType::AttachmentUploadDone => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_upload_done(&state, &pool, uid, &message.message).await;
+            }
+        }
+        MessageType::AttachmentFetch => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_fetch(&state, &pool, uid, &message.message).await;
+            }
+        }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
+        // Host-only reply types (UploadReady/UploadOk/FetchBegin/FetchDone/AttachmentError)
+        // arriving FROM a client are meaningless — ignored by the catch-all.
         _ => {}
     }
     Ok(())
@@ -2095,8 +2213,16 @@ pub async fn client_connect_to_server(
             old.abort();
         }
     }
-    let listener =
-        start_client_listener(app, reader, Arc::clone(&state.client_transport), generation);
+    // A fresh connection starts with clean transfer state (a reconnect mid-upload fails the
+    // old driver loudly rather than resuming into a dead host session).
+    crate::attachments::reset_client(state.inner()).await;
+    let listener = start_client_listener(
+        app,
+        Arc::clone(state.inner()),
+        reader,
+        Arc::clone(&state.client_transport),
+        generation,
+    );
     *state.client_listener.lock().await = Some(listener);
     let heartbeat = spawn_client_heartbeat(Arc::clone(&state.client_stream));
     *state.client_heartbeat.lock().await = Some(heartbeat);
@@ -2160,6 +2286,7 @@ pub async fn send_as_client(
 
 fn start_client_listener(
     app: tauri::AppHandle,
+    state: Arc<AppState>,
     mut reader: tokio::net::tcp::OwnedReadHalf,
     transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
     generation: u64,
@@ -2215,6 +2342,14 @@ fn start_client_listener(
             };
             match String::from_utf8(plaintext) {
                 Ok(message_str) => {
+                    // Attachment protocol frames (chunks, transfer control) are consumed
+                    // Rust-side — a 60 KB base64 chunk must never cross the IPC boundary
+                    // as a UI event. Everything else is emitted raw, as before.
+                    if let Ok(parsed) = serde_json::from_str::<Message>(&message_str) {
+                        if crate::attachments::intercept_client_frame(&app, &state, &parsed).await {
+                            continue;
+                        }
+                    }
                     tracing::info!("🎧 Client received: {}", message_str);
                     if let Err(e) = app.emit("message", message_str) {
                         tracing::error!("Failed to emit received message: {}", e);
@@ -2897,7 +3032,7 @@ pub async fn get_server_info(state: State<'_, Arc<AppState>>) -> Result<Option<S
 /// Encrypt and send a message to one peer over its Noise transport. The transport
 /// lock is held across encrypt + write so Noise nonces always reach the wire in order
 /// (out-of-order frames would fail to decrypt).
-async fn send_secure(
+pub(crate) async fn send_secure(
     writer: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     transport: &Arc<tokio::sync::Mutex<TransportState>>,
     message: &Message,
@@ -2915,7 +3050,10 @@ async fn send_secure(
 
 /// Client-side equivalent: encrypt and send to the server over the single client
 /// transport. Locks transport then writer (consistent order) to keep nonces ordered.
-async fn send_secure_client(state: &Arc<AppState>, message: &Message) -> Result<(), String> {
+pub(crate) async fn send_secure_client(
+    state: &Arc<AppState>,
+    message: &Message,
+) -> Result<(), String> {
     let payload = serde_json::to_string(message).map_err(|e| e.to_string())?;
     let mut ts_guard = state.client_transport.lock().await;
     let ts = ts_guard
@@ -2961,6 +3099,8 @@ pub async fn client_disconnect(
         features: None,
     };
     let _ = send_secure_client(state.inner(), &disconnect_msg).await;
+    // Fail any in-flight transfer loudly and drop assemblies before the session goes away.
+    crate::attachments::reset_client(state.inner()).await;
     {
         let mut guard = state.client_stream.lock().await;
         guard.take();

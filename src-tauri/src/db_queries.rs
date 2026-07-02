@@ -1172,6 +1172,32 @@ pub async fn delete_attachments_for_message(pool: &SqlitePool, message_id: &str)
     Ok(result.rows_affected())
 }
 
+/// What a fetch needs to authorize and stream an attachment: its content address and the
+/// room its message lives in (for the membership gate).
+#[derive(sqlx::FromRow)]
+pub struct AttachmentFetchInfo {
+    pub sha256: String,
+    pub room_id: i64,
+}
+
+/// Resolve an attachment id to its fetch info. Attachments of soft-deleted messages resolve
+/// to None — a deleted message's files are gone from the fetch surface immediately, even
+/// before blob GC runs.
+pub async fn get_attachment_fetch_info(
+    pool: &SqlitePool,
+    attachment_id: &str,
+) -> AppResult<Option<AttachmentFetchInfo>> {
+    Ok(sqlx::query_as::<_, AttachmentFetchInfo>(
+        "SELECT a.sha256, m.room_id
+         FROM attachments a
+         JOIN messages m ON m.message_id = a.message_id
+         WHERE a.id = $1 AND m.deleted_at IS NULL",
+    )
+    .bind(attachment_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

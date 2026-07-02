@@ -68,6 +68,12 @@ pub async fn store_blob(pool: &SqlitePool, bytes: &[u8]) -> AppResult<String> {
 }
 
 pub async fn blob_exists_complete(pool: &SqlitePool, sha256: &str) -> AppResult<bool> {
+    Ok(complete_blob_size(pool, sha256).await?.is_some())
+}
+
+/// The stored size of a blob, `Some(size)` only if it is complete (declared size equals the
+/// summed chunk bytes). Callers use this to validate a claimed size without reading bytes.
+pub async fn complete_blob_size(pool: &SqlitePool, sha256: &str) -> AppResult<Option<i64>> {
     let row = sqlx::query(
         "SELECT b.size AS size, COALESCE(SUM(LENGTH(c.data)), 0) AS stored
          FROM attachment_blobs b
@@ -79,9 +85,10 @@ pub async fn blob_exists_complete(pool: &SqlitePool, sha256: &str) -> AppResult<
     .fetch_optional(pool)
     .await?;
 
-    Ok(row
-        .map(|row| row.get::<i64, _>("size") == row.get::<i64, _>("stored"))
-        .unwrap_or(false))
+    Ok(row.and_then(|row| {
+        let size = row.get::<i64, _>("size");
+        (size == row.get::<i64, _>("stored")).then_some(size)
+    }))
 }
 
 pub async fn read_blob(pool: &SqlitePool, sha256: &str) -> AppResult<Option<Vec<u8>>> {
@@ -184,7 +191,9 @@ pub async fn delete_orphan_blobs(
     Ok(deleted)
 }
 
-fn hex_sha256(bytes: &[u8]) -> String {
+/// Hex sha256 of a byte slice — the store's content address. Shared with the wire layer so
+/// upload verification and download integrity checks use the exact same addressing.
+pub(crate) fn hex_sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
     let mut out = String::with_capacity(digest.len() * 2);
     for byte in digest {

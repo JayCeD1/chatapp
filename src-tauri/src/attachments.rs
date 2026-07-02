@@ -1616,6 +1616,98 @@ mod transfer_tests {
             .is_err());
     }
 
+    /// Two connections uploading identical bytes concurrently must both end in a
+    /// non-broken state with the blob stored exactly once. This needs a real
+    /// multi-connection pool (an `sqlite::memory:` pool gives each connection its own
+    /// DB), configured like production (WAL + busy_timeout), so the same-sha
+    /// DELETE+INSERT transactions actually contend on SQLite's write lock.
+    #[tokio::test]
+    async fn concurrent_duplicate_uploads_store_once_and_both_succeed() {
+        let mut path = std::env::temp_dir();
+        path.push(format!("nutler-transfer-test-{}.db", Uuid::new_v4()));
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(true)
+            .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal)
+            .busy_timeout(Duration::from_secs(5))
+            .foreign_keys(true);
+        let pool = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect_with(opts)
+            .await
+            .expect("open temp-file db");
+        crate::db::run_migrations(&pool)
+            .await
+            .expect("run migrations");
+        sqlx::raw_sql(
+            "INSERT INTO users (id, name, email, department_id)
+                 VALUES (1, 'Alice', 'a@x', 1), (2, 'Bob', 'b@x', 1);",
+        )
+        .execute(&pool)
+        .await
+        .expect("seed users");
+
+        let state = test_state();
+        let mut alice = connect_client(&state, 1).await;
+        let mut bob = connect_client(&state, 2).await;
+        let bytes = patterned_bytes(300 * 1024);
+        let sha = blob_store::hex_sha256(&bytes);
+
+        // Drive one full wire upload; tolerate the dedup fast-path (UploadOk straight
+        // from Start) since the peer may have completed first.
+        async fn upload_racy(
+            state: &Arc<AppState>,
+            pool: &SqlitePool,
+            client: &mut TestClient,
+            user_id: u64,
+            bytes: &[u8],
+            sha: &str,
+        ) {
+            handle_upload_start(state, pool, user_id, &start_payload(sha, bytes.len())).await;
+            let reply = next_reply(client).await;
+            match reply.message_type {
+                MessageType::AttachmentUploadOk => return, // dedup fast-path
+                MessageType::AttachmentUploadReady => {}
+                other => panic!("unexpected reply to Start: {other:?}"),
+            }
+            for (seq, chunk) in bytes.chunks(ATTACHMENT_CHUNK_BYTES).enumerate() {
+                handle_upload_chunk(state, user_id, &chunk_payload(sha, seq as u64, chunk)).await;
+            }
+            handle_upload_done(state, pool, user_id, &sha_payload(sha)).await;
+            let done = next_reply(client).await;
+            assert_eq!(
+                done.message_type,
+                MessageType::AttachmentUploadOk,
+                "a byte-perfect upload must not surface a storage error to its sender"
+            );
+        }
+
+        tokio::join!(
+            upload_racy(&state, &pool, &mut alice, 1, &bytes, &sha),
+            upload_racy(&state, &pool, &mut bob, 2, &bytes, &sha),
+        );
+
+        // Exactly one blob row + one coherent chunk set survived the race.
+        let blob_rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM attachment_blobs WHERE sha256 = $1")
+                .bind(&sha)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(blob_rows, 1);
+        assert!(blob_store::blob_exists_complete(&pool, &sha).await.unwrap());
+        let read = blob_store::read_blob(&pool, &sha)
+            .await
+            .unwrap()
+            .expect("blob readable");
+        assert_eq!(read, bytes);
+
+        pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", path.display(), suffix));
+        }
+    }
+
     #[tokio::test(start_paused = true)]
     async fn byte_rate_limiter_refills_over_time() {
         let mut limiter = ByteRateLimiter::new(tokio::time::Instant::now());

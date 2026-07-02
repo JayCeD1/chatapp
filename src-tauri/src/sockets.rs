@@ -223,6 +223,13 @@ fn default_protocol_version() -> u16 {
     PROTOCOL_VERSION
 }
 
+// Capability flags advertised by the host on the Identity frame (`Message.features`). Peers
+// gate optional protocol surfaces on these instead of PROTOCOL_VERSION bumps: an old host
+// drops the connection on any unknown MessageType (serde parse failure), so a client must
+// only ever send attachment frames to a host that advertised the capability. See
+// docs/architecture/attachments.md §1.
+pub const FEATURE_ATTACHMENTS_V1: &str = "attachments-v1";
+
 // ---- LAN server discovery (UDP announce/respond) ----
 // Discovery is plaintext, best-effort, and ADVISORY: it only surfaces that a Nutler host
 // exists on the LAN plus its public metadata (name, TCP port, live user count). It carries no
@@ -331,6 +338,29 @@ fn parse_announce(datagram: &[u8], src_ip: IpAddr, my_nonce: &str) -> Option<(Ip
     ))
 }
 
+/// Metadata reference to an attachment carried on a Chat frame. This is *content* metadata
+/// (a separable sub-object of the envelope, per docs/architecture/gap-analysis.md move #2),
+/// not routing metadata: under a future E2EE envelope the whole `AttachmentRef` moves into
+/// the encrypted payload. The blob bytes themselves never ride on a Chat frame — they are
+/// transferred out-of-band in chunks and referenced here by content address.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AttachmentRef {
+    /// Client-generated UUID for this message-attachment instance (fetches key on this,
+    /// never on the sha256, so knowing a content hash grants no access).
+    pub id: String,
+    /// Hex sha256 of the blob bytes — the content address in the host blob store.
+    pub sha256: String,
+    /// Original filename. Display data only; never used to construct a path.
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    // Image dimensions, for layout-stable previews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Message {
     // Default keeps frames from older/newer peers (or pre-versioning ones) decodable.
@@ -349,6 +379,14 @@ pub struct Message {
     // (the identity authority) and assign a globally-unique id. Defaulted/omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    // Content sub-object: attachment references carried on a Chat frame (metadata only —
+    // blob bytes travel separately). Serde-defaulted so old peers' frames stay decodable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<AttachmentRef>>,
+    // Carried only on the host's Identity frame: capability flags (FEATURE_*) so clients can
+    // gate optional protocol surfaces on what this host actually supports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -604,6 +642,8 @@ pub async fn server_listen_as_participant(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
 
     // Save server join to database //Use tauri::async_runtime::spawn for database operations
@@ -966,6 +1006,8 @@ async fn clean_client(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
 
     //Save the disconnect message to the database
@@ -1122,6 +1164,8 @@ async fn broadcast_user_list(app: &tauri::AppHandle, state: &Arc<AppState>, room
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     distribute_message_to_all(app, state, room, &msg, None).await;
 }
@@ -1180,6 +1224,8 @@ async fn send_room_history(
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         }
     };
 
@@ -1233,6 +1279,8 @@ async fn push_unread(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64) {
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     let _ = send_secure(&writer, &transport, &msg).await;
 }
@@ -1254,6 +1302,8 @@ async fn push_user_directory(app: &tauri::AppHandle, state: &Arc<AppState>, pool
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     let conns: Vec<_> = {
         let streams = state.server_streams.lock().await;
@@ -1303,6 +1353,8 @@ async fn push_rooms_update(
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     } else if Some(user_id) == *state.user_id.read().await {
@@ -1350,6 +1402,8 @@ async fn send_error_notice(state: &Arc<AppState>, user_id: u64, text: &str) {
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     }
@@ -1357,7 +1411,8 @@ async fn send_error_notice(state: &Arc<AppState>, user_id: u64, text: &str) {
 
 /// Tell a freshly-connected client its canonical user id (carried in `user_id`), so it can
 /// recognise its own messages — its local id differs from the host-assigned canonical one, and
-/// persisted history is authored under the canonical id.
+/// persisted history is authored under the canonical id. Also carries the host's capability
+/// flags (`features`), which clients use to gate optional protocol surfaces.
 async fn send_identity(state: &Arc<AppState>, user_id: u64) {
     let conn = {
         let streams = state.server_streams.lock().await;
@@ -1378,6 +1433,8 @@ async fn send_identity(state: &Arc<AppState>, user_id: u64) {
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: Some(vec![FEATURE_ATTACHMENTS_V1.to_string()]),
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     }
@@ -1406,6 +1463,8 @@ async fn send_dm_ready(state: &Arc<AppState>, user_id: u64, room: &ChatRoom) {
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     }
@@ -1460,6 +1519,8 @@ async fn notify_unread_for_room(
                     created_at: now_secs(),
                     is_emoji: false,
                     email: None,
+                    attachments: None,
+                    features: None,
                 };
                 if let Ok(s) = serde_json::to_string(&msg) {
                     let _ = app.emit("message", s);
@@ -1488,6 +1549,9 @@ async fn handle_server_message(
     // The email was already consumed during Connect registration (above, in the read loop);
     // drop it so it's never relayed to other clients in the distributed Connect notice.
     message.email = None;
+    // `features` is a host-only capability advertisement (Identity frame); strip any
+    // client-asserted copy so a forged flag is never relayed to other clients.
+    message.features = None;
 
     tracing::info!(
         "🟢 Server handling message: {:?} from {}",
@@ -1905,6 +1969,8 @@ pub async fn send_as_server_participant(
         created_at: now_secs(),
         is_emoji,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2000,6 +2066,8 @@ pub async fn client_connect_to_server(
         is_emoji: false,
         email: Some(email.clone()),
         message_id: Uuid::new_v4().to_string(),
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &connect_message)
         .await
@@ -2070,6 +2138,8 @@ pub async fn send_as_client(
         created_at: now_secs(),
         is_emoji,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2184,6 +2254,8 @@ pub async fn server_participant_join_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2265,6 +2337,8 @@ pub async fn client_join_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2303,6 +2377,8 @@ pub async fn client_leave_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
     send_secure_client(state.inner(), &leave_msg)
@@ -2333,6 +2409,8 @@ pub async fn server_leave_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2392,6 +2470,8 @@ fn edit_event(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     }
 }
 
@@ -2608,6 +2688,8 @@ pub async fn request_history(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2634,6 +2716,8 @@ pub async fn client_add_member(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2660,6 +2744,8 @@ pub async fn client_create_dm(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2695,6 +2781,8 @@ pub async fn client_create_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2869,6 +2957,8 @@ pub async fn client_disconnect(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     let _ = send_secure_client(state.inner(), &disconnect_msg).await;
     {
@@ -2935,6 +3025,8 @@ pub async fn server_participant_disconnect(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
 
     // Best-effort: send an encrypted disconnect notice to each client, then drop them.
@@ -2991,6 +3083,119 @@ pub async fn server_participant_disconnect(
     let _ = app.emit("server_stopped", ());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn message_fixture() -> Message {
+        Message {
+            version: PROTOCOL_VERSION,
+            message_type: MessageType::Chat,
+            username: "Alice".to_string(),
+            user_id: 42,
+            message: "hello from the wire".to_string(),
+            message_id: "msg-123".to_string(),
+            room: "Engineering".to_string(),
+            room_id: 7,
+            created_at: 1_725_000_000,
+            is_emoji: false,
+            email: None,
+            attachments: None,
+            features: None,
+        }
+    }
+
+    #[test]
+    fn old_frame_decode_defaults_new_optional_fields() {
+        let raw = r#"{
+            "message_type": "Chat",
+            "username": "Alice",
+            "user_id": 42,
+            "message": "hello from an old peer",
+            "message_id": "msg-old-1",
+            "room": "Engineering",
+            "room_id": 7,
+            "created_at": 1725000000,
+            "is_emoji": false
+        }"#;
+
+        let decoded: Message = serde_json::from_str(raw).expect("old frame should decode");
+
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.message_type, MessageType::Chat);
+        assert_eq!(decoded.username, "Alice");
+        assert_eq!(decoded.attachments, None);
+        assert_eq!(decoded.features, None);
+    }
+
+    #[test]
+    fn round_trip_with_attachments_preserves_attachment_refs() {
+        let attachment = AttachmentRef {
+            id: "att-3f7b2f4a".to_string(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+                .to_string(),
+            name: "release-plan.png".to_string(),
+            mime: "image/png".to_string(),
+            size: 98_765,
+            width: Some(1280),
+            height: Some(720),
+        };
+        let mut original = message_fixture();
+        original.attachments = Some(vec![attachment.clone()]);
+
+        let encoded = serde_json::to_string(&original).expect("message should serialize");
+        let decoded: Message =
+            serde_json::from_str(&encoded).expect("serialized message should deserialize");
+
+        assert_eq!(decoded.attachments, Some(vec![attachment]));
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.message_type, MessageType::Chat);
+        assert_eq!(decoded.username, original.username);
+        assert_eq!(decoded.user_id, original.user_id);
+        assert_eq!(decoded.message, original.message);
+        assert_eq!(decoded.message_id, original.message_id);
+        assert_eq!(decoded.room, original.room);
+        assert_eq!(decoded.room_id, original.room_id);
+        assert_eq!(decoded.created_at, original.created_at);
+        assert_eq!(decoded.is_emoji, original.is_emoji);
+    }
+
+    #[test]
+    fn unknown_extra_fields_decode() {
+        let raw = r#"{
+            "version": 1,
+            "message_type": "Chat",
+            "username": "Bob",
+            "user_id": 64,
+            "message": "newer peer sent extra data",
+            "message_id": "msg-future-1",
+            "room": "Design",
+            "room_id": 9,
+            "created_at": 1725001111,
+            "is_emoji": false,
+            "future_field": {"x": 1}
+        }"#;
+
+        let decoded: Message = serde_json::from_str(raw).expect("extra fields should be ignored");
+
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.message_type, MessageType::Chat);
+        assert_eq!(decoded.username, "Bob");
+        assert_eq!(decoded.room_id, 9);
+    }
+
+    #[test]
+    fn absent_optional_fields_are_omitted_on_the_wire() {
+        let msg = message_fixture();
+
+        let encoded = serde_json::to_string(&msg).expect("message should serialize");
+
+        assert!(!encoded.contains("attachments"));
+        assert!(!encoded.contains("features"));
+        assert!(!encoded.contains("email"));
+    }
 }
 
 #[cfg(test)]

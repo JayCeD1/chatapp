@@ -241,6 +241,49 @@ pub fn get_migrations() -> Vec<Migration> {
             sql: "ALTER TABLE chat_rooms ADD COLUMN is_dm BOOLEAN NOT NULL DEFAULT 0;",
             kind: MigrationKind::Up,
         },
+        // Migration 14: attachment metadata sidecar + content-addressed blob store
+        // (docs/architecture/attachments.md §4). Blob bytes are OPAQUE to all queries —
+        // nothing may parse them (E2EE forward-compat); all blob access goes through the
+        // blob_store module (§3a). No FK from attachments.message_id to messages: message
+        // deletion is a soft delete (deleted_at), so attachment/blob GC is explicit code.
+        Migration {
+            version: 14,
+            description: "add_attachments_and_blob_store",
+            sql: "CREATE TABLE attachment_blobs (
+                sha256     TEXT PRIMARY KEY,
+                size       INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE TABLE attachment_blob_chunks (
+                sha256 TEXT NOT NULL REFERENCES attachment_blobs(sha256) ON DELETE CASCADE,
+                seq    INTEGER NOT NULL,
+                data   BLOB NOT NULL,
+                PRIMARY KEY (sha256, seq)
+            );
+            CREATE TABLE attachments (
+                id         TEXT PRIMARY KEY,
+                message_id TEXT NOT NULL,
+                sha256     TEXT NOT NULL REFERENCES attachment_blobs(sha256),
+                filename   TEXT NOT NULL,
+                mime       TEXT NOT NULL,
+                size       INTEGER NOT NULL,
+                width      INTEGER,
+                height     INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            );
+            CREATE INDEX idx_attachments_message ON attachments(message_id);
+            CREATE INDEX idx_attachments_sha ON attachments(sha256);",
+            kind: MigrationKind::Up,
+        },
+        // Down for v14: drop the attachment tables (children first for the FKs)
+        Migration {
+            version: 14,
+            description: "drop_attachments_and_blob_store",
+            sql: "DROP TABLE IF EXISTS attachments;
+                  DROP TABLE IF EXISTS attachment_blob_chunks;
+                  DROP TABLE IF EXISTS attachment_blobs;",
+            kind: MigrationKind::Down,
+        },
         // Down for v7: remove default chat rooms created in v7
         Migration {
             version: 7,

@@ -229,7 +229,7 @@ mod tests {
             .fetch_all(&pool)
             .await
             .unwrap();
-        assert!(applied.contains(&13)); // latest Up (is_dm)
+        assert!(applied.contains(&14)); // latest Up (attachments + blob store)
         let count = applied.len();
 
         // Re-running is a no-op — nothing new applied.

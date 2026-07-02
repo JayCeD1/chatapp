@@ -40,6 +40,18 @@ export interface ChatRoom {
   user_count?: number;
 }
 
+// Metadata reference to an attachment on a message (docs/architecture/attachments.md §1).
+// Content metadata only — the blob bytes are fetched separately by attachment `id`.
+export interface AttachmentRef {
+  id: string; // client-generated UUID for this message-attachment instance
+  sha256: string; // hex content address of the blob
+  name: string; // original filename (display data only)
+  mime: string;
+  size: number;
+  width?: number; // images only
+  height?: number;
+}
+
 export interface Message {
   version?: number; // wire envelope version (see docs/architecture ADR-0004)
   id?: number; // DB row id (history)
@@ -54,6 +66,8 @@ export interface Message {
   created_at: string; // normalized ISO-8601 UTC string
   edited_at?: string | null;
   deleted_at?: string | null;
+  attachments?: AttachmentRef[]; // content sub-object; absent on attachment-less messages
+  features?: string[]; // host capability flags, carried only on the Identity frame
 }
 
 export interface Reaction {

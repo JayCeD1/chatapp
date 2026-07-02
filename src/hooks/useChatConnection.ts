@@ -57,6 +57,8 @@ const normalizeMessage = (m: any, fallbackRoomId?: number): Message => {
     created_at: createdAt,
     edited_at: m?.edited_at ?? null,
     deleted_at: m?.deleted_at ?? null,
+    attachments: Array.isArray(m?.attachments) ? m.attachments : undefined,
+    features: Array.isArray(m?.features) ? m.features : undefined,
   };
 };
 

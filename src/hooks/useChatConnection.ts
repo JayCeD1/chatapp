@@ -2,6 +2,7 @@ import { useState, useEffect, useCallback, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import {
+  AttachmentRef,
   ChatRoom,
   ConnectionMode,
   Department,
@@ -21,6 +22,28 @@ import { usePreferences } from "./usePreferences";
 import { useMessageStore } from "./useMessageStore";
 
 export type ConnectionStatus = "connected" | "reconnecting" | "disconnected";
+
+// History batches carry attachment metadata as a flat sidecar list (DB rows with `filename`);
+// group it by message and reshape to the wire AttachmentRef (`name`) so history messages and
+// live messages render identically.
+const groupHistoryAttachments = (
+  rows: any[] | undefined,
+): Record<string, AttachmentRef[]> => {
+  const byMsg: Record<string, AttachmentRef[]> = {};
+  for (const a of rows || []) {
+    if (!a?.message_id || !a?.id) continue;
+    (byMsg[a.message_id] ||= []).push({
+      id: a.id,
+      sha256: a.sha256,
+      name: a.filename,
+      mime: a.mime,
+      size: a.size,
+      width: a.width ?? undefined,
+      height: a.height ?? undefined,
+    });
+  }
+  return byMsg;
+};
 
 // Normalize a message from either source into one shape with an ISO-8601 UTC timestamp,
 // so the UI never has to branch on origin:
@@ -57,6 +80,8 @@ const normalizeMessage = (m: any, fallbackRoomId?: number): Message => {
     created_at: createdAt,
     edited_at: m?.edited_at ?? null,
     deleted_at: m?.deleted_at ?? null,
+    attachments: Array.isArray(m?.attachments) ? m.attachments : undefined,
+    features: Array.isArray(m?.features) ? m.features : undefined,
   };
 };
 
@@ -107,6 +132,10 @@ export const useChatConnection = () => {
   // so we use this to recognise our own messages by id rather than by (collision-prone) name.
   const [canonicalUserId, setCanonicalUserId] = useState<number | null>(null);
   const canonicalUserIdRef = useRef<number | null>(null);
+  // Capability flags the host advertised on the Identity frame (client mode). Attachments
+  // are gated on this: a client must never send attachment frames to a host that predates
+  // the feature (an old host drops the connection on the unknown MessageType).
+  const [hostFeatures, setHostFeatures] = useState<string[]>([]);
 
   // Refs so the once-registered listeners read the latest values without re-subscribing.
   const passwordRef = useRef("");
@@ -172,10 +201,14 @@ export const useChatConnection = () => {
         return;
       }
 
-      // Host tells us our canonical id (client mode) so we can recognise our own messages.
+      // Host tells us our canonical id (client mode) so we can recognise our own messages,
+      // and advertises its capabilities (e.g. attachments-v1) so we can gate optional UI.
       if (nm.message_type === "Identity") {
         canonicalUserIdRef.current = nm.user_id;
         setCanonicalUserId(nm.user_id);
+        // Always set (reset when absent) so a capability never leaks from a prior host —
+        // sending an attachment frame to a host that lacks the feature drops the connection.
+        setHostFeatures(Array.isArray(nm.features) ? nm.features : []);
         return;
       }
 
@@ -214,9 +247,15 @@ export const useChatConnection = () => {
           const batch = JSON.parse(nm.message) as {
             messages: any[];
             reactions: any[];
+            attachments?: any[];
           };
+          const attByMsg = groupHistoryAttachments(batch.attachments);
           const msgs = (batch.messages || []).map((m) =>
-            normalizeMessage({ ...m, room: nm.room }),
+            normalizeMessage({
+              ...m,
+              room: nm.room,
+              attachments: attByMsg[m.message_id],
+            }),
           );
           // Merge, not replace. A live Chat/Edit/Delete can land in the gap between
           // the host snapshotting history and this push arriving:
@@ -292,9 +331,15 @@ export const useChatConnection = () => {
           const batch = JSON.parse(nm.message) as {
             messages: any[];
             reactions: any[];
+            attachments?: any[];
           };
+          const attByMsg = groupHistoryAttachments(batch.attachments);
           const older = (batch.messages || []).map((m) =>
-            normalizeMessage({ ...m, room: nm.room }),
+            normalizeMessage({
+              ...m,
+              room: nm.room,
+              attachments: attByMsg[m.message_id],
+            }),
           );
           setMessagesByRoom((prev) => {
             const existing = prev[nm.room] || [];
@@ -1027,6 +1072,37 @@ export const useChatConnection = () => {
     }
   };
 
+  // Whether attachments can be sent right now: the host participant always can (it IS the
+  // current build); a client can only if the host advertised the capability.
+  const attachmentsEnabled =
+    mode === "server" || hostFeatures.includes("attachments-v1");
+
+  // Send a message carrying already-uploaded attachment refs (the blobs are transferred
+  // first by the composer via upload_attachment). One command; the backend branches on
+  // host/client internally, persists sidecar rows before distributing, and echoes to us.
+  // Returns whether the send succeeded, so the composer only clears its pending files +
+  // caption on success (a host-side rejection — bad refs, a GC-swept blob — must not
+  // silently discard what the user attached).
+  const sendMessageWithAttachments = async (
+    text: string,
+    attachments: AttachmentRef[],
+  ): Promise<boolean> => {
+    if (!currentUser || !currentRoom || attachments.length === 0) return false;
+    try {
+      await invoke("send_message_with_attachments", {
+        message: text,
+        user_id: currentUser.id,
+        is_emoji: false,
+        attachments,
+      });
+      return true;
+    } catch (err) {
+      console.error("Send with attachments failed:", err);
+      setError(`Message not sent: ${err}`);
+      return false;
+    }
+  };
+
   // Stable (reads refs) so ChatPane's throttle/debounce timers never call a stale
   // copy. Best-effort: a failed typing ping must never surface or block the composer.
   const sendTyping = useCallback(async (typing: boolean) => {
@@ -1132,6 +1208,7 @@ export const useChatConnection = () => {
     setDirectory([]);
     setCanonicalUserId(null);
     canonicalUserIdRef.current = null;
+    setHostFeatures([]);
     setConnectionStatus("connected");
     setView("login");
     localStorage.removeItem("nutler.userId");
@@ -1176,6 +1253,8 @@ export const useChatConnection = () => {
     createRoom,
     leaveRoom,
     sendMessage,
+    sendMessageWithAttachments,
+    attachmentsEnabled,
     editMessage,
     deleteMessage,
     toggleReaction,

@@ -28,3 +28,9 @@ dist-ssr
 *.db
 *.db-wal
 *.db-shm
+
+# Local AI-agent workspace files (personal orchestration config — never commit)
+.claude/
+CLAUDE.md
+AGENTS.md
+.codex/

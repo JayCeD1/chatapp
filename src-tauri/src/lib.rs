@@ -16,11 +16,14 @@ use crate::sockets::{
 use std::sync::Arc;
 use tauri::Manager;
 
+mod attachments;
+mod blob_store;
 mod db;
 mod db_queries;
 mod error;
 mod mdns;
 mod migration;
+mod sanitize;
 mod secure;
 mod sockets;
 
@@ -47,6 +50,8 @@ pub fn run() {
             discovery_responder: Arc::new(tokio::sync::Mutex::new(None)),
             room_clients: Arc::new(tokio::sync::Mutex::new(Default::default())),
             ip_conn_counts: Arc::new(tokio::sync::Mutex::new(Default::default())),
+            attachments_host: Default::default(),
+            attachments_client: Default::default(),
             username: tokio::sync::RwLock::new(String::new()),
             user_id: tokio::sync::RwLock::new(None),
             is_server: tokio::sync::RwLock::new(false),
@@ -104,7 +109,24 @@ pub fn run() {
                 .state::<std::sync::Arc<sockets::AppState>>()
                 .pool
                 .set(pool.clone());
-            app.manage(pool); // makes the pool available to commands
+            app.manage(pool.clone()); // makes the pool available to commands
+
+            // Age-gated orphan-blob sweep: collect attachment blobs no message references and
+            // older than the grace window (covers a crashed upload's leftover blob, and a
+            // deleted message's blob after its sidecar rows are dropped). Runs at startup and
+            // hourly for the app's lifetime; a no-op on a client (no blobs stored locally).
+            // The grace window keeps it from reaping a fresh in-flight upload (§9a trap 6).
+            tauri::async_runtime::spawn(async move {
+                let mut ticker = tokio::time::interval(std::time::Duration::from_secs(3600));
+                loop {
+                    ticker.tick().await;
+                    match blob_store::delete_orphan_blobs(&pool, Some(3600)).await {
+                        Ok(n) if n > 0 => tracing::info!("Swept {} orphan attachment blob(s)", n),
+                        Ok(_) => {}
+                        Err(e) => tracing::error!("Orphan blob sweep failed: {}", e),
+                    }
+                }
+            });
 
             Ok(())
         })
@@ -150,6 +172,12 @@ pub fn run() {
             send_as_server_participant,
             client_connect_to_server,
             send_as_client,
+            // Attachments (docs/architecture/attachments.md)
+            sockets::send_message_with_attachments,
+            attachments::upload_attachment,
+            attachments::fetch_attachment,
+            attachments::get_attachment_bytes,
+            attachments::save_attachment,
             server_participant_join_room,
             client_join_room,
             client_leave_room,

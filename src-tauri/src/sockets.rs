@@ -1,7 +1,8 @@
 use crate::db_queries::{
-    add_room_member_internal, create_room_internal, delete_message_db, edit_message_db,
-    get_chat_rooms_internal, get_or_create_dm_internal, get_room_messages_internal,
-    get_room_reactions_internal, get_unread_counts_internal, list_users_internal,
+    add_room_member_internal, create_room_internal, delete_attachments_for_message,
+    delete_message_db, edit_message_db, get_attachments_for_message_ids, get_chat_rooms_internal,
+    get_or_create_dm_internal, get_room_messages_internal, get_room_reactions_internal,
+    get_unread_counts_internal, insert_attachments_for_message, list_users_internal,
     room_join_allowed_internal, save_message_internal, toggle_reaction_db,
     touch_last_read_internal, upsert_user_internal, ChatRoom,
 };
@@ -116,7 +117,7 @@ fn spawn_client_heartbeat(
 /// Read one length-prefixed frame: a 4-byte big-endian length header followed by
 /// that many payload bytes. Returns `Ok(None)` for a zero-length keep-alive frame.
 /// Rejects oversized frames so a malicious peer cannot trigger a huge allocation.
-async fn read_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
+pub(crate) async fn read_frame<R>(reader: &mut R) -> std::io::Result<Option<Vec<u8>>>
 where
     R: AsyncReadExt + Unpin,
 {
@@ -144,7 +145,7 @@ where
 
 /// Current UNIX time in seconds. Returns 0 if the system clock is before the epoch
 /// instead of panicking — these run on network-triggered code paths.
-fn now_secs() -> u64 {
+pub(crate) fn now_secs() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
@@ -207,6 +208,11 @@ pub struct AppState {
     pub current_room: tokio::sync::RwLock<String>,
     pub current_room_id: tokio::sync::RwLock<Option<u64>>,
     pub server_addr: tokio::sync::RwLock<Option<SocketAddr>>,
+    // Attachment transfer state: host-side upload sessions/download slots, and the client's
+    // upload driver, download assemblies + blob cache (attachments.rs).
+    pub attachments_host: crate::attachments::HostTransfers,
+    pub attachments_client: crate::attachments::ClientTransfers,
+
     // The query pool, set once at startup — lets broadcast-time eviction reach clean_client
     // without threading the pool through every distribute_message_to_all call site.
     pub pool: std::sync::OnceLock<SqlitePool>,
@@ -222,6 +228,13 @@ pub const PROTOCOL_VERSION: u16 = 1;
 fn default_protocol_version() -> u16 {
     PROTOCOL_VERSION
 }
+
+// Capability flags advertised by the host on the Identity frame (`Message.features`). Peers
+// gate optional protocol surfaces on these instead of PROTOCOL_VERSION bumps: an old host
+// drops the connection on any unknown MessageType (serde parse failure), so a client must
+// only ever send attachment frames to a host that advertised the capability. See
+// docs/architecture/attachments.md §1.
+pub const FEATURE_ATTACHMENTS_V1: &str = "attachments-v1";
 
 // ---- LAN server discovery (UDP announce/respond) ----
 // Discovery is plaintext, best-effort, and ADVISORY: it only surfaces that a Nutler host
@@ -331,6 +344,29 @@ fn parse_announce(datagram: &[u8], src_ip: IpAddr, my_nonce: &str) -> Option<(Ip
     ))
 }
 
+/// Metadata reference to an attachment carried on a Chat frame. This is *content* metadata
+/// (a separable sub-object of the envelope, per docs/architecture/gap-analysis.md move #2),
+/// not routing metadata: under a future E2EE envelope the whole `AttachmentRef` moves into
+/// the encrypted payload. The blob bytes themselves never ride on a Chat frame — they are
+/// transferred out-of-band in chunks and referenced here by content address.
+#[derive(Serialize, Deserialize, Clone, PartialEq, Debug)]
+pub struct AttachmentRef {
+    /// Client-generated UUID for this message-attachment instance (fetches key on this,
+    /// never on the sha256, so knowing a content hash grants no access).
+    pub id: String,
+    /// Hex sha256 of the blob bytes — the content address in the host blob store.
+    pub sha256: String,
+    /// Original filename. Display data only; never used to construct a path.
+    pub name: String,
+    pub mime: String,
+    pub size: u64,
+    // Image dimensions, for layout-stable previews.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub width: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub height: Option<u32>,
+}
+
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Message {
     // Default keeps frames from older/newer peers (or pre-versioning ones) decodable.
@@ -349,6 +385,14 @@ pub struct Message {
     // (the identity authority) and assign a globally-unique id. Defaulted/omitted otherwise.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub email: Option<String>,
+    // Content sub-object: attachment references carried on a Chat frame (metadata only —
+    // blob bytes travel separately). Serde-defaulted so old peers' frames stay decodable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attachments: Option<Vec<AttachmentRef>>,
+    // Carried only on the host's Identity frame: capability flags (FEATURE_*) so clients can
+    // gate optional protocol surfaces on what this host actually supports.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<Vec<String>>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Debug)]
@@ -400,6 +444,29 @@ pub enum MessageType {
     // Host → a single client: a human-readable error (in `message`) for a request that failed
     // host-side (e.g. a duplicate channel name), so the client can surface it.
     ErrorNotice,
+    // ---- Attachment transfer (docs/architecture/attachments.md §2). All payloads are JSON in
+    // `message`. Clients only send these to hosts advertising the `attachments-v1` capability
+    // (an old host drops the connection on any unknown variant). ----
+    // Client → host: declare an upload `{sha256, size}`. Host replies UploadReady (send the
+    // chunks), UploadOk (dedup — blob already stored), or AttachmentError.
+    AttachmentUploadStart,
+    AttachmentUploadReady,
+    // Both directions: one blob chunk `{sha256, seq, data(base64)}`. Bypasses the per-message
+    // rate limit in favor of a per-connection byte budget.
+    AttachmentChunk,
+    // Client → host: all chunks sent `{sha256}`; host verifies the hash, persists, replies
+    // UploadOk or AttachmentError.
+    AttachmentUploadDone,
+    AttachmentUploadOk,
+    // Client → host: pull an attachment's bytes `{attachment_id}` (membership-gated; keyed by
+    // attachment id, never by sha, so knowing a hash grants nothing).
+    AttachmentFetch,
+    // Host → client: fetch stream framing `{attachment_id, sha256, size}` / `{attachment_id,
+    // sha256}` around the AttachmentChunk stream.
+    AttachmentFetchBegin,
+    AttachmentFetchDone,
+    // Either direction: a transfer failed `{sha256?, attachment_id?, reason}`.
+    AttachmentError,
 }
 
 #[derive(Serialize, Deserialize, Clone)]
@@ -604,6 +671,8 @@ pub async fn server_listen_as_participant(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
 
     // Save server join to database //Use tauri::async_runtime::spawn for database operations
@@ -747,6 +816,9 @@ async fn handle_client_connection(
     // Per-connection inbound rate limit (token bucket): a burst allowance that refills at a
     // sustained rate, so one peer can't flood the host with messages.
     let mut rate_limiter = RateLimiter::new(tokio::time::Instant::now());
+    // Attachment chunks are exempt from the message-count bucket (a 25 MiB upload is ~580
+    // frames) and governed by this per-connection BYTE budget instead.
+    let mut chunk_limiter = crate::attachments::ByteRateLimiter::new(tokio::time::Instant::now());
 
     let mut client_info: Option<ClientConnection> = None;
     loop {
@@ -791,8 +863,14 @@ async fn handle_client_connection(
                     }
                 };
 
-                // Rate-limit: drop the frame if this connection is over its message budget.
-                if !rate_limiter.allow(tokio::time::Instant::now()) {
+                // Rate-limit: attachment chunks consume the byte bucket (they're bulk data at
+                // high frame rates); everything else consumes the message-count bucket.
+                if message.message_type == MessageType::AttachmentChunk {
+                    if !chunk_limiter.allow(tokio::time::Instant::now(), message.message.len()) {
+                        tracing::warn!("Chunk byte budget exceeded by {}; dropping", peer_addr);
+                        continue;
+                    }
+                } else if !rate_limiter.allow(tokio::time::Instant::now()) {
                     tracing::warn!(
                         "Rate limit exceeded by {}; dropping {:?}",
                         peer_addr,
@@ -947,6 +1025,9 @@ async fn clean_client(
             users.retain(|&id| id != client.user_id);
         }
     }
+    // Drop any half-received upload buffer this connection owned (download streams release
+    // their own slots when their next send fails).
+    crate::attachments::drop_upload_session(state, user_id).await;
     tracing::info!(
         "Client disconnected: {} (ID: {})",
         client.username,
@@ -966,6 +1047,8 @@ async fn clean_client(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
 
     //Save the disconnect message to the database
@@ -1122,6 +1205,8 @@ async fn broadcast_user_list(app: &tauri::AppHandle, state: &Arc<AppState>, room
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     distribute_message_to_all(app, state, room, &msg, None).await;
 }
@@ -1154,10 +1239,21 @@ async fn send_room_history(
     let all_reactions = get_room_reactions_internal(pool, room_id as i64, user_id as i64)
         .await
         .unwrap_or_default();
+    // Attachment metadata for the page (~150 bytes/ref; blob bytes NEVER ride history —
+    // clients fetch on demand, so the trim loop's one-frame invariant holds).
+    let all_attachments = {
+        let ids: Vec<String> = messages
+            .iter()
+            .filter_map(|m| m.message_id.clone())
+            .collect();
+        get_attachments_for_message_ids(pool, &ids)
+            .await
+            .unwrap_or_default()
+    };
 
-    // Build the batch for a given message set, carrying ONLY the reactions whose target
-    // survives the trim (reactions are room-wide, so an untrimmed list could overflow the
-    // frame on its own).
+    // Build the batch for a given message set, carrying ONLY the reactions/attachments whose
+    // target survives the trim (both are page-wide lists, so an untrimmed list could overflow
+    // the frame on its own).
     let make = |msgs: &[crate::db_queries::Message]| -> Message {
         let ids: std::collections::HashSet<&str> = msgs
             .iter()
@@ -1167,7 +1263,16 @@ async fn send_room_history(
             .iter()
             .filter(|r| ids.contains(r.message_id.as_str()))
             .collect();
-        let payload = serde_json::json!({ "messages": msgs, "reactions": reactions }).to_string();
+        let attachments: Vec<_> = all_attachments
+            .iter()
+            .filter(|a| ids.contains(a.message_id.as_str()))
+            .collect();
+        let payload = serde_json::json!({
+            "messages": msgs,
+            "reactions": reactions,
+            "attachments": attachments,
+        })
+        .to_string();
         Message {
             version: PROTOCOL_VERSION,
             message_type: msg_type,
@@ -1180,6 +1285,8 @@ async fn send_room_history(
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         }
     };
 
@@ -1233,6 +1340,8 @@ async fn push_unread(state: &Arc<AppState>, pool: &SqlitePool, user_id: u64) {
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     let _ = send_secure(&writer, &transport, &msg).await;
 }
@@ -1254,6 +1363,8 @@ async fn push_user_directory(app: &tauri::AppHandle, state: &Arc<AppState>, pool
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     let conns: Vec<_> = {
         let streams = state.server_streams.lock().await;
@@ -1303,6 +1414,8 @@ async fn push_rooms_update(
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     } else if Some(user_id) == *state.user_id.read().await {
@@ -1350,6 +1463,8 @@ async fn send_error_notice(state: &Arc<AppState>, user_id: u64, text: &str) {
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     }
@@ -1357,7 +1472,8 @@ async fn send_error_notice(state: &Arc<AppState>, user_id: u64, text: &str) {
 
 /// Tell a freshly-connected client its canonical user id (carried in `user_id`), so it can
 /// recognise its own messages — its local id differs from the host-assigned canonical one, and
-/// persisted history is authored under the canonical id.
+/// persisted history is authored under the canonical id. Also carries the host's capability
+/// flags (`features`), which clients use to gate optional protocol surfaces.
 async fn send_identity(state: &Arc<AppState>, user_id: u64) {
     let conn = {
         let streams = state.server_streams.lock().await;
@@ -1378,6 +1494,8 @@ async fn send_identity(state: &Arc<AppState>, user_id: u64) {
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: Some(vec![FEATURE_ATTACHMENTS_V1.to_string()]),
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     }
@@ -1406,6 +1524,8 @@ async fn send_dm_ready(state: &Arc<AppState>, user_id: u64, room: &ChatRoom) {
             created_at: now_secs(),
             is_emoji: false,
             email: None,
+            attachments: None,
+            features: None,
         };
         let _ = send_secure(&writer, &transport, &msg).await;
     }
@@ -1460,6 +1580,8 @@ async fn notify_unread_for_room(
                     created_at: now_secs(),
                     is_emoji: false,
                     email: None,
+                    attachments: None,
+                    features: None,
                 };
                 if let Ok(s) = serde_json::to_string(&msg) {
                     let _ = app.emit("message", s);
@@ -1488,6 +1610,9 @@ async fn handle_server_message(
     // The email was already consumed during Connect registration (above, in the read loop);
     // drop it so it's never relayed to other clients in the distributed Connect notice.
     message.email = None;
+    // `features` is a host-only capability advertisement (Identity frame); strip any
+    // client-asserted copy so a forged flag is never relayed to other clients.
+    message.features = None;
 
     tracing::info!(
         "🟢 Server handling message: {:?} from {}",
@@ -1546,8 +1671,75 @@ async fn handle_server_message(
                 );
                 return Ok(());
             }
-            // Distribute first (live delivery to in-room clients), then persist and refresh
-            // unread badges in a single task so the unread recompute sees the saved row.
+            // Validate attachment refs BEFORE distributing or persisting: the relay clones
+            // the whole frame, so an unvalidated ref (never uploaded, wrong size, spoofed)
+            // would propagate to every member as an unfetchable card.
+            if let Some(refs) = &message.attachments {
+                // Client sender: gated by the connection-bound canonical id, so a peer can
+                // only reference content it uploaded or can see in an accessible room.
+                if let Err(reason) = crate::attachments::validate_chat_attachments(
+                    &pool,
+                    crate::attachments::RefActor::Client(actor as i64),
+                    refs,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        "Dropped chat with bad attachments from {}: {}",
+                        actor,
+                        reason
+                    );
+                    if let Some(requester) = auth_user_id {
+                        send_error_notice(&state, requester, &reason).await;
+                    }
+                    return Ok(());
+                }
+                // Attachment-bearing chats persist the message row + sidecar rows BEFORE
+                // distributing (§9a trap 11): recipients auto-fetch on receipt, and the
+                // fetch resolves through these rows — distributing first would race it
+                // into a spurious "no longer available".
+                if let Err(e) = save_message_internal(
+                    &pool,
+                    message.room_id as i64,
+                    message.user_id as i64,
+                    message.message.clone(),
+                    "Chat".to_string(),
+                    message.is_emoji,
+                    message.message_id.clone(),
+                )
+                .await
+                {
+                    tracing::error!("Failed to save chat message to db: {}", e);
+                    return Ok(());
+                }
+                if let Err(e) =
+                    insert_attachments_for_message(&pool, &message.message_id, refs).await
+                {
+                    tracing::error!("Failed to save attachment metadata: {}", e);
+                    return Ok(());
+                }
+                distribute_message_to_all(
+                    &app,
+                    &state,
+                    &message.room,
+                    &message,
+                    Some(message.user_id),
+                )
+                .await;
+                let pool_clone = pool.clone();
+                let state_clone = Arc::clone(&state);
+                let app_clone = app.clone();
+                let room = message.room.clone();
+                let room_id = message.room_id;
+                tauri::async_runtime::spawn(async move {
+                    notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id)
+                        .await;
+                });
+                return Ok(());
+            }
+            // Plain chats keep the low-latency order: distribute first (live delivery to
+            // in-room clients), then persist and refresh unread badges in a single task so
+            // the unread recompute sees the saved row.
             distribute_message_to_all(&app, &state, &message.room, &message, Some(message.user_id))
                 .await;
 
@@ -1716,8 +1908,21 @@ async fn handle_server_message(
             let editor = auth_user_id.unwrap_or(message.user_id) as i64;
             if let Ok(rows) = delete_message_db(&pool, &message.message_id, editor).await {
                 if rows > 0 {
+                    // Drop the deleted message's attachment sidecar rows so its files leave
+                    // the fetch surface immediately (get_attachment_fetch_info → None). The
+                    // now-orphaned blobs are collected by the age-gated periodic sweep — NOT
+                    // here (§9a trap 6: an unscoped/ungated blob delete could reap another
+                    // user's in-flight upload sharing the same content).
+                    if let Err(e) = delete_attachments_for_message(&pool, &message.message_id).await
+                    {
+                        tracing::error!("Failed to drop attachment rows on delete: {}", e);
+                    }
                     let mut del = message.clone();
                     del.message = String::new();
+                    // A deleted message's broadcast must not carry its attachment refs
+                    // (§9a trap 3) — recipients would render cards for content that the
+                    // fetch gate already treats as gone.
+                    del.attachments = None;
                     distribute_message_to_all(&app, &state, &message.room, &del, None).await;
                 }
             }
@@ -1867,7 +2072,32 @@ async fn handle_server_message(
                 }
             }
         }
+        // Attachment transfer (attachments.rs). All host-side handlers require the
+        // connection-bound id — an unauthenticated connection never reaches here, but the
+        // guard also keeps sessions keyed by canonical identity, not frame contents.
+        MessageType::AttachmentUploadStart => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_upload_start(&state, &pool, uid, &message.message).await;
+            }
+        }
+        MessageType::AttachmentChunk => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_upload_chunk(&state, uid, &message.message).await;
+            }
+        }
+        MessageType::AttachmentUploadDone => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_upload_done(&state, &pool, uid, &message.message).await;
+            }
+        }
+        MessageType::AttachmentFetch => {
+            if let Some(uid) = auth_user_id {
+                crate::attachments::handle_fetch(&state, &pool, uid, &message.message).await;
+            }
+        }
         // Disconnect is handled by the connection's EOF cleanup path (clean_client).
+        // Host-only reply types (UploadReady/UploadOk/FetchBegin/FetchDone/AttachmentError)
+        // arriving FROM a client are meaningless — ignored by the catch-all.
         _ => {}
     }
     Ok(())
@@ -1905,6 +2135,8 @@ pub async fn send_as_server_participant(
         created_at: now_secs(),
         is_emoji,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2000,6 +2232,8 @@ pub async fn client_connect_to_server(
         is_emoji: false,
         email: Some(email.clone()),
         message_id: Uuid::new_v4().to_string(),
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &connect_message)
         .await
@@ -2027,8 +2261,16 @@ pub async fn client_connect_to_server(
             old.abort();
         }
     }
-    let listener =
-        start_client_listener(app, reader, Arc::clone(&state.client_transport), generation);
+    // A fresh connection starts with clean transfer state (a reconnect mid-upload fails the
+    // old driver loudly rather than resuming into a dead host session).
+    crate::attachments::reset_client(state.inner()).await;
+    let listener = start_client_listener(
+        app,
+        Arc::clone(state.inner()),
+        reader,
+        Arc::clone(&state.client_transport),
+        generation,
+    );
     *state.client_listener.lock().await = Some(listener);
     let heartbeat = spawn_client_heartbeat(Arc::clone(&state.client_stream));
     *state.client_heartbeat.lock().await = Some(heartbeat);
@@ -2070,6 +2312,8 @@ pub async fn send_as_client(
         created_at: now_secs(),
         is_emoji,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2088,8 +2332,97 @@ pub async fn send_as_client(
     Ok(())
 }
 
+/// Send a Chat carrying attachment refs, in either mode. The blobs must already be uploaded
+/// (`upload_attachment`) — this sends only the metadata-bearing message. The caption may be
+/// empty (a bare file drop is a valid message). Host mode persists the message + sidecar
+/// rows BEFORE distributing (§9a trap 11); client mode sends the frame and echoes locally,
+/// mirroring send_as_client.
+#[tauri::command(rename_all = "snake_case")]
+pub async fn send_message_with_attachments(
+    app: tauri::AppHandle,
+    state: State<'_, Arc<AppState>>,
+    db: State<'_, SqlitePool>,
+    message: String,
+    user_id: u64,
+    is_emoji: bool,
+    attachments: Vec<AttachmentRef>,
+) -> Result<(), String> {
+    if attachments.is_empty() {
+        return Err("Nothing attached".to_string());
+    }
+    if message.chars().count() > MAX_MESSAGE_CHARS {
+        return Err(format!("Message exceeds {} characters", MAX_MESSAGE_CHARS));
+    }
+
+    let username = state.username.read().await.clone();
+    let room = state.current_room.read().await.clone();
+    let room_id = state.current_room_id.read().await.unwrap_or(1);
+
+    let chat_message = Message {
+        version: PROTOCOL_VERSION,
+        message_type: MessageType::Chat,
+        username: username.clone(),
+        user_id,
+        message: message.clone(),
+        room_id,
+        room,
+        created_at: now_secs(),
+        is_emoji,
+        email: None,
+        attachments: Some(attachments.clone()),
+        features: None,
+        message_id: Uuid::new_v4().to_string(),
+    };
+
+    if *state.is_server.read().await {
+        // The host is the trusted authority (it reads all plaintext and stores every blob),
+        // so it's exempt from the reference gate but still gets the structural checks.
+        crate::attachments::validate_chat_attachments(
+            db.inner(),
+            crate::attachments::RefActor::Host,
+            &attachments,
+        )
+        .await?;
+        save_message_internal(
+            db.inner(),
+            chat_message.room_id as i64,
+            chat_message.user_id as i64,
+            chat_message.message.clone(),
+            "Chat".to_string(),
+            chat_message.is_emoji,
+            chat_message.message_id.clone(),
+        )
+        .await
+        .map_err(|e| format!("Failed to save message: {e}"))?;
+        insert_attachments_for_message(db.inner(), &chat_message.message_id, &attachments)
+            .await
+            .map_err(|e| e.to_string())?;
+        distribute_message_to_all(&app, state.inner(), &chat_message.room, &chat_message, None)
+            .await;
+
+        let pool_clone = db.inner().clone();
+        let state_clone = Arc::clone(state.inner());
+        let app_clone = app.clone();
+        let room = chat_message.room.clone();
+        let room_id = chat_message.room_id;
+        tauri::async_runtime::spawn(async move {
+            notify_unread_for_room(&app_clone, &state_clone, &pool_clone, &room, room_id).await;
+        });
+    } else {
+        send_secure_client(state.inner(), &chat_message)
+            .await
+            .map_err(|e| format!("Failed to send message to server: {}", e))?;
+        // Show in own UI immediately (don't wait for the server echo).
+        if let Ok(payload) = serde_json::to_string(&chat_message) {
+            let _ = app.emit("message", payload);
+        }
+    }
+    Ok(())
+}
+
 fn start_client_listener(
     app: tauri::AppHandle,
+    state: Arc<AppState>,
     mut reader: tokio::net::tcp::OwnedReadHalf,
     transport: Arc<tokio::sync::Mutex<Option<TransportState>>>,
     generation: u64,
@@ -2145,6 +2478,14 @@ fn start_client_listener(
             };
             match String::from_utf8(plaintext) {
                 Ok(message_str) => {
+                    // Attachment protocol frames (chunks, transfer control) are consumed
+                    // Rust-side — a 60 KB base64 chunk must never cross the IPC boundary
+                    // as a UI event. Everything else is emitted raw, as before.
+                    if let Ok(parsed) = serde_json::from_str::<Message>(&message_str) {
+                        if crate::attachments::intercept_client_frame(&app, &state, &parsed).await {
+                            continue;
+                        }
+                    }
                     tracing::info!("🎧 Client received: {}", message_str);
                     if let Err(e) = app.emit("message", message_str) {
                         tracing::error!("Failed to emit received message: {}", e);
@@ -2184,6 +2525,8 @@ pub async fn server_participant_join_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2265,6 +2608,8 @@ pub async fn client_join_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2303,6 +2648,8 @@ pub async fn client_leave_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
     send_secure_client(state.inner(), &leave_msg)
@@ -2333,6 +2680,8 @@ pub async fn server_leave_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
         message_id: Uuid::new_v4().to_string(),
     };
 
@@ -2392,6 +2741,8 @@ fn edit_event(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     }
 }
 
@@ -2608,6 +2959,8 @@ pub async fn request_history(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2634,6 +2987,8 @@ pub async fn client_add_member(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2660,6 +3015,8 @@ pub async fn client_create_dm(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2695,6 +3052,8 @@ pub async fn client_create_room(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     send_secure_client(state.inner(), &msg)
         .await
@@ -2809,7 +3168,7 @@ pub async fn get_server_info(state: State<'_, Arc<AppState>>) -> Result<Option<S
 /// Encrypt and send a message to one peer over its Noise transport. The transport
 /// lock is held across encrypt + write so Noise nonces always reach the wire in order
 /// (out-of-order frames would fail to decrypt).
-async fn send_secure(
+pub(crate) async fn send_secure(
     writer: &Arc<tokio::sync::Mutex<tokio::net::tcp::OwnedWriteHalf>>,
     transport: &Arc<tokio::sync::Mutex<TransportState>>,
     message: &Message,
@@ -2827,7 +3186,10 @@ async fn send_secure(
 
 /// Client-side equivalent: encrypt and send to the server over the single client
 /// transport. Locks transport then writer (consistent order) to keep nonces ordered.
-async fn send_secure_client(state: &Arc<AppState>, message: &Message) -> Result<(), String> {
+pub(crate) async fn send_secure_client(
+    state: &Arc<AppState>,
+    message: &Message,
+) -> Result<(), String> {
     let payload = serde_json::to_string(message).map_err(|e| e.to_string())?;
     let mut ts_guard = state.client_transport.lock().await;
     let ts = ts_guard
@@ -2869,8 +3231,12 @@ pub async fn client_disconnect(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
     let _ = send_secure_client(state.inner(), &disconnect_msg).await;
+    // Fail any in-flight transfer loudly and drop assemblies before the session goes away.
+    crate::attachments::reset_client(state.inner()).await;
     {
         let mut guard = state.client_stream.lock().await;
         guard.take();
@@ -2935,6 +3301,8 @@ pub async fn server_participant_disconnect(
         created_at: now_secs(),
         is_emoji: false,
         email: None,
+        attachments: None,
+        features: None,
     };
 
     // Best-effort: send an encrypted disconnect notice to each client, then drop them.
@@ -2991,6 +3359,118 @@ pub async fn server_participant_disconnect(
     let _ = app.emit("server_stopped", ());
 
     Ok(())
+}
+
+#[cfg(test)]
+mod envelope_tests {
+    use super::*;
+
+    fn message_fixture() -> Message {
+        Message {
+            version: PROTOCOL_VERSION,
+            message_type: MessageType::Chat,
+            username: "Alice".to_string(),
+            user_id: 42,
+            message: "hello from the wire".to_string(),
+            message_id: "msg-123".to_string(),
+            room: "Engineering".to_string(),
+            room_id: 7,
+            created_at: 1_725_000_000,
+            is_emoji: false,
+            email: None,
+            attachments: None,
+            features: None,
+        }
+    }
+
+    #[test]
+    fn old_frame_decode_defaults_new_optional_fields() {
+        let raw = r#"{
+            "message_type": "Chat",
+            "username": "Alice",
+            "user_id": 42,
+            "message": "hello from an old peer",
+            "message_id": "msg-old-1",
+            "room": "Engineering",
+            "room_id": 7,
+            "created_at": 1725000000,
+            "is_emoji": false
+        }"#;
+
+        let decoded: Message = serde_json::from_str(raw).expect("old frame should decode");
+
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.message_type, MessageType::Chat);
+        assert_eq!(decoded.username, "Alice");
+        assert_eq!(decoded.attachments, None);
+        assert_eq!(decoded.features, None);
+    }
+
+    #[test]
+    fn round_trip_with_attachments_preserves_attachment_refs() {
+        let attachment = AttachmentRef {
+            id: "att-3f7b2f4a".to_string(),
+            sha256: "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef".to_string(),
+            name: "release-plan.png".to_string(),
+            mime: "image/png".to_string(),
+            size: 98_765,
+            width: Some(1280),
+            height: Some(720),
+        };
+        let mut original = message_fixture();
+        original.attachments = Some(vec![attachment.clone()]);
+
+        let encoded = serde_json::to_string(&original).expect("message should serialize");
+        let decoded: Message =
+            serde_json::from_str(&encoded).expect("serialized message should deserialize");
+
+        assert_eq!(decoded.attachments, Some(vec![attachment]));
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.message_type, MessageType::Chat);
+        assert_eq!(decoded.username, original.username);
+        assert_eq!(decoded.user_id, original.user_id);
+        assert_eq!(decoded.message, original.message);
+        assert_eq!(decoded.message_id, original.message_id);
+        assert_eq!(decoded.room, original.room);
+        assert_eq!(decoded.room_id, original.room_id);
+        assert_eq!(decoded.created_at, original.created_at);
+        assert_eq!(decoded.is_emoji, original.is_emoji);
+    }
+
+    #[test]
+    fn unknown_extra_fields_decode() {
+        let raw = r#"{
+            "version": 1,
+            "message_type": "Chat",
+            "username": "Bob",
+            "user_id": 64,
+            "message": "newer peer sent extra data",
+            "message_id": "msg-future-1",
+            "room": "Design",
+            "room_id": 9,
+            "created_at": 1725001111,
+            "is_emoji": false,
+            "future_field": {"x": 1}
+        }"#;
+
+        let decoded: Message = serde_json::from_str(raw).expect("extra fields should be ignored");
+
+        assert_eq!(decoded.version, PROTOCOL_VERSION);
+        assert_eq!(decoded.message_type, MessageType::Chat);
+        assert_eq!(decoded.username, "Bob");
+        assert_eq!(decoded.room_id, 9);
+    }
+
+    #[test]
+    fn absent_optional_fields_are_omitted_on_the_wire() {
+        let msg = message_fixture();
+
+        let encoded = serde_json::to_string(&msg).expect("message should serialize");
+
+        assert!(!encoded.contains("attachments"));
+        assert!(!encoded.contains("features"));
+        assert!(!encoded.contains("email"));
+    }
 }
 
 #[cfg(test)]

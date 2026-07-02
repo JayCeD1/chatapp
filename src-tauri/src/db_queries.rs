@@ -497,6 +497,20 @@ pub async fn leave_room(
     Ok(())
 }
 
+/// The single source of truth for "user `$1` may access room `cr`": the room is public, the
+/// user created it, or the user is an active member. A macro (not a `const`) so it expands to
+/// a string LITERAL that `concat!` can fold into each query at compile time — both the
+/// room-join gate and the attachment-referencing gate share it, so they can never drift (§9a
+/// item 9). Assumes a `chat_rooms cr` alias is in scope; `$1` = user_id.
+macro_rules! room_access_predicate {
+    () => {
+        "(cr.is_private = 0
+          OR cr.created_by = $1
+          OR EXISTS (SELECT 1 FROM user_rooms ur
+                     WHERE ur.room_id = cr.id AND ur.user_id = $1 AND ur.is_active = 1))"
+    };
+}
+
 /// Whether `user_id` may open `room_id`: the room is public, or the user created it, or the
 /// user is an active member. Unknown room → not allowed. Used to enforce private channels.
 pub async fn room_join_allowed_internal(
@@ -504,20 +518,44 @@ pub async fn room_join_allowed_internal(
     user_id: i64,
     room_id: i64,
 ) -> Result<bool, String> {
-    let allowed: Option<bool> = sqlx::query_scalar(
-        "SELECT (cr.is_private = 0
-                 OR cr.created_by = $1
-                 OR EXISTS (SELECT 1 FROM user_rooms ur
-                            WHERE ur.room_id = cr.id AND ur.user_id = $1 AND ur.is_active = 1))
-         FROM chat_rooms cr
-         WHERE cr.id = $2",
-    )
-    .bind(user_id)
-    .bind(room_id)
+    let allowed: Option<bool> = sqlx::query_scalar(concat!(
+        "SELECT ",
+        room_access_predicate!(),
+        " FROM chat_rooms cr WHERE cr.id = $2"
+    ))
+    .bind(user_id) // $1
+    .bind(room_id) // $2
     .fetch_optional(pool)
     .await
     .map_err(|e| format!("Failed to check room access: {}", e))?;
     Ok(allowed.unwrap_or(false))
+}
+
+/// May `user_id` reference `sha256` by content? True iff it is attached to a non-deleted
+/// message in a room they can access — the same access predicate as `room_join_allowed_internal`
+/// (shared macro, so no drift). The other half of "may reference" (they uploaded it themselves)
+/// is checked separately in `may_reference_sha`. Preserves "knowing a hash grants nothing":
+/// a member can only reference content they can already legitimately see.
+pub async fn sha_referenced_in_accessible_room(
+    pool: &SqlitePool,
+    user_id: i64,
+    sha256: &str,
+) -> Result<bool, String> {
+    let hit: Option<i64> = sqlx::query_scalar(concat!(
+        "SELECT 1
+         FROM attachments a
+         JOIN messages m ON m.message_id = a.message_id AND m.deleted_at IS NULL
+         JOIN chat_rooms cr ON cr.id = m.room_id
+         WHERE a.sha256 = $2 AND ",
+        room_access_predicate!(),
+        " LIMIT 1"
+    ))
+    .bind(user_id) // $1 (predicate)
+    .bind(sha256) // $2
+    .fetch_optional(pool)
+    .await
+    .map_err(|e| format!("Failed to check attachment access: {}", e))?;
+    Ok(hit.is_some())
 }
 
 /// Add `user_id` to `room_id` (an invite). Only someone who can already access the room
@@ -1088,6 +1126,116 @@ pub async fn get_unread_counts(
     get_unread_counts_internal(&db, user_id).await
 }
 
+#[derive(Serialize, sqlx::FromRow, Clone, Debug)]
+#[allow(dead_code)]
+pub struct AttachmentRow {
+    pub id: String,
+    pub message_id: String,
+    pub sha256: String,
+    pub filename: String,
+    pub mime: String,
+    pub size: i64,
+    pub width: Option<i64>,
+    pub height: Option<i64>,
+}
+
+#[allow(dead_code)]
+pub async fn insert_attachments_for_message(
+    pool: &SqlitePool,
+    message_id: &str,
+    refs: &[crate::sockets::AttachmentRef],
+) -> AppResult<()> {
+    if refs.is_empty() {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    for attachment in refs {
+        let size = i64::try_from(attachment.size).map_err(|_| {
+            AppError::Validation("Attachment size is too large to store".to_string())
+        })?;
+        sqlx::query(
+            "INSERT INTO attachments (id, message_id, sha256, filename, mime, size, width, height)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+             ON CONFLICT(id) DO NOTHING",
+        )
+        .bind(&attachment.id)
+        .bind(message_id)
+        .bind(&attachment.sha256)
+        .bind(&attachment.name)
+        .bind(&attachment.mime)
+        .bind(size)
+        .bind(attachment.width.map(i64::from))
+        .bind(attachment.height.map(i64::from))
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+
+    Ok(())
+}
+
+#[allow(dead_code)]
+pub async fn get_attachments_for_message_ids(
+    pool: &SqlitePool,
+    message_ids: &[String],
+) -> AppResult<Vec<AttachmentRow>> {
+    if message_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut query = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+        "SELECT id, message_id, sha256, filename, mime, size, width, height
+         FROM attachments
+         WHERE message_id IN (",
+    );
+    let mut separated = query.separated(", ");
+    for message_id in message_ids {
+        separated.push_bind(message_id);
+    }
+    separated.push_unseparated(") ORDER BY message_id, id");
+
+    Ok(query
+        .build_query_as::<AttachmentRow>()
+        .fetch_all(pool)
+        .await?)
+}
+
+#[allow(dead_code)]
+pub async fn delete_attachments_for_message(pool: &SqlitePool, message_id: &str) -> AppResult<u64> {
+    let result = sqlx::query("DELETE FROM attachments WHERE message_id = $1")
+        .bind(message_id)
+        .execute(pool)
+        .await?;
+    Ok(result.rows_affected())
+}
+
+/// What a fetch needs to authorize and stream an attachment: its content address and the
+/// room its message lives in (for the membership gate).
+#[derive(sqlx::FromRow)]
+pub struct AttachmentFetchInfo {
+    pub sha256: String,
+    pub room_id: i64,
+}
+
+/// Resolve an attachment id to its fetch info. Attachments of soft-deleted messages resolve
+/// to None — a deleted message's files are gone from the fetch surface immediately, even
+/// before blob GC runs.
+pub async fn get_attachment_fetch_info(
+    pool: &SqlitePool,
+    attachment_id: &str,
+) -> AppResult<Option<AttachmentFetchInfo>> {
+    Ok(sqlx::query_as::<_, AttachmentFetchInfo>(
+        "SELECT a.sha256, m.room_id
+         FROM attachments a
+         JOIN messages m ON m.message_id = a.message_id
+         WHERE a.id = $1 AND m.deleted_at IS NULL",
+    )
+    .bind(attachment_id)
+    .fetch_optional(pool)
+    .await?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1106,6 +1254,11 @@ mod tests {
         crate::db::run_migrations(&pool)
             .await
             .expect("run migrations");
+
+        sqlx::raw_sql("PRAGMA foreign_keys=ON;")
+            .execute(&pool)
+            .await
+            .expect("enable foreign keys");
 
         sqlx::raw_sql(
             "INSERT INTO users (id, name, email, department_id)
@@ -1402,5 +1555,200 @@ mod tests {
             .unwrap();
         assert!(allowed);
         assert!(!denied);
+    }
+
+    #[tokio::test]
+    async fn attachment_metadata_queries_are_idempotent_filter_and_delete() {
+        let pool = setup().await;
+        assert!(get_attachments_for_message_ids(&pool, &[])
+            .await
+            .unwrap()
+            .is_empty());
+
+        let sha1 = crate::blob_store::store_blob(&pool, b"one").await.unwrap();
+        let sha2 = crate::blob_store::store_blob(&pool, b"two").await.unwrap();
+        let sha3 = crate::blob_store::store_blob(&pool, b"three")
+            .await
+            .unwrap();
+        let refs = vec![
+            crate::sockets::AttachmentRef {
+                id: "att-1".to_string(),
+                sha256: sha1.clone(),
+                name: "one.txt".to_string(),
+                mime: "text/plain".to_string(),
+                size: 3,
+                width: None,
+                height: None,
+            },
+            crate::sockets::AttachmentRef {
+                id: "att-2".to_string(),
+                sha256: sha2.clone(),
+                name: "two.png".to_string(),
+                mime: "image/png".to_string(),
+                size: 3,
+                width: Some(640),
+                height: Some(480),
+            },
+        ];
+        let other_refs = vec![crate::sockets::AttachmentRef {
+            id: "att-3".to_string(),
+            sha256: sha3,
+            name: "three.bin".to_string(),
+            mime: "application/octet-stream".to_string(),
+            size: 5,
+            width: None,
+            height: None,
+        }];
+
+        insert_attachments_for_message(&pool, "message-1", &refs)
+            .await
+            .unwrap();
+        insert_attachments_for_message(&pool, "message-2", &other_refs)
+            .await
+            .unwrap();
+        insert_attachments_for_message(&pool, "message-1", &refs)
+            .await
+            .unwrap();
+
+        let rows = get_attachments_for_message_ids(&pool, &["message-1".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].id, "att-1");
+        assert_eq!(rows[0].message_id, "message-1");
+        assert_eq!(rows[0].sha256, sha1);
+        assert_eq!(rows[0].filename, "one.txt");
+        assert_eq!(rows[0].mime, "text/plain");
+        assert_eq!(rows[0].size, 3);
+        assert_eq!(rows[1].id, "att-2");
+        assert_eq!(rows[1].sha256, sha2);
+        assert_eq!(rows[1].width, Some(640));
+        assert_eq!(rows[1].height, Some(480));
+
+        let total: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM attachments")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(total, 3);
+
+        assert_eq!(
+            delete_attachments_for_message(&pool, "message-1")
+                .await
+                .unwrap(),
+            2
+        );
+        assert_eq!(
+            delete_attachments_for_message(&pool, "message-1")
+                .await
+                .unwrap(),
+            0
+        );
+
+        let survivor = get_attachments_for_message_ids(&pool, &["message-2".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(survivor.len(), 1);
+        assert_eq!(survivor[0].id, "att-3");
+    }
+
+    // Drift guard (§9a item 9): whether a sha is referenceable-by-visibility must agree
+    // EXACTLY with room access, since both share `room_access_predicate!`. Also proves the
+    // visibility half across public / private-creator / private-member / non-member / deleted.
+    #[tokio::test]
+    async fn sha_reference_visibility_matches_room_access() {
+        let pool = setup().await; // Alice=1, Bob=2; room 1 pre-seeded public.
+
+        // Attach a blob to a message in `room_id` (authored by `author`), return its sha.
+        async fn seed(pool: &SqlitePool, room_id: i64, author: i64, id: &str) -> String {
+            let sha = crate::blob_store::store_blob(pool, id.as_bytes())
+                .await
+                .unwrap();
+            let mid = format!("msg-{id}");
+            save_message_internal(
+                pool,
+                room_id,
+                author,
+                "see attached".to_string(),
+                "Chat".to_string(),
+                false,
+                mid.clone(),
+            )
+            .await
+            .unwrap();
+            insert_attachments_for_message(
+                pool,
+                &mid,
+                &[crate::sockets::AttachmentRef {
+                    id: format!("att-{id}"),
+                    sha256: sha.clone(),
+                    name: "f.bin".to_string(),
+                    mime: "application/octet-stream".to_string(),
+                    size: id.len() as u64,
+                    width: None,
+                    height: None,
+                }],
+            )
+            .await
+            .unwrap();
+            sha
+        }
+
+        // Public room: both users can access AND can reference; the two gates agree.
+        let sha_pub = seed(&pool, 1, 1, "pub").await;
+        for uid in [1i64, 2] {
+            let vis = sha_referenced_in_accessible_room(&pool, uid, &sha_pub)
+                .await
+                .unwrap();
+            assert!(vis, "public content must be referenceable by {uid}");
+            assert_eq!(
+                vis,
+                room_join_allowed_internal(&pool, uid, 1).await.unwrap()
+            );
+        }
+
+        // Private room owned by Alice (1); Bob (2) is not a member.
+        sqlx::raw_sql(
+            "INSERT INTO chat_rooms (id, name, is_private, created_by) VALUES (100, 'secret', 1, 1)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let sha_priv = seed(&pool, 100, 1, "priv").await;
+        for uid in [1i64, 2] {
+            assert_eq!(
+                sha_referenced_in_accessible_room(&pool, uid, &sha_priv)
+                    .await
+                    .unwrap(),
+                room_join_allowed_internal(&pool, uid, 100).await.unwrap(),
+                "reference-visibility must match room access for user {uid}"
+            );
+        }
+        assert!(sha_referenced_in_accessible_room(&pool, 1, &sha_priv)
+            .await
+            .unwrap()); // creator
+        assert!(!sha_referenced_in_accessible_room(&pool, 2, &sha_priv)
+            .await
+            .unwrap()); // non-member CANNOT reference by hash
+
+        // Add Bob as a member → now he can reference it, still matching room access.
+        sqlx::raw_sql("INSERT INTO user_rooms (user_id, room_id, is_active) VALUES (2, 100, 1)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(sha_referenced_in_accessible_room(&pool, 2, &sha_priv)
+            .await
+            .unwrap());
+        assert_eq!(
+            sha_referenced_in_accessible_room(&pool, 2, &sha_priv)
+                .await
+                .unwrap(),
+            room_join_allowed_internal(&pool, 2, 100).await.unwrap()
+        );
+
+        // Soft-deleting the message removes it from the visibility surface for everyone.
+        delete_message_db(&pool, "msg-priv", 1).await.unwrap();
+        assert!(!sha_referenced_in_accessible_room(&pool, 1, &sha_priv)
+            .await
+            .unwrap());
     }
 }

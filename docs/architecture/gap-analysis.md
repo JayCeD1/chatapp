@@ -26,7 +26,7 @@ editing.
 | 5 | Transport security independent | 🟢 Met | Noise (NNpsk0, ChaCha20-Poly1305) protects every frame; it's a distinct module (`secure.rs`). This is our TLS-equivalent. |
 | 6 | No server dependence on plaintext | 🔴 Not met (by design, for now) | Search + history sync + persistence read bodies. Explicitly flagged below. |
 | 7 | Versioned message format | 🟢 Met | The `Message` envelope carries `version: u16` (`PROTOCOL_VERSION = 1`), serde-defaulted for forward/back compat (ADR-0004). |
-| 8 | Attachments encrypted-ready | ⚪ N/A yet | No attachments feature yet — design it encrypted-blob + metadata-sidecar from day one. |
+| 8 | Attachments encrypted-ready | 🟢 Met | Shipped as encrypted-blob + metadata-sidecar from day one ([ADR-0005](./decisions.md), [attachments.md](./attachments.md)): content-addressed blobs behind the `blob_store` seam, an `AttachmentRef` content sub-object, host never parses bytes. Blobs are plaintext-readable by the host today (flagged below) but the storage layer is opaque-bytes, so ciphertext is a localized swap. |
 | 9 | Auth separate from encryption | 🔴 Not met (by design, for now) | The room password derives the Noise PSK **and** is the sole access control. Revisit before per-user auth / E2EE. |
 | 10 | Out-of-band key verification | ⚪ N/A yet | No keys to verify yet; required before any E2EE rollout (Constraint 10/11). |
 | 11 | Migration path to FS/PCS/groups not blocked | 🟢 OK | Nothing precludes a future Double-Ratchet 1:1 path; group E2EE will need its own model. |
@@ -66,6 +66,9 @@ new plaintext-dependent feature must be flagged in its PR (see the PR checklist)
 | Client history sync | `sockets.rs` `send_room_history` (host reads stored bodies and forwards) | Host must read plaintext to build the batch | Server returns ciphertext blobs; client decrypts |
 | Message body persistence | `messages.message` column (plaintext) | Server stores readable content | Store opaque `payload` ciphertext |
 | Server-side reactions | `reactions` table + host aggregation | Server reads emoji content/links them to messages | Encrypted reactions or client-side aggregation |
+| Attachment blobs readable by host | `blob_store` (SQLCipher, but the host process reads content) | Host stores + serves plaintext bytes | Sender encrypts the blob per-message-key; host stores ciphertext under the same schema (localized — the store is already opaque-bytes) |
+| Cross-user attachment dedup | `store_blob` sha256 content addressing | Host learns content equality across users | Under E2EE the hash is of ciphertext; cross-user dedup disappears (accepted) |
+| Attachment metadata visible | `attachments` sidecar + history frames | Filename/mime/size/dims are host-visible | Filename/mime move into the encrypted content; size stays visible (Constraint 6 already accepts size leakage) |
 
 > Presence, typing, and read state are **intentionally** metadata (not content) — see
 > Constraint 12 / [decisions.md](./decisions.md). They leak activity but not message bodies.
@@ -74,16 +77,15 @@ new plaintext-dependent feature must be flagged in its PR (see the PR checklist)
 
 ## Near-term moves (cheap, do them when adjacent)
 
-You don't need an E2EE sprint. Two moves are nearly free and buy real forward-compat:
+Both near-term moves have now shipped — kept here for the record:
 
-1. **Add a `version` field to the message envelope (Constraint 7).** A `u16`/`u8` `v` on the
-   `Message` struct (`sockets.rs`) + the frontend `Message` type, defaulting to `1`. Do it
-   the next time the format changes — e.g. **alongside the unread-spine `LoadOlder` work** —
-   so v1 (plaintext) and a future v2 (ciphertext) can coexist without a flag day.
-2. **Keep the body separable in your head as `payload`.** When you next add a field that is
-   message *content* (attachments, rich text), put it under a content sub-object, not a new
-   top-level sibling of the routing metadata — so a future "encrypt the content object" is a
-   localized change.
+1. **✅ Add a `version` field to the message envelope (Constraint 7).** Done — `Message.version`
+   + `PROTOCOL_VERSION` (ADR-0004), serde-defaulted so v1 (plaintext) and a future v2 (ciphertext)
+   coexist without a flag day.
+2. **✅ Keep the body separable as a content sub-object.** Done for attachments — they ride as a
+   separable `AttachmentRef` sub-object, not a top-level sibling of routing metadata (ADR-0005),
+   so "encrypt the content object" stays localized. Apply the same shape to any future message
+   *content* (rich text, etc.).
 
 Deliberately **not** doing yet (would be over-abstraction per Guardrail 1):
 
@@ -115,9 +117,9 @@ the same secret as message confidentiality (what can be read). Treat any work th
 
 | Change | Effort | When |
 | --- | --- | --- |
-| Add `version` to the message envelope | S | With the next format change (unread spine) |
-| Keep message content under a `payload`/content sub-object | S | When adding attachments / rich content |
-| Document each new plaintext-dependent feature in its PR | — | Ongoing (PR checklist) |
+| ~~Add `version` to the message envelope~~ ✅ | S | Done (ADR-0004) |
+| ~~Keep message content under a `payload`/content sub-object~~ ✅ | S | Done for attachments (ADR-0005); apply to future content |
+| Document each new plaintext-dependent feature in its PR | — | Ongoing (PR checklist) — attachments logged above |
 | Separate auth from the encryption PSK | M | Before per-user auth or E2EE |
 | Extract `ITransport` + lift routing above transport | L | When a 2nd transport becomes real |
 | Device identity + keypairs + verification UI | L | E2EE phase |

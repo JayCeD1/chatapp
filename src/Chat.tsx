@@ -62,6 +62,8 @@ const Chat = () => {
       onToggleTheme={toggleTheme}
       preferences={c.preferences}
       onSetPreferences={c.setPreferences}
+      attachmentsEnabled={c.attachmentsEnabled}
+      onSendAttachments={c.sendMessageWithAttachments}
     />
   );
 };

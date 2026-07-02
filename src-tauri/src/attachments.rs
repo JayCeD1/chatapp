@@ -879,21 +879,30 @@ pub async fn validate_chat_attachments(
         if r.size == 0 || r.size as usize > MAX_ATTACHMENT_BYTES {
             return Err("Invalid attachment size".to_string());
         }
+        // Reference authorization for a remote client, evaluated UNCONDITIONALLY (before the
+        // existence/size check) so timing can't separate "stored but unauthorized" from
+        // "absent": every ref that clears the field checks pays the same DB work regardless of
+        // whether the blob exists. A genuine storage error is genericized to "Storage error"
+        // (never raw sqlx text to the peer), matching the existence-check error arm below. Host
+        // is the trusted authority → always authorized.
+        let authorized = match actor {
+            RefActor::Host => true,
+            RefActor::Client(uid) => {
+                may_reference_sha(pool, uid, &r.sha256).await.map_err(|e| {
+                    tracing::error!("Attachment reference check failed: {}", e);
+                    "Storage error".to_string()
+                })?
+            }
+        };
+        // Existence, size, AND authorization collapse into ONE rejection string, so an
+        // unauthorized sender can't distinguish "exists but not yours" from "absent" by the
+        // reply, timing, or message — a member who only learned a hash gains nothing.
         match blob_store::complete_blob_size(pool, &r.sha256).await {
-            Ok(Some(stored)) if stored == r.size as i64 => {}
+            Ok(Some(stored)) if stored == r.size as i64 && authorized => {}
             Ok(_) => return Err("Attachment was not uploaded".to_string()),
             Err(e) => {
                 tracing::error!("Attachment validation failed: {}", e);
                 return Err("Storage error".to_string());
-            }
-        }
-        // Reference gate for remote senders: they must have uploaded this content or be able
-        // to see it in an accessible room. The failure string is DELIBERATELY identical to the
-        // not-uploaded case above — a distinct "not authorized" message would itself be an
-        // existence oracle ("this hash exists, just not for you").
-        if let RefActor::Client(uid) = actor {
-            if !may_reference_sha(pool, uid, &r.sha256).await? {
-                return Err("Attachment was not uploaded".to_string());
             }
         }
     }

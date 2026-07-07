@@ -2838,7 +2838,7 @@ name = "nutler"
 version = "0.6.0"
 dependencies = [
  "base64 0.22.1",
- "getrandom 0.2.17",
+ "getrandom 0.4.3",
  "keyring",
  "libsqlite3-sys",
  "mdns-sd",

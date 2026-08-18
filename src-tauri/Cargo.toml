@@ -44,7 +44,7 @@ sha2 = "0.11"
 # Attachment chunks ride the JSON envelope as base64 (docs/architecture/attachments.md §2).
 base64 = "0.22"
 # Optional mDNS / DNS-SD discovery, alongside the UDP-broadcast path (pure Rust, no native deps).
-mdns-sd = "0.13"
+mdns-sd = "0.20"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

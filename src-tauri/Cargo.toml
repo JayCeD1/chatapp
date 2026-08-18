@@ -30,7 +30,7 @@ sqlx = { version = "0.9.0", features = ["sqlite", "runtime-tokio"] }
 # Encrypt the database at rest (SQLCipher). Forces sqlx's libsqlite3-sys to link a
 # SQLCipher-enabled SQLite; the DB is keyed via `PRAGMA key`. Vendored OpenSSL so the build
 # doesn't depend on a system crypto library.
-libsqlite3-sys = { version = "0.30", features = ["bundled-sqlcipher-vendored-openssl"] }
+libsqlite3-sys = { version = "0.37", features = ["bundled-sqlcipher-vendored-openssl"] }
 # OS keychain for the at-rest DB key (macOS Keychain / Windows Credential Manager / Linux
 # Secret Service), with a 0600 key-file fallback where no keychain is available.
 keyring = "2"

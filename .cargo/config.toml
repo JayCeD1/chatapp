@@ -1,0 +1,6 @@
+[build]
+rustflags = ["-Z", "threads=8"]
+
+# requires nightly added to cargo guilf ie `cargo +nightly build`
+# rustup update nightly
+# rustup component add rustc-codegen-cranelift-preview --toolchain nightly

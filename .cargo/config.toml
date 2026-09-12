@@ -1,12 +1,17 @@
-[build]
-rustflags = ["-Z", "threads=8"]
-
-# requires nightly added to cargo guilf ie `cargo +nightly build`
-# rustup update nightly
-# rustup component add rustc-codegen-cranelift-preview --toolchain nightly
-
-[unstable]
-codegen-backend = true
-
-[profile.dev]
-codegen-backend = "cranelift"
+# Default build uses the stable toolchain (see CONTRIBUTING.md / CI, which target
+# stable). The settings below are nightly-only fast-dev-build optimizations and are
+# opt-in: they previously lived here unconditionally, which forced `-Z` flags and the
+# cranelift codegen backend onto every cargo invocation and broke stable builds and CI.
+#
+# To opt into the faster nightly dev builds:
+#   rustup toolchain install nightly --component rustc-codegen-cranelift-preview
+# then uncomment the sections below and build with `cargo +nightly build`.
+#
+# [build]
+# rustflags = ["-Z", "threads=8"]
+#
+# [unstable]
+# codegen-backend = true
+#
+# [profile.dev]
+# codegen-backend = "cranelift"
